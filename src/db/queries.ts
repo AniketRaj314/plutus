@@ -184,6 +184,48 @@ export function listTransactions(db: Database.Database, limit = 50): Transaction
     .all(limit) as Transaction[];
 }
 
+export interface TransactionFilters {
+  since?: string;
+  until?: string;
+  source?: string;
+  category?: string;
+  min_amount?: number;
+  limit?: number;
+}
+
+export function queryTransactions(db: Database.Database, filters: TransactionFilters): Transaction[] {
+  const clauses: string[] = [];
+  const params: Record<string, unknown> = {};
+
+  if (filters.since) {
+    clauses.push("datetime >= @since");
+    params.since = filters.since;
+  }
+  if (filters.until) {
+    clauses.push("datetime <= @until");
+    params.until = filters.until;
+  }
+  if (filters.source) {
+    clauses.push("source = @source");
+    params.source = filters.source;
+  }
+  if (filters.category) {
+    clauses.push("category = @category");
+    params.category = filters.category;
+  }
+  if (filters.min_amount !== undefined) {
+    clauses.push("amount >= @min_amount");
+    params.min_amount = filters.min_amount;
+  }
+
+  const where = clauses.length > 0 ? `WHERE ${clauses.join(" AND ")}` : "";
+  params.limit = filters.limit ?? 20;
+
+  return db
+    .prepare(`SELECT * FROM transactions ${where} ORDER BY datetime DESC LIMIT @limit`)
+    .all(params) as Transaction[];
+}
+
 export function updateTransaction(
   db: Database.Database,
   id: string,
@@ -231,6 +273,10 @@ export function listSplitsForTransaction(db: Database.Database, transactionId: s
   return db
     .prepare("SELECT * FROM splits WHERE transaction_id = ?")
     .all(transactionId) as Split[];
+}
+
+export function listAllSplits(db: Database.Database): Split[] {
+  return db.prepare("SELECT * FROM splits ORDER BY created_at DESC").all() as Split[];
 }
 
 export function updateSplit(
@@ -326,6 +372,10 @@ export function setContext(db: Database.Database, key: string, value: string): v
 
 export function listContext(db: Database.Database): ContextRow[] {
   return db.prepare("SELECT * FROM context ORDER BY key ASC").all() as ContextRow[];
+}
+
+export function deleteContext(db: Database.Database, key: string): void {
+  db.prepare("DELETE FROM context WHERE key = ?").run(key);
 }
 
 // -- agent_messages --

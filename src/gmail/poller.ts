@@ -5,7 +5,9 @@ import { getGmailClient } from "./auth";
 import { getContext, setContext, getTransaction, getTransactionByRawEmailId, findTransactionByContentKey, insertTransaction } from "../db/queries";
 import { parseGmailMessage } from "./parsers";
 import { enrichTransaction } from "../enrichment/gpt";
-import { applyTransaction } from "../envelope/engine";
+import { applyTransaction, getEnvelopeState } from "../envelope/engine";
+import { sendMessage, recordTransactionMessage } from "../telegram/bot";
+import { formatTransaction } from "../telegram/formatter";
 
 const WATCHED_SENDERS = ["noreply@idfcfirstbank.com", "no-reply@getonecard.app"];
 // americanexpress.com sender address TBD — not yet included
@@ -126,6 +128,21 @@ export async function processMessage(db: Database.Database, message: gmail_v1.Sc
       setContext(db, "pending_rebalance_message", applyResult.triggered_rebalance.message);
       console.log(`[envelope] rebalance triggered: ${applyResult.triggered_rebalance.message}`);
     }
+  }
+
+  const finalTransaction = getTransaction(db, transaction.id) ?? enriched;
+  const messageText = formatTransaction(finalTransaction, getEnvelopeState(db));
+
+  if (messageText) {
+    try {
+      const messageId = await sendMessage(messageText);
+      recordTransactionMessage(db, messageId, finalTransaction.id);
+      console.log(`[telegram] sent transaction message ${messageId} for transaction ${finalTransaction.id}`);
+    } catch (err) {
+      console.error(`[telegram] failed to send message for transaction ${finalTransaction.id}:`, err);
+    }
+  } else {
+    console.log(`[telegram] transaction ${finalTransaction.id} is committed, no message sent`);
   }
 }
 

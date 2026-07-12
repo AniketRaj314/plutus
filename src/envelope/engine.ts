@@ -15,7 +15,7 @@ import {
 const IST_OFFSET_MS = 5.5 * 60 * 60 * 1000;
 const DEFAULT_MONTHLY_SPENDABLE = 120000;
 const DEFAULT_SALARY_DAY = 1;
-const BIG_PURCHASE_THRESHOLD = 3000;
+export const BIG_PURCHASE_THRESHOLD = 3000;
 const CC_PAYMENT_PATTERNS = ["AMEX", "AMERICAN EXPRESS", "BOBCARD", "ONECARD", "ICICI CREDIT", "IDFC CREDIT"];
 // Merchant text must look bill-payment-shaped before the amount-matching
 // heuristic below is trusted — coincidental amount sums are common at
@@ -61,12 +61,12 @@ function formatIstDate(dateOnly: Date): string {
   return dateOnly.toISOString().slice(0, 10);
 }
 
-function parseIstDateOnly(dateStr: string): Date {
+export function parseIstDateOnly(dateStr: string): Date {
   const [y, m, d] = dateStr.split("-").map(Number);
   return new Date(Date.UTC(y, m - 1, d));
 }
 
-function getWeekStart(referenceDate: Date): Date {
+export function getWeekStart(referenceDate: Date): Date {
   const dateOnly = toIstDateOnly(referenceDate);
   const day = dateOnly.getUTCDay();
   const diff = (day === 0 ? -6 : 1) - day;
@@ -79,7 +79,7 @@ function getMonthEnd(monthStr: string): Date {
   return new Date(Date.UTC(year, month, 0));
 }
 
-function getRemainingWeeksInMonth(weekStart: Date, monthStr: string): number {
+export function getRemainingWeeksInMonth(weekStart: Date, monthStr: string): number {
   const monthEnd = getMonthEnd(monthStr);
   let count = 0;
   let cursor = new Date(weekStart);
@@ -128,13 +128,50 @@ export function setupEnvelope(
   return getEnvelope(db) as Envelope;
 }
 
+// Mid-month recompute of committed_total/discretionary_pool/current_week_budget
+// (e.g. after adding a new committed expense) WITHOUT resetting spent_discretionary
+// or current_week_spent — unlike setupEnvelope, which is for first-run bootstrap
+// and month rollover, where zeroing spend tracking is correct. Calling
+// setupEnvelope mid-month would silently wipe already-tracked spending.
+export function recalculateEnvelope(db: Database.Database): Envelope {
+  const envelope = getEnvelope(db);
+  if (!envelope || !envelope.monthly_spendable) {
+    return setupEnvelope(db);
+  }
+
+  const committed = listCommittedExpenses(db);
+  const committedTotal = committed.reduce((sum, c) => sum + (c.amount_approx ?? 0), 0);
+  const monthlySpendable = envelope.monthly_spendable ?? 0;
+  const discretionaryPool = monthlySpendable - committedTotal;
+
+  const now = new Date();
+  const weekStart = envelope.current_week_start ? parseIstDateOnly(envelope.current_week_start) : getWeekStart(now);
+  const month = envelope.month ?? formatIstDate(toIstDateOnly(now)).slice(0, 7);
+  const weeksRemaining = getRemainingWeeksInMonth(weekStart, month);
+
+  const remainingPool = discretionaryPool - (envelope.spent_discretionary ?? 0);
+  const newWeeklyBudget = remainingPool / weeksRemaining;
+
+  updateEnvelope(db, {
+    committed_total: committedTotal,
+    discretionary_pool: discretionaryPool,
+    current_week_budget: newWeeklyBudget,
+  });
+
+  console.log(
+    `[envelope] recalculated (spend tracking preserved): committed_total=${committedTotal} discretionary_pool=${discretionaryPool} current_week_budget=${newWeeklyBudget}`
+  );
+
+  return getEnvelope(db) as Envelope;
+}
+
 // -- core operations --
 
 export function getEnvelopeState(db: Database.Database): Envelope | undefined {
   return getEnvelope(db);
 }
 
-function getBillingWindow(card: CreditCard, referenceDate: Date): { start: string; end: string } {
+export function getBillingWindow(card: CreditCard, referenceDate: Date): { start: string; end: string } {
   const ref = toIstDateOnly(referenceDate);
   const year = ref.getUTCFullYear();
   const month = ref.getUTCMonth();
@@ -228,10 +265,13 @@ export function applyTransaction(db: Database.Database, transaction: Transaction
 
   updateTransaction(db, transaction.id, { envelope_applied: 1 });
 
-  const weekRemaining = (envelope.current_week_budget ?? 0) - newWeekSpent;
-  const monthRemaining = (envelope.discretionary_pool ?? 0) - newSpentDiscretionary;
-
   const triggeredRebalance = transaction.is_reversal ? null : rebalanceAfterBigPurchase(db, magnitude);
+
+  // Re-read after a possible rebalance so week_remaining reflects the
+  // post-rebalance current_week_budget, not the stale pre-rebalance value.
+  const finalEnvelope = triggeredRebalance ? getEnvelope(db) : envelope;
+  const weekRemaining = (finalEnvelope?.current_week_budget ?? envelope.current_week_budget ?? 0) - newWeekSpent;
+  const monthRemaining = (envelope.discretionary_pool ?? 0) - newSpentDiscretionary;
 
   return {
     week_remaining: weekRemaining,
