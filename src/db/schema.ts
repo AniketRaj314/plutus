@@ -27,6 +27,8 @@ export function runMigrations(db: Database.Database): void {
       correlated_with TEXT,
       correlation_status TEXT DEFAULT 'none',
       notes TEXT,
+      raw_email_id TEXT,
+      is_reversal INTEGER DEFAULT 0,
       created_at TEXT DEFAULT (datetime('now'))
     );
 
@@ -84,7 +86,18 @@ export function runMigrations(db: Database.Database): void {
     CREATE INDEX IF NOT EXISTS idx_splits_transaction_id ON splits (transaction_id);
   `);
 
+  ensureColumn(db, "transactions", "raw_email_id", "TEXT");
+  ensureColumn(db, "transactions", "is_reversal", "INTEGER DEFAULT 0");
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_transactions_raw_email_id ON transactions (raw_email_id);`);
+
   seedEnvelope(db);
+}
+
+function ensureColumn(db: Database.Database, table: string, column: string, type: string): void {
+  const columns = db.prepare(`PRAGMA table_info(${table})`).all() as { name: string }[];
+  if (!columns.some((c) => c.name === column)) {
+    db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${type}`);
+  }
 }
 
 function seedEnvelope(db: Database.Database): void {

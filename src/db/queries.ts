@@ -18,6 +18,8 @@ export interface Transaction {
   correlated_with: string | null;
   correlation_status: string;
   notes: string | null;
+  raw_email_id: string | null;
+  is_reversal: number;
   created_at: string;
 }
 
@@ -88,11 +90,11 @@ export function insertTransaction(db: Database.Database, data: NewTransaction): 
     `INSERT INTO transactions (
       id, source, amount, merchant_raw, merchant_clean, category, datetime,
       card_last4, is_committed, is_credit_card_payment, is_cancelled_out,
-      split_id, envelope_impact, correlated_with, correlation_status, notes
+      split_id, envelope_impact, correlated_with, correlation_status, notes, raw_email_id, is_reversal
     ) VALUES (
       @id, @source, @amount, @merchant_raw, @merchant_clean, @category, @datetime,
       @card_last4, @is_committed, @is_credit_card_payment, @is_cancelled_out,
-      @split_id, @envelope_impact, @correlated_with, @correlation_status, @notes
+      @split_id, @envelope_impact, @correlated_with, @correlation_status, @notes, @raw_email_id, @is_reversal
     )`
   ).run({
     id,
@@ -111,12 +113,47 @@ export function insertTransaction(db: Database.Database, data: NewTransaction): 
     correlated_with: data.correlated_with ?? null,
     correlation_status: data.correlation_status ?? "none",
     notes: data.notes ?? null,
+    raw_email_id: data.raw_email_id ?? null,
+    is_reversal: data.is_reversal ?? 0,
   });
   return getTransaction(db, id) as Transaction;
 }
 
 export function getTransaction(db: Database.Database, id: string): Transaction | undefined {
   return db.prepare("SELECT * FROM transactions WHERE id = ?").get(id) as Transaction | undefined;
+}
+
+export function getTransactionByRawEmailId(
+  db: Database.Database,
+  rawEmailId: string
+): Transaction | undefined {
+  return db
+    .prepare("SELECT * FROM transactions WHERE raw_email_id = ?")
+    .get(rawEmailId) as Transaction | undefined;
+}
+
+export function findTransactionByContentKey(
+  db: Database.Database,
+  source: string,
+  amount: number,
+  merchantRaw: string | null,
+  datetimeMinute: string
+): Transaction | undefined {
+  if (merchantRaw === null) {
+    return db
+      .prepare(
+        `SELECT * FROM transactions
+         WHERE source = ? AND amount = ? AND merchant_raw IS NULL AND substr(datetime, 1, 16) = ?`
+      )
+      .get(source, amount, datetimeMinute) as Transaction | undefined;
+  }
+
+  return db
+    .prepare(
+      `SELECT * FROM transactions
+       WHERE source = ? AND amount = ? AND merchant_raw = ? AND substr(datetime, 1, 16) = ?`
+    )
+    .get(source, amount, merchantRaw, datetimeMinute) as Transaction | undefined;
 }
 
 export function listTransactions(db: Database.Database, limit = 50): Transaction[] {

@@ -1,3 +1,158 @@
-export function startPoller(): void {
-  // TODO: node-cron polling loop
+import cron from "node-cron";
+import type Database from "better-sqlite3";
+import type { gmail_v1 } from "googleapis";
+import { getGmailClient } from "./auth";
+import { getContext, setContext, getTransactionByRawEmailId, findTransactionByContentKey, insertTransaction } from "../db/queries";
+import { parseGmailMessage } from "./parsers";
+import { enrichTransaction } from "../enrichment/gpt";
+
+const WATCHED_SENDERS = ["noreply@idfcfirstbank.com", "no-reply@getonecard.app"];
+// americanexpress.com sender address TBD — not yet included
+
+const LAST_POLL_KEY = "last_gmail_poll";
+const PROCESSED_IDS_KEY = "processed_message_ids";
+const MAX_PROCESSED_IDS = 2000;
+
+export function startPoller(db: Database.Database): void {
+  const intervalMins = Number(process.env.POLL_INTERVAL_MINS) || 10;
+  const schedule = `*/${intervalMins} * * * *`;
+
+  cron.schedule(schedule, () => {
+    void pollOnce(db);
+  });
+
+  console.log(`Gmail poller scheduled every ${intervalMins} minute(s)`);
+}
+
+export async function pollOnce(db: Database.Database): Promise<void> {
+  try {
+    const gmail = getGmailClient();
+    const sinceSeconds = getLastPollTimestamp(db);
+    const processedIds = getProcessedIds(db);
+
+    const query = `from:(${WATCHED_SENDERS.join(" OR ")}) after:${sinceSeconds}`;
+    const messageIds = await listMessageIds(gmail, query);
+    const newIds = messageIds.filter((id) => !processedIds.has(id));
+
+    for (const id of newIds) {
+      const message = await gmail.users.messages.get({
+        userId: "me",
+        id,
+        format: "full",
+      });
+
+      await processMessage(db, message.data);
+      processedIds.add(id);
+    }
+
+    saveProcessedIds(db, processedIds);
+    setContext(db, LAST_POLL_KEY, String(Math.floor(Date.now() / 1000)));
+
+    console.log(
+      newIds.length === 0
+        ? "[gmail] poll complete, no new messages"
+        : `[gmail] poll complete, ${newIds.length} new message(s) processed`
+    );
+  } catch (err) {
+    console.error("[gmail] poll cycle failed:", err);
+  }
+}
+
+export async function processMessage(db: Database.Database, message: gmail_v1.Schema$Message): Promise<void> {
+  const headers = message.payload?.headers ?? [];
+  const from = headers.find((h) => h.name === "From")?.value ?? "(unknown sender)";
+  const subject = headers.find((h) => h.name === "Subject")?.value ?? "(no subject)";
+  const snippet = message.snippet ?? "";
+  const id = message.id ?? "(unknown id)";
+
+  console.log(`[gmail] from="${from}" subject="${subject}" snippet="${snippet}" id=${id}`);
+
+  const parsed = parseGmailMessage(message);
+  if (!parsed) {
+    console.log(`[gmail] no parser matched or unparseable, skipping id=${id}`);
+    return;
+  }
+
+  if (getTransactionByRawEmailId(db, parsed.raw_email_id)) {
+    console.log(`[gmail] transaction already recorded for raw_email_id=${parsed.raw_email_id}, skipping`);
+    return;
+  }
+
+  const minuteKey = parsed.datetime.slice(0, 16);
+  const contentDuplicate = findTransactionByContentKey(
+    db,
+    parsed.source,
+    parsed.amount,
+    parsed.merchant_raw,
+    minuteKey
+  );
+  if (contentDuplicate) {
+    console.log(
+      `[gmail] duplicate transaction content (same amount/merchant/minute) already recorded as ${contentDuplicate.id}, skipping raw_email_id=${parsed.raw_email_id}`
+    );
+    return;
+  }
+
+  const transaction = insertTransaction(db, {
+    source: parsed.source,
+    amount: parsed.amount,
+    merchant_raw: parsed.merchant_raw,
+    datetime: parsed.datetime,
+    card_last4: parsed.card_last4,
+    raw_email_id: parsed.raw_email_id,
+    is_reversal: parsed.is_reversal ? 1 : 0,
+  });
+
+  console.log(
+    `[gmail] parsed transaction: source=${transaction.source} amount=${transaction.amount} merchant="${transaction.merchant_raw ?? "(none)"}" datetime=${transaction.datetime} card_last4=${transaction.card_last4} is_reversal=${transaction.is_reversal} id=${transaction.id}`
+  );
+
+  await enrichTransaction(db, transaction);
+}
+
+async function listMessageIds(gmail: gmail_v1.Gmail, query: string): Promise<string[]> {
+  const ids: string[] = [];
+  let pageToken: string | undefined;
+
+  do {
+    const res = await gmail.users.messages.list({
+      userId: "me",
+      q: query,
+      pageToken,
+      maxResults: 100,
+    });
+
+    for (const msg of res.data.messages ?? []) {
+      if (msg.id) ids.push(msg.id);
+    }
+
+    pageToken = res.data.nextPageToken ?? undefined;
+  } while (pageToken);
+
+  return ids;
+}
+
+function getLastPollTimestamp(db: Database.Database): number {
+  const row = getContext(db, LAST_POLL_KEY);
+  if (!row?.value) {
+    const intervalMins = Number(process.env.POLL_INTERVAL_MINS) || 10;
+    return Math.floor(Date.now() / 1000) - intervalMins * 60;
+  }
+  return Number(row.value);
+}
+
+function getProcessedIds(db: Database.Database): Set<string> {
+  const row = getContext(db, PROCESSED_IDS_KEY);
+  if (!row?.value) return new Set();
+  try {
+    const parsed = JSON.parse(row.value);
+    return new Set(Array.isArray(parsed) ? parsed : []);
+  } catch {
+    return new Set();
+  }
+}
+
+function saveProcessedIds(db: Database.Database, ids: Set<string>): void {
+  const trimmed = Array.from(ids).slice(-MAX_PROCESSED_IDS);
+  setContext(db, PROCESSED_IDS_KEY, JSON.stringify(trimmed));
 }
