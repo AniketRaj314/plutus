@@ -68,6 +68,11 @@ function parseAlert(email: EmailContent): ParsedFields | null {
     datetime,
     card_last4: last4,
     is_reversal: false,
+    currency: "INR",
+    amount_inr: null,
+    is_international: false,
+    notes: null,
+    envelope_impact: null,
   };
 }
 
@@ -89,6 +94,11 @@ function parseDebitAlert(email: EmailContent): ParsedFields | null {
     datetime,
     card_last4: last4,
     is_reversal: false,
+    currency: "INR",
+    amount_inr: null,
+    is_international: false,
+    notes: null,
+    envelope_impact: null,
   };
 }
 
@@ -109,6 +119,11 @@ function parseReversal(email: EmailContent): ParsedFields | null {
     datetime: parsed.toISOString(),
     card_last4: last4,
     is_reversal: true,
+    currency: "INR",
+    amount_inr: null,
+    is_international: false,
+    notes: null,
+    envelope_impact: null,
   };
 }
 

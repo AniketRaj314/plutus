@@ -2,9 +2,10 @@ import cron from "node-cron";
 import type Database from "better-sqlite3";
 import type { gmail_v1 } from "googleapis";
 import { getGmailClient } from "./auth";
-import { getContext, setContext, getTransactionByRawEmailId, findTransactionByContentKey, insertTransaction } from "../db/queries";
+import { getContext, setContext, getTransaction, getTransactionByRawEmailId, findTransactionByContentKey, insertTransaction } from "../db/queries";
 import { parseGmailMessage } from "./parsers";
 import { enrichTransaction } from "../enrichment/gpt";
+import { applyTransaction } from "../envelope/engine";
 
 const WATCHED_SENDERS = ["noreply@idfcfirstbank.com", "no-reply@getonecard.app"];
 // americanexpress.com sender address TBD — not yet included
@@ -101,13 +102,31 @@ export async function processMessage(db: Database.Database, message: gmail_v1.Sc
     card_last4: parsed.card_last4,
     raw_email_id: parsed.raw_email_id,
     is_reversal: parsed.is_reversal ? 1 : 0,
+    currency: parsed.currency,
+    amount_inr: parsed.amount_inr,
+    is_international: parsed.is_international ? 1 : 0,
+    envelope_impact: parsed.envelope_impact,
+    notes: parsed.notes,
   });
 
   console.log(
-    `[gmail] parsed transaction: source=${transaction.source} amount=${transaction.amount} merchant="${transaction.merchant_raw ?? "(none)"}" datetime=${transaction.datetime} card_last4=${transaction.card_last4} is_reversal=${transaction.is_reversal} id=${transaction.id}`
+    `[gmail] parsed transaction: source=${transaction.source} amount=${transaction.amount} currency=${transaction.currency} merchant="${transaction.merchant_raw ?? "(none)"}" datetime=${transaction.datetime} card_last4=${transaction.card_last4} is_reversal=${transaction.is_reversal} is_international=${transaction.is_international} id=${transaction.id}`
   );
 
   await enrichTransaction(db, transaction);
+
+  const enriched = getTransaction(db, transaction.id) ?? transaction;
+  const applyResult = applyTransaction(db, enriched);
+
+  if (applyResult) {
+    console.log(
+      `[envelope] applied transaction ${enriched.id}: week_remaining=${applyResult.week_remaining.toFixed(2)} month_remaining=${applyResult.month_remaining.toFixed(2)}`
+    );
+    if (applyResult.triggered_rebalance) {
+      setContext(db, "pending_rebalance_message", applyResult.triggered_rebalance.message);
+      console.log(`[envelope] rebalance triggered: ${applyResult.triggered_rebalance.message}`);
+    }
+  }
 }
 
 async function listMessageIds(gmail: gmail_v1.Gmail, query: string): Promise<string[]> {

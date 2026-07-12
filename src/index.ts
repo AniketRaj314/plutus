@@ -1,6 +1,7 @@
 import "dotenv/config";
 import { getDb, runMigrations } from "./db/schema";
 import { startPoller } from "./gmail/poller";
+import { startEnvelopeCron } from "./envelope/engine";
 
 console.log("Plutus starting...");
 
@@ -10,3 +11,4 @@ runMigrations(db);
 console.log("DB ready");
 
 startPoller(db);
+startEnvelopeCron(db);

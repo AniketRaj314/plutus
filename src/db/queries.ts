@@ -20,6 +20,11 @@ export interface Transaction {
   notes: string | null;
   raw_email_id: string | null;
   is_reversal: number;
+  enrichment_confidence: number | null;
+  envelope_applied: number;
+  currency: string;
+  amount_inr: number | null;
+  is_international: number;
   created_at: string;
 }
 
@@ -82,6 +87,16 @@ export interface AgentMessage {
 
 export type NewAgentMessage = Partial<Omit<AgentMessage, "id" | "created_at">>;
 
+export interface CreditCard {
+  id: string;
+  name: string | null;
+  last4: string | null;
+  billing_start_day: number | null;
+  billing_end_day: number | null;
+  due_day: number | null;
+  source: string | null;
+}
+
 // -- transactions --
 
 export function insertTransaction(db: Database.Database, data: NewTransaction): Transaction {
@@ -90,11 +105,13 @@ export function insertTransaction(db: Database.Database, data: NewTransaction): 
     `INSERT INTO transactions (
       id, source, amount, merchant_raw, merchant_clean, category, datetime,
       card_last4, is_committed, is_credit_card_payment, is_cancelled_out,
-      split_id, envelope_impact, correlated_with, correlation_status, notes, raw_email_id, is_reversal
+      split_id, envelope_impact, correlated_with, correlation_status, notes, raw_email_id, is_reversal,
+      enrichment_confidence, envelope_applied, currency, amount_inr, is_international
     ) VALUES (
       @id, @source, @amount, @merchant_raw, @merchant_clean, @category, @datetime,
       @card_last4, @is_committed, @is_credit_card_payment, @is_cancelled_out,
-      @split_id, @envelope_impact, @correlated_with, @correlation_status, @notes, @raw_email_id, @is_reversal
+      @split_id, @envelope_impact, @correlated_with, @correlation_status, @notes, @raw_email_id, @is_reversal,
+      @enrichment_confidence, @envelope_applied, @currency, @amount_inr, @is_international
     )`
   ).run({
     id,
@@ -115,6 +132,11 @@ export function insertTransaction(db: Database.Database, data: NewTransaction): 
     notes: data.notes ?? null,
     raw_email_id: data.raw_email_id ?? null,
     is_reversal: data.is_reversal ?? 0,
+    enrichment_confidence: data.enrichment_confidence ?? null,
+    envelope_applied: data.envelope_applied ?? 0,
+    currency: data.currency ?? "INR",
+    amount_inr: data.amount_inr ?? null,
+    is_international: data.is_international ?? 0,
   });
   return getTransaction(db, id) as Transaction;
 }
@@ -260,6 +282,16 @@ export function listCommittedExpenses(db: Database.Database): CommittedExpense[]
 
 export function deleteCommittedExpense(db: Database.Database, id: string): void {
   db.prepare("DELETE FROM committed_expenses WHERE id = ?").run(id);
+}
+
+// -- credit_cards --
+
+export function listCreditCards(db: Database.Database): CreditCard[] {
+  return db.prepare("SELECT * FROM credit_cards ORDER BY id ASC").all() as CreditCard[];
+}
+
+export function getCreditCard(db: Database.Database, id: string): CreditCard | undefined {
+  return db.prepare("SELECT * FROM credit_cards WHERE id = ?").get(id) as CreditCard | undefined;
 }
 
 // -- envelope (single row, id = 1) --

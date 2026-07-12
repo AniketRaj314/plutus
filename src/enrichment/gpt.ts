@@ -87,6 +87,11 @@ export async function enrichTransaction(db: Database.Database, transaction: Tran
     return;
   }
 
+  if (transaction.is_international && transaction.notes === "pending_forex_resolution") {
+    console.log(`[enrich] transaction ${transaction.id} is pending forex resolution, skipping enrichment for now`);
+    return;
+  }
+
   try {
     const committed = listCommittedExpenses(db);
     const recent = listTransactions(db, 4).filter((t) => t.id !== transaction.id).slice(0, 3);
@@ -113,6 +118,7 @@ export async function enrichTransaction(db: Database.Database, transaction: Tran
       category: parsed.category,
       is_committed: parsed.is_committed ? 1 : 0,
       notes: parsed.notes,
+      enrichment_confidence: parsed.confidence,
     });
 
     console.log(
@@ -120,6 +126,18 @@ export async function enrichTransaction(db: Database.Database, transaction: Tran
     );
   } catch (err) {
     console.error(`[enrich] enrichment failed for transaction ${transaction.id}:`, err);
+
+    updateTransaction(db, transaction.id, {
+      merchant_clean: transaction.merchant_raw,
+      category: "Other",
+      is_committed: 0,
+      enrichment_confidence: 0,
+      notes: "enrichment_failed",
+    });
+
+    console.log(
+      `[enrich] transaction ${transaction.id}: fell back to safe defaults (merchant_clean="${transaction.merchant_raw}" category="Other" confidence=0 notes="enrichment_failed")`
+    );
   }
 }
 

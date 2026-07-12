@@ -9,7 +9,11 @@
     "build": "tsc",
     "start": "node dist/index.js",
     "poll:once": "ts-node scripts/poll-once.ts",
-    "enrich:one": "ts-node scripts/enrich-one.ts"
+    "enrich:one": "ts-node scripts/enrich-one.ts",
+    "envelope:state": "ts-node scripts/envelope-state.ts",
+    "envelope:setup": "ts-node scripts/envelope-setup.ts",
+    "envelope:rollover": "ts-node scripts/envelope-rollover.ts",
+    "envelope:apply": "ts-node scripts/envelope-apply.ts"
   },
   "dependencies": {
     "better-sqlite3": "^11.10.0",

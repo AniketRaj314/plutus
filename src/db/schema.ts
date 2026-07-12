@@ -29,6 +29,11 @@ export function runMigrations(db: Database.Database): void {
       notes TEXT,
       raw_email_id TEXT,
       is_reversal INTEGER DEFAULT 0,
+      enrichment_confidence REAL,
+      envelope_applied INTEGER DEFAULT 0,
+      currency TEXT DEFAULT 'INR',
+      amount_inr REAL,
+      is_international INTEGER DEFAULT 0,
       created_at TEXT DEFAULT (datetime('now'))
     );
 
@@ -81,6 +86,16 @@ export function runMigrations(db: Database.Database): void {
       created_at TEXT DEFAULT (datetime('now'))
     );
 
+    CREATE TABLE IF NOT EXISTS credit_cards (
+      id TEXT PRIMARY KEY,
+      name TEXT,
+      last4 TEXT,
+      billing_start_day INTEGER,
+      billing_end_day INTEGER,
+      due_day INTEGER,
+      source TEXT
+    );
+
     CREATE INDEX IF NOT EXISTS idx_transactions_datetime ON transactions (datetime);
     CREATE INDEX IF NOT EXISTS idx_transactions_source ON transactions (source);
     CREATE INDEX IF NOT EXISTS idx_splits_transaction_id ON splits (transaction_id);
@@ -88,9 +103,32 @@ export function runMigrations(db: Database.Database): void {
 
   ensureColumn(db, "transactions", "raw_email_id", "TEXT");
   ensureColumn(db, "transactions", "is_reversal", "INTEGER DEFAULT 0");
+  ensureColumn(db, "transactions", "enrichment_confidence", "REAL");
+  ensureColumn(db, "transactions", "envelope_applied", "INTEGER DEFAULT 0");
+  ensureColumn(db, "transactions", "currency", "TEXT DEFAULT 'INR'");
+  ensureColumn(db, "transactions", "amount_inr", "REAL");
+  ensureColumn(db, "transactions", "is_international", "INTEGER DEFAULT 0");
   db.exec(`CREATE INDEX IF NOT EXISTS idx_transactions_raw_email_id ON transactions (raw_email_id);`);
 
   seedEnvelope(db);
+  seedCreditCards(db);
+}
+
+function seedCreditCards(db: Database.Database): void {
+  const cards = [
+    { id: "amex", name: "American Express", last4: null, billing_start_day: 21, billing_end_day: 20, due_day: 8, source: "amex" },
+    { id: "bobcard", name: "BOBCARD One", last4: "8533", billing_start_day: 22, billing_end_day: 21, due_day: 9, source: "bobcard" },
+    { id: "idfc_cc", name: "IDFC FIRST Credit Card", last4: "6198", billing_start_day: 20, billing_end_day: 19, due_day: 4, source: "idfc_cc" },
+  ];
+
+  const stmt = db.prepare(
+    `INSERT OR REPLACE INTO credit_cards (id, name, last4, billing_start_day, billing_end_day, due_day, source)
+     VALUES (@id, @name, @last4, @billing_start_day, @billing_end_day, @due_day, @source)`
+  );
+
+  for (const card of cards) {
+    stmt.run(card);
+  }
 }
 
 function ensureColumn(db: Database.Database, table: string, column: string, type: string): void {

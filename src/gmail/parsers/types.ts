@@ -15,6 +15,11 @@ export interface ParsedTransaction {
   card_last4: string;
   raw_email_id: string;
   is_reversal: boolean;
+  currency: string;
+  amount_inr: number | null;
+  is_international: boolean;
+  notes: string | null;
+  envelope_impact: number | null;
 }
 
 export type ParsedFields = Omit<ParsedTransaction, "id" | "raw_email_id">;
