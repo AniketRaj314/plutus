@@ -1,0 +1,8 @@
+import { getDb, runMigrations } from "./db/schema";
+
+console.log("Plutus starting...");
+
+const dbPath = process.env.DATABASE_PATH ?? "./plutus.sqlite";
+const db = getDb(dbPath);
+runMigrations(db);
+console.log("DB ready");
