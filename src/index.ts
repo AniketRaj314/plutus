@@ -11,9 +11,15 @@ async function main() {
   console.log("Plutus starting...");
 
   const dbPath = process.env.DATABASE_PATH || "./plutus.sqlite";
+  console.log(`Node version: ${process.version}`);
+  console.log(`DATABASE_PATH: ${dbPath}`);
+
   const db = getDb(dbPath);
   runMigrations(db);
   console.log("DB ready");
+
+  startEnvelopeCron(db);
+  startCorrelator(db);
 
   const app = Fastify();
   registerRoutes(app, db);
@@ -21,14 +27,16 @@ async function main() {
 
   const port = Number(process.env.PORT) || 3000;
   await app.listen({ port, host: "0.0.0.0" });
-  console.log(`Fastify listening on port ${port}`);
+  console.log(`Plutus listening on port ${port}`);
 
-  await registerWebhook();
+  if (process.env.NODE_ENV === "production") {
+    await registerWebhook();
+    console.log(`Telegram webhook registered at ${process.env.WEBHOOK_URL}`);
+  }
+
   await flushPendingRebalanceMessage(db);
 
   startPoller(db);
-  startEnvelopeCron(db);
-  startCorrelator(db);
 }
 
 main().catch((err) => {

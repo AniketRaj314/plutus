@@ -47,7 +47,24 @@ export function registerRoutes(app: FastifyInstance, db: Database.Database): voi
     });
   });
 
-  app.get("/health", async () => ({ status: "ok" }));
+  app.get("/health", async (_request, reply) => {
+    try {
+      db.prepare("SELECT 1").get();
+    } catch (err) {
+      console.error("[health] DB check failed:", err);
+      reply.status(503);
+      return { status: "degraded", db: "error" };
+    }
+
+    return {
+      status: "ok",
+      uptime: process.uptime(),
+      db: "ok",
+      node_version: process.version,
+      environment: process.env.NODE_ENV,
+      poll_interval: process.env.POLL_INTERVAL_MINS,
+    };
+  });
 }
 
 // -- REST API (bearer-token auth, CORS, rate limiting on /agent) --
