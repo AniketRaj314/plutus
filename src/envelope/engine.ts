@@ -165,6 +165,56 @@ export function recalculateEnvelope(db: Database.Database): Envelope {
   return getEnvelope(db) as Envelope;
 }
 
+// Full reconciliation of spend tracking against actual transaction data —
+// distinct from recalculateEnvelope() above, which only rederives
+// committed_total/discretionary_pool/current_week_budget from committed
+// expenses and assumes spent_discretionary/current_week_spent are already
+// correct. Use this after a bulk backfill or any batch of manual
+// create/delete_transaction calls, where incremental application could have
+// drifted from reality (out-of-order inserts, deleted rows, etc).
+export function reconcileEnvelopeFromTransactions(db: Database.Database): Envelope {
+  const envelope = getEnvelope(db);
+  if (!envelope || !envelope.monthly_spendable) {
+    return setupEnvelope(db);
+  }
+
+  const monthStart = `${envelope.month}-01T00:00:00.000Z`;
+  const weekStart = `${envelope.current_week_start}T00:00:00.000Z`;
+
+  // Reversals are intentionally included, not excluded — their envelope_impact
+  // is already negative, so summing them nets refunds against the original
+  // charge instead of silently ignoring the credit.
+  const row = db
+    .prepare(
+      `SELECT
+         COALESCE(SUM(CASE WHEN datetime >= @monthStart THEN envelope_impact ELSE 0 END), 0) AS month_total,
+         COALESCE(SUM(CASE WHEN datetime >= @weekStart THEN envelope_impact ELSE 0 END), 0) AS week_total
+       FROM transactions
+       WHERE is_committed = 0 AND is_cancelled_out = 0 AND envelope_applied = 1`
+    )
+    .get({ monthStart, weekStart }) as { month_total: number; week_total: number };
+
+  const weekStartDate = envelope.current_week_start ? parseIstDateOnly(envelope.current_week_start) : getWeekStart(new Date());
+  const month = envelope.month ?? formatIstDate(toIstDateOnly(new Date())).slice(0, 7);
+  const weeksRemaining = getRemainingWeeksInMonth(weekStartDate, month);
+
+  const discretionaryPool = envelope.discretionary_pool ?? 0;
+  const remainingPool = discretionaryPool - row.month_total;
+  const newWeeklyBudget = remainingPool / weeksRemaining;
+
+  updateEnvelope(db, {
+    spent_discretionary: row.month_total,
+    current_week_spent: row.week_total,
+    current_week_budget: newWeeklyBudget,
+  });
+
+  console.log(
+    `[envelope] reconciled from transactions: spent_discretionary=${row.month_total} current_week_spent=${row.week_total} current_week_budget=${newWeeklyBudget}`
+  );
+
+  return getEnvelope(db) as Envelope;
+}
+
 // -- core operations --
 
 export function getEnvelopeState(db: Database.Database): Envelope | undefined {

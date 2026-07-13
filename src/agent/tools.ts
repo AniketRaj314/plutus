@@ -4,19 +4,33 @@ import {
   queryTransactions,
   getTransaction,
   updateTransaction,
+  insertTransaction,
+  deleteTransaction,
   insertSplit,
   updateSplit,
+  deleteSplit,
   listAllSplits,
   insertCommittedExpense,
+  getCommittedExpense,
+  deleteCommittedExpense,
   listTransactions,
   setContext,
   getContext,
+  listContext,
   getCreditCard,
   updateEnvelope,
   type Transaction,
   type NewTransaction,
 } from "../db/queries";
-import { applyTransaction, recalculateEnvelope, getEnvelopeState, getBillingWindow } from "../envelope/engine";
+import { newId } from "../db/schema";
+import {
+  applyTransaction,
+  recalculateEnvelope,
+  reconcileEnvelopeFromTransactions,
+  getEnvelopeState,
+  getBillingWindow,
+} from "../envelope/engine";
+import { enrichTransaction } from "../enrichment/gpt";
 
 function round2(n: number): number {
   return Math.round(n * 100) / 100;
@@ -26,7 +40,7 @@ export interface ToolDefinition {
   name: string;
   description: string;
   parameters: Record<string, unknown>;
-  handler: (db: Database.Database, args: Record<string, unknown>) => unknown;
+  handler: (db: Database.Database, args: Record<string, unknown>) => unknown | Promise<unknown>;
 }
 
 // -- get_envelope --
@@ -339,6 +353,159 @@ function getCardBillingWindowTool(db: Database.Database, args: { source: string 
   };
 }
 
+// -- create_transaction / bulk_create_transactions --
+
+interface CreateTransactionArgs {
+  source: string;
+  amount: number;
+  merchant_raw: string;
+  merchant_clean?: string;
+  category?: string;
+  datetime: string;
+  card_last4?: string;
+  currency?: string;
+  amount_inr?: number;
+  is_committed?: boolean;
+  is_cancelled_out?: boolean;
+  is_reversal?: boolean;
+  is_international?: boolean;
+  envelope_impact?: number;
+  notes?: string;
+}
+
+async function createTransactionTool(db: Database.Database, args: CreateTransactionArgs): Promise<unknown> {
+  const created = insertTransaction(db, {
+    source: args.source,
+    amount: args.amount,
+    merchant_raw: args.merchant_raw,
+    merchant_clean: args.merchant_clean,
+    category: args.category,
+    datetime: args.datetime,
+    card_last4: args.card_last4,
+    currency: args.currency ?? "INR",
+    amount_inr: args.amount_inr,
+    is_committed: args.is_committed ? 1 : 0,
+    is_cancelled_out: args.is_cancelled_out ? 1 : 0,
+    is_reversal: args.is_reversal ? 1 : 0,
+    is_international: args.is_international ? 1 : 0,
+    envelope_impact: args.envelope_impact,
+    notes: args.notes,
+    // Marks the row as manually created so email-dedup logic never mistakes
+    // it for (or gets confused by) a real Gmail-sourced transaction.
+    raw_email_id: `manual_backfill_${newId()}`,
+  });
+
+  const hasCleanData = args.merchant_clean !== undefined && args.category !== undefined;
+  if (!hasCleanData) {
+    await enrichTransaction(db, created);
+  }
+
+  const enriched = getTransaction(db, created.id) as Transaction;
+  const applyResult = applyTransaction(db, enriched);
+
+  return {
+    transaction: getTransaction(db, created.id),
+    apply_result: applyResult,
+    envelope: getEnvelopeState(db),
+  };
+}
+
+interface BulkCreateTransactionsArgs {
+  transactions: CreateTransactionArgs[];
+}
+
+interface BulkCreateResultItem {
+  success: boolean;
+  id?: string;
+  error?: string;
+}
+
+async function bulkCreateTransactionsTool(db: Database.Database, args: BulkCreateTransactionsArgs): Promise<unknown> {
+  const sorted = [...args.transactions].sort((a, b) =>
+    a.datetime < b.datetime ? -1 : a.datetime > b.datetime ? 1 : 0
+  );
+
+  const results: BulkCreateResultItem[] = [];
+  let created = 0;
+  let failed = 0;
+
+  // Sequential, not parallel — the envelope must apply transactions in
+  // datetime order for rebalance-after-big-purchase and week/month
+  // boundaries to compute correctly.
+  for (const txn of sorted) {
+    try {
+      const result = (await createTransactionTool(db, txn)) as { transaction: Transaction };
+      results.push({ success: true, id: result.transaction.id });
+      created++;
+    } catch (err) {
+      results.push({ success: false, error: err instanceof Error ? err.message : String(err) });
+      failed++;
+    }
+  }
+
+  return { created, failed, results, envelope: getEnvelopeState(db) };
+}
+
+// -- delete_transaction --
+
+function deleteTransactionTool(db: Database.Database, args: { id: string }): unknown {
+  const existing = getTransaction(db, args.id);
+  if (!existing) return { error: `transaction ${args.id} not found` };
+
+  let envelopeReversed = false;
+  if (existing.envelope_applied) {
+    const magnitude = existing.envelope_impact ?? existing.amount ?? 0;
+    const envelope = getEnvelope(db);
+    if (envelope) {
+      updateEnvelope(db, {
+        current_week_spent: (envelope.current_week_spent ?? 0) - magnitude,
+        spent_discretionary: (envelope.spent_discretionary ?? 0) - magnitude,
+      });
+      envelopeReversed = true;
+    }
+  }
+
+  if (existing.split_id) {
+    deleteSplit(db, existing.split_id);
+  }
+
+  deleteTransaction(db, args.id);
+
+  return { deleted: true, envelope_reversed: envelopeReversed };
+}
+
+// -- reconcile_envelope --
+
+function reconcileEnvelopeTool(db: Database.Database): unknown {
+  return reconcileEnvelopeFromTransactions(db);
+}
+
+// -- list_context --
+
+const INTERNAL_CONTEXT_KEYS = new Set(["telegram_message_map", "processed_message_ids"]);
+
+function listContextTool(db: Database.Database): unknown {
+  const rows = listContext(db);
+  const result: Record<string, string | null> = {};
+  for (const row of rows) {
+    if (INTERNAL_CONTEXT_KEYS.has(row.key)) continue;
+    result[row.key] = row.value;
+  }
+  return result;
+}
+
+// -- delete_committed_expense --
+
+function deleteCommittedExpenseTool(db: Database.Database, args: { id: string }): unknown {
+  const existing = getCommittedExpense(db, args.id);
+  if (!existing) return { error: `committed expense ${args.id} not found` };
+
+  deleteCommittedExpense(db, args.id);
+  const envelope = recalculateEnvelope(db);
+
+  return { deleted: true, envelope };
+}
+
 // -- tool registry --
 
 export const tools: ToolDefinition[] = [
@@ -502,5 +669,103 @@ export const tools: ToolDefinition[] = [
       required: ["source"],
     },
     handler: (db, args) => getCardBillingWindowTool(db, args as { source: string }),
+  },
+  {
+    name: "create_transaction",
+    description:
+      "Create a new transaction manually for backfilling historical statement data. Pass merchant_clean and category directly to skip GPT enrichment.",
+    parameters: {
+      type: "object",
+      properties: {
+        source: { type: "string", enum: ["idfc_cc", "bobcard", "amex", "idfc_upi"] },
+        amount: { type: "number" },
+        merchant_raw: { type: "string" },
+        merchant_clean: { type: "string", description: "If provided along with category, enrichment is skipped" },
+        category: { type: "string", description: "If provided along with merchant_clean, enrichment is skipped" },
+        datetime: { type: "string", description: "ISO 8601 datetime" },
+        card_last4: { type: "string" },
+        currency: { type: "string", description: "Default INR" },
+        amount_inr: { type: "number", description: "INR value for an international transaction" },
+        is_committed: { type: "boolean", description: "Default false" },
+        is_cancelled_out: { type: "boolean", description: "Default false" },
+        is_reversal: { type: "boolean", description: "Default false" },
+        is_international: { type: "boolean", description: "Default false" },
+        envelope_impact: { type: "number", description: "Override amount for envelope purposes, e.g. a split/partial charge" },
+        notes: { type: "string" },
+      },
+      required: ["source", "amount", "merchant_raw", "datetime"],
+    },
+    handler: (db, args) => createTransactionTool(db, args as unknown as CreateTransactionArgs),
+  },
+  {
+    name: "bulk_create_transactions",
+    description:
+      "Create multiple transactions in one call for statement backfill. Applied sequentially in datetime order (not parallel), so the envelope's rebalance and week/month math stays correct. A failure on one row doesn't abort the rest.",
+    parameters: {
+      type: "object",
+      properties: {
+        transactions: {
+          type: "array",
+          items: {
+            type: "object",
+            properties: {
+              source: { type: "string", enum: ["idfc_cc", "bobcard", "amex", "idfc_upi"] },
+              amount: { type: "number" },
+              merchant_raw: { type: "string" },
+              merchant_clean: { type: "string" },
+              category: { type: "string" },
+              datetime: { type: "string" },
+              card_last4: { type: "string" },
+              currency: { type: "string" },
+              amount_inr: { type: "number" },
+              is_committed: { type: "boolean" },
+              is_cancelled_out: { type: "boolean" },
+              is_reversal: { type: "boolean" },
+              is_international: { type: "boolean" },
+              envelope_impact: { type: "number" },
+              notes: { type: "string" },
+            },
+            required: ["source", "amount", "merchant_raw", "datetime"],
+          },
+        },
+      },
+      required: ["transactions"],
+    },
+    handler: (db, args) => bulkCreateTransactionsTool(db, args as unknown as BulkCreateTransactionsArgs),
+  },
+  {
+    name: "delete_transaction",
+    description:
+      "Delete a transaction and reverse its envelope impact if it had been applied. Use to correct backfill mistakes. Also deletes any associated split.",
+    parameters: {
+      type: "object",
+      properties: { id: { type: "string" } },
+      required: ["id"],
+    },
+    handler: (db, args) => deleteTransactionTool(db, args as { id: string }),
+  },
+  {
+    name: "reconcile_envelope",
+    description:
+      "Recompute spent_discretionary and current_week_spent from scratch by re-summing actual transaction data (envelope_impact of non-committed, non-cancelled, applied transactions), then re-derive current_week_budget from what's left. Use after a bulk backfill or a batch of manual create/delete_transaction calls, where incremental tracking may have drifted from the real transaction data. Distinct from recalculate_envelope, which only rederives the committed total and discretionary pool from committed expenses and assumes spend tracking is already accurate.",
+    parameters: { type: "object", properties: {}, required: [] },
+    handler: (db) => reconcileEnvelopeTool(db),
+  },
+  {
+    name: "list_context",
+    description: "Return all persisted context key-value pairs as a single object, excluding internal plumbing keys.",
+    parameters: { type: "object", properties: {}, required: [] },
+    handler: (db) => listContextTool(db),
+  },
+  {
+    name: "delete_committed_expense",
+    description:
+      "Remove a committed expense entry and recalculate the envelope's committed total and discretionary pool.",
+    parameters: {
+      type: "object",
+      properties: { id: { type: "string" } },
+      required: ["id"],
+    },
+    handler: (db, args) => deleteCommittedExpenseTool(db, args as { id: string }),
   },
 ];

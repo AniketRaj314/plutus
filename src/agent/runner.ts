@@ -106,7 +106,7 @@ export async function runAgent(db: Database.Database, payload: RunAgentPayload):
       } else {
         try {
           const args = toolCall.function.arguments ? JSON.parse(toolCall.function.arguments) : {};
-          result = tool.handler(db, args);
+          result = await tool.handler(db, args);
         } catch (err) {
           result = { error: err instanceof Error ? err.message : String(err) };
         }

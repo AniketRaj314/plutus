@@ -300,6 +300,10 @@ export function updateSplit(
   return getSplit(db, id);
 }
 
+export function deleteSplit(db: Database.Database, id: string): void {
+  db.prepare("DELETE FROM splits WHERE id = ?").run(id);
+}
+
 // -- committed_expenses --
 
 export function insertCommittedExpense(

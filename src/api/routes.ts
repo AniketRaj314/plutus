@@ -406,6 +406,12 @@ const MCP_TOOL_NAMES = [
   "recalculate_envelope",
   "set_context",
   "get_context",
+  "create_transaction",
+  "bulk_create_transactions",
+  "delete_transaction",
+  "reconcile_envelope",
+  "list_context",
+  "delete_committed_expense",
 ] as const;
 
 function buildMcpToolSpecs(): McpToolSpec[] {
