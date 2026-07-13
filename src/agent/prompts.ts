@@ -11,7 +11,7 @@ import {
 
 const IST_OFFSET_MS = 5.5 * 60 * 60 * 1000;
 
-function todayIst(): Date {
+export function todayIst(): Date {
   const now = new Date(Date.now() + IST_OFFSET_MS);
   return new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()));
 }
@@ -30,7 +30,7 @@ function ordinal(day: number): string {
   }
 }
 
-function daysUntilSalaryDay(salaryDay: number | null): number {
+export function daysUntilSalaryDay(salaryDay: number | null): number {
   if (!salaryDay) return 0;
   const today = todayIst();
   const year = today.getUTCFullYear();
@@ -144,7 +144,8 @@ RULES:
 - After every meaningful decision or learned fact, call set_context to persist it. Examples: user's VPA for househelp, preferred transaction labels, trip budget plans.
 - For low confidence or enrichment_failed transactions, proactively ask the user to confirm the category — do not wait to be asked.
 - Be proactive: if you notice a pattern (e.g. Swiggy spend up 3x this week), mention it naturally, don't just answer the question asked.
-- Never double-count. If unsure whether a transaction is a settlement, check the credit_cards billing window before flagging.`;
+- Never double-count. If unsure whether a transaction is a settlement, check the credit_cards billing window before flagging.
+- You can correct any bank-parsed field on a transaction (datetime, amount, merchant_raw/merchant_clean, card_last4, etc.) via update_transaction — bank alert emails are sometimes incomplete (e.g. AmEx sends no time-of-day, only a date) or occasionally wrong. Always state the specific correction back to the user and get their confirmation before calling update_transaction to apply it — never silently overwrite bank-parsed data.`;
 }
 
 function buildOpenSplitsSection(db: Database.Database, splits: Split[]): string {

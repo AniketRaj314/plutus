@@ -74,30 +74,61 @@ interface UpdateTransactionArgs {
   notes?: string;
   is_committed?: boolean;
   merchant_clean?: string;
+  merchant_raw?: string;
   is_cancelled_out?: boolean;
   amount_inr?: number;
+  amount?: number;
+  datetime?: string;
+  card_last4?: string;
 }
 
 function updateTransactionTool(db: Database.Database, args: UpdateTransactionArgs): unknown {
+  const existing = getTransaction(db, args.id);
+  if (!existing) return { error: `transaction ${args.id} not found` };
+
   const updates: Partial<NewTransaction> = {};
   if (args.category !== undefined) updates.category = args.category;
   if (args.notes !== undefined) updates.notes = args.notes;
   if (args.is_committed !== undefined) updates.is_committed = args.is_committed ? 1 : 0;
   if (args.merchant_clean !== undefined) updates.merchant_clean = args.merchant_clean;
+  if (args.merchant_raw !== undefined) updates.merchant_raw = args.merchant_raw;
   if (args.is_cancelled_out !== undefined) updates.is_cancelled_out = args.is_cancelled_out ? 1 : 0;
+  if (args.datetime !== undefined) updates.datetime = args.datetime;
+  if (args.card_last4 !== undefined) updates.card_last4 = args.card_last4;
 
-  if (args.amount_inr !== undefined) {
-    updates.amount_inr = args.amount_inr;
-    updates.envelope_impact = args.amount_inr;
-    // Resolving forex is a deliberate amendment, not an accidental retry —
-    // bypass applyTransaction's idempotency guard so the real deduction lands.
+  // Correcting the amount (whether resolving forex via amount_inr, or fixing
+  // a misparsed amount directly) affects money already deducted from the
+  // envelope — reverse the old deduction and let applyTransaction re-deduct
+  // the corrected one, bypassing its idempotency guard since this is a
+  // deliberate amendment, not an accidental retry.
+  const affectsEnvelope = args.amount_inr !== undefined || args.amount !== undefined;
+
+  if (affectsEnvelope && existing.envelope_applied) {
+    const reversedMagnitude = existing.envelope_impact ?? existing.amount ?? 0;
+    const envelope = getEnvelope(db);
+    if (envelope) {
+      updateEnvelope(db, {
+        current_week_spent: (envelope.current_week_spent ?? 0) - reversedMagnitude,
+        spent_discretionary: (envelope.spent_discretionary ?? 0) - reversedMagnitude,
+      });
+    }
+  }
+
+  if (affectsEnvelope) {
     updates.envelope_applied = 0;
+    if (args.amount_inr !== undefined) {
+      updates.amount_inr = args.amount_inr;
+      updates.envelope_impact = args.amount_inr;
+    }
+    if (args.amount !== undefined) {
+      updates.amount = args.amount;
+    }
   }
 
   const updated = updateTransaction(db, args.id, updates);
   if (!updated) return { error: `transaction ${args.id} not found` };
 
-  if (args.amount_inr === undefined) {
+  if (!affectsEnvelope) {
     return { transaction: updated };
   }
 
@@ -338,7 +369,7 @@ export const tools: ToolDefinition[] = [
   {
     name: "update_transaction",
     description:
-      "Update a transaction's category, notes, committed flag, clean merchant name, cancelled-out flag, or resolve a pending international transaction's INR amount. Setting amount_inr automatically applies the real envelope impact.",
+      "Correct any bank-parsed field on a transaction once the user has confirmed the correction: category, notes, committed flag, clean/raw merchant name, card last4, datetime (e.g. when the source email had no time-of-day, like AmEx), cancelled-out flag, the amount itself, or resolve a pending international transaction's INR amount. Changing amount or amount_inr automatically reverses the old envelope deduction and re-applies the corrected one. Always confirm the correction with the user before calling this.",
     parameters: {
       type: "object",
       properties: {
@@ -347,7 +378,11 @@ export const tools: ToolDefinition[] = [
         notes: { type: "string" },
         is_committed: { type: "boolean" },
         merchant_clean: { type: "string" },
+        merchant_raw: { type: "string" },
+        card_last4: { type: "string" },
+        datetime: { type: "string", description: "ISO 8601 datetime to correct an inaccurate or missing timestamp" },
         is_cancelled_out: { type: "boolean" },
+        amount: { type: "number", description: "Corrected transaction amount, if the parsed amount was wrong" },
         amount_inr: { type: "number", description: "INR value for a resolved international transaction" },
       },
       required: ["id"],

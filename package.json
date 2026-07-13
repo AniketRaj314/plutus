@@ -15,9 +15,11 @@
     "envelope:rollover": "ts-node scripts/envelope-rollover.ts",
     "envelope:apply": "ts-node scripts/envelope-apply.ts",
     "correlate:check": "ts-node scripts/correlate-check.ts",
-    "correlate:force": "ts-node scripts/correlate-force.ts"
+    "correlate:force": "ts-node scripts/correlate-force.ts",
+    "api:test": "ts-node scripts/api-test.ts"
   },
   "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.29.0",
     "better-sqlite3": "^11.10.0",
     "dotenv": "^17.4.2",
     "fastify": "^4.28.1",
@@ -26,7 +28,8 @@
     "node-cron": "^3.0.3",
     "node-html-parser": "^9.0.0",
     "node-telegram-bot-api": "^0.66.0",
-    "openai": "^4.67.3"
+    "openai": "^4.67.3",
+    "zod": "^3.25.76"
   },
   "devDependencies": {
     "@types/better-sqlite3": "^7.6.11",

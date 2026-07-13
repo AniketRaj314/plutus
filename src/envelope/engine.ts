@@ -263,7 +263,7 @@ export function applyTransaction(db: Database.Database, transaction: Transaction
     spent_discretionary: newSpentDiscretionary,
   });
 
-  updateTransaction(db, transaction.id, { envelope_applied: 1 });
+  updateTransaction(db, transaction.id, { envelope_applied: 1, envelope_impact: signedAmount });
 
   const triggeredRebalance = transaction.is_reversal ? null : rebalanceAfterBigPurchase(db, magnitude);
 

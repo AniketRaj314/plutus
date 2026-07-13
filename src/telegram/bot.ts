@@ -46,6 +46,17 @@ export async function sendMessage(text: string, replyToMessageId?: number): Prom
   return message.message_id;
 }
 
+export async function sendTypingAction(): Promise<void> {
+  try {
+    const bot = getBot();
+    const chatId = getChatId();
+    const threadId = getThreadId();
+    await bot.sendChatAction(chatId, "typing", { message_thread_id: threadId });
+  } catch (err) {
+    console.error("[telegram] failed to send typing action:", err instanceof Error ? err.message : err);
+  }
+}
+
 export async function editMessage(messageId: number, newText: string): Promise<void> {
   try {
     const bot = getBot();
@@ -69,11 +80,18 @@ export async function registerWebhook(): Promise<void> {
     return;
   }
 
+  const secretToken = process.env.TELEGRAM_WEBHOOK_SECRET;
+  if (!secretToken) {
+    console.warn(
+      "[telegram] TELEGRAM_WEBHOOK_SECRET not set — webhook will register without Telegram's secret_token verification, meaning the webhook route can't prove incoming requests are genuinely from Telegram"
+    );
+  }
+
   try {
     const bot = getBot();
     const url = `${webhookUrl.replace(/\/$/, "")}/webhook/telegram`;
-    await bot.setWebHook(url);
-    console.log(`[telegram] webhook registered: ${url}`);
+    await bot.setWebHook(url, secretToken ? { secret_token: secretToken } : undefined);
+    console.log(`[telegram] webhook registered: ${url}${secretToken ? " (with secret_token)" : ""}`);
   } catch (err) {
     console.error("[telegram] failed to register webhook:", err);
   }
@@ -158,6 +176,11 @@ export async function handleTelegramUpdate(db: Database.Database, update: Telegr
     console.log(`[telegram] incoming general message: "${message.text}"`);
   }
 
+  // Telegram's "typing" indicator only lasts ~5s, so refresh it periodically
+  // while the agent (o3 can take 10-30s) is still working.
+  void sendTypingAction();
+  const typingInterval = setInterval(() => void sendTypingAction(), 4000);
+
   try {
     const reply = await runAgent(db, {
       user_message: message.text,
@@ -168,5 +191,7 @@ export async function handleTelegramUpdate(db: Database.Database, update: Telegr
   } catch (err) {
     console.error("[telegram] agent run failed:", err);
     await sendMessage("Something went wrong on my end — try again in a bit.", message.message_id);
+  } finally {
+    clearInterval(typingInterval);
   }
 }

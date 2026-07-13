@@ -6,7 +6,8 @@ import { tools } from "./tools";
 import { listRecentAgentMessages, insertAgentMessage, getTransaction } from "../db/queries";
 
 const MODEL = "o3";
-const MAX_TOOL_ITERATIONS = 8;
+const MAX_TOOL_ITERATIONS = 20;
+const MAX_COMPLETION_TOKENS = 8000;
 
 let client: OpenAI | null = null;
 
@@ -78,6 +79,7 @@ export async function runAgent(db: Database.Database, payload: RunAgentPayload):
       temperature: 1,
       messages,
       tools: toolDefs,
+      max_completion_tokens: MAX_COMPLETION_TOKENS,
     });
 
     const message = completion.choices[0].message;
@@ -118,8 +120,7 @@ export async function runAgent(db: Database.Database, payload: RunAgentPayload):
     }
 
     if (i === MAX_TOOL_ITERATIONS - 1) {
-      finalText =
-        "I hit my reasoning step limit working through that — try rephrasing or breaking it into smaller asks.";
+      finalText = "That's a lot to set up in one go — let's do it in parts. Can you tell me one committed expense at a time?";
     }
   }
 

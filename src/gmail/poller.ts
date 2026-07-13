@@ -175,6 +175,10 @@ async function listMessageIds(gmail: gmail_v1.Gmail, query: string): Promise<str
   let pageToken: string | undefined;
 
   do {
+    // Intentionally no labelIds filter (e.g. CATEGORY_PRIMARY) — the
+    // sender-scoped `q` query above is tight enough on its own, and we want
+    // bank alert emails picked up regardless of which Gmail tab (Primary,
+    // Updates, Promotions, etc.) they land in.
     const res = await gmail.users.messages.list({
       userId: "me",
       q: query,

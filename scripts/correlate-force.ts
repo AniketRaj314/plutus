@@ -10,7 +10,7 @@ async function main() {
     process.exit(1);
   }
 
-  const dbPath = process.env.DATABASE_PATH ?? "./plutus.sqlite";
+  const dbPath = process.env.DATABASE_PATH || "./plutus.sqlite";
   const db = getDb(dbPath);
   runMigrations(db);
 
