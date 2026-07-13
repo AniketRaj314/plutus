@@ -9,8 +9,11 @@ import { applyTransaction, getEnvelopeState } from "../envelope/engine";
 import { sendMessage, recordTransactionMessage } from "../telegram/bot";
 import { formatTransaction } from "../telegram/formatter";
 
-const WATCHED_SENDERS = ["noreply@idfcfirstbank.com", "no-reply@getonecard.app"];
-// americanexpress.com sender address TBD — not yet included
+const WATCHED_SENDERS = [
+  "noreply@idfcfirstbank.com",
+  "no-reply@getonecard.app",
+  "AmericanExpress@welcome.americanexpress.com",
+];
 
 const LAST_POLL_KEY = "last_gmail_poll";
 const PROCESSED_IDS_KEY = "processed_message_ids";
@@ -109,6 +112,8 @@ export async function processMessage(db: Database.Database, message: gmail_v1.Sc
     is_international: parsed.is_international ? 1 : 0,
     envelope_impact: parsed.envelope_impact,
     notes: parsed.notes,
+    is_preauth: parsed.is_preauth ? 1 : 0,
+    correlation_status: parsed.correlation_status ?? "none",
   });
 
   console.log(
@@ -118,6 +123,25 @@ export async function processMessage(db: Database.Database, message: gmail_v1.Sc
   await enrichTransaction(db, transaction);
 
   const enriched = getTransaction(db, transaction.id) ?? transaction;
+
+  if (enriched.source === "idfc_upi" && enriched.correlation_status === "pending") {
+    // Envelope apply and final formatting are deferred to the correlation
+    // engine (src/enrichment/correlator.ts) — it edits this same message
+    // in-place once a matching merchant receipt is found or the 30-minute
+    // window expires.
+    const pendingText = formatTransaction(enriched, getEnvelopeState(db));
+    if (pendingText) {
+      try {
+        const messageId = await sendMessage(pendingText);
+        recordTransactionMessage(db, messageId, enriched.id);
+        console.log(`[telegram] sent pending UPI message ${messageId} for transaction ${enriched.id}`);
+      } catch (err) {
+        console.error(`[telegram] failed to send pending UPI message for transaction ${enriched.id}:`, err);
+      }
+    }
+    return;
+  }
+
   const applyResult = applyTransaction(db, enriched);
 
   if (applyResult) {
@@ -177,7 +201,7 @@ function getLastPollTimestamp(db: Database.Database): number {
   return Number(row.value);
 }
 
-function getProcessedIds(db: Database.Database): Set<string> {
+export function getProcessedIds(db: Database.Database): Set<string> {
   const row = getContext(db, PROCESSED_IDS_KEY);
   if (!row?.value) return new Set();
   try {
@@ -188,7 +212,7 @@ function getProcessedIds(db: Database.Database): Set<string> {
   }
 }
 
-function saveProcessedIds(db: Database.Database, ids: Set<string>): void {
+export function saveProcessedIds(db: Database.Database, ids: Set<string>): void {
   const trimmed = Array.from(ids).slice(-MAX_PROCESSED_IDS);
   setContext(db, PROCESSED_IDS_KEY, JSON.stringify(trimmed));
 }

@@ -7,7 +7,7 @@ import {
   type Transaction,
 } from "../db/queries";
 
-const CATEGORIES = [
+export const CATEGORIES = [
   "Food & Dining",
   "Groceries",
   "Transport",

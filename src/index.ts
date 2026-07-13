@@ -5,6 +5,7 @@ import { startPoller } from "./gmail/poller";
 import { startEnvelopeCron } from "./envelope/engine";
 import { registerWebhook, flushPendingRebalanceMessage } from "./telegram/bot";
 import { registerRoutes } from "./api/routes";
+import { startCorrelator } from "./enrichment/correlator";
 
 async function main() {
   console.log("Plutus starting...");
@@ -26,6 +27,7 @@ async function main() {
 
   startPoller(db);
   startEnvelopeCron(db);
+  startCorrelator(db);
 }
 
 main().catch((err) => {

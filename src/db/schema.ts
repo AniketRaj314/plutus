@@ -34,6 +34,7 @@ export function runMigrations(db: Database.Database): void {
       currency TEXT DEFAULT 'INR',
       amount_inr REAL,
       is_international INTEGER DEFAULT 0,
+      is_preauth INTEGER DEFAULT 0,
       created_at TEXT DEFAULT (datetime('now'))
     );
 
@@ -108,6 +109,7 @@ export function runMigrations(db: Database.Database): void {
   ensureColumn(db, "transactions", "currency", "TEXT DEFAULT 'INR'");
   ensureColumn(db, "transactions", "amount_inr", "REAL");
   ensureColumn(db, "transactions", "is_international", "INTEGER DEFAULT 0");
+  ensureColumn(db, "transactions", "is_preauth", "INTEGER DEFAULT 0");
   db.exec(`CREATE INDEX IF NOT EXISTS idx_transactions_raw_email_id ON transactions (raw_email_id);`);
 
   seedEnvelope(db);
@@ -116,7 +118,7 @@ export function runMigrations(db: Database.Database): void {
 
 function seedCreditCards(db: Database.Database): void {
   const cards = [
-    { id: "amex", name: "American Express", last4: null, billing_start_day: 21, billing_end_day: 20, due_day: 8, source: "amex" },
+    { id: "amex", name: "American Express", last4: "41001", billing_start_day: 21, billing_end_day: 20, due_day: 8, source: "amex" },
     { id: "bobcard", name: "BOBCARD One", last4: "8533", billing_start_day: 22, billing_end_day: 21, due_day: 9, source: "bobcard" },
     { id: "idfc_cc", name: "IDFC FIRST Credit Card", last4: "6198", billing_start_day: 20, billing_end_day: 19, due_day: 4, source: "idfc_cc" },
   ];

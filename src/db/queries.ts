@@ -25,6 +25,7 @@ export interface Transaction {
   currency: string;
   amount_inr: number | null;
   is_international: number;
+  is_preauth: number;
   created_at: string;
 }
 
@@ -106,12 +107,12 @@ export function insertTransaction(db: Database.Database, data: NewTransaction): 
       id, source, amount, merchant_raw, merchant_clean, category, datetime,
       card_last4, is_committed, is_credit_card_payment, is_cancelled_out,
       split_id, envelope_impact, correlated_with, correlation_status, notes, raw_email_id, is_reversal,
-      enrichment_confidence, envelope_applied, currency, amount_inr, is_international
+      enrichment_confidence, envelope_applied, currency, amount_inr, is_international, is_preauth
     ) VALUES (
       @id, @source, @amount, @merchant_raw, @merchant_clean, @category, @datetime,
       @card_last4, @is_committed, @is_credit_card_payment, @is_cancelled_out,
       @split_id, @envelope_impact, @correlated_with, @correlation_status, @notes, @raw_email_id, @is_reversal,
-      @enrichment_confidence, @envelope_applied, @currency, @amount_inr, @is_international
+      @enrichment_confidence, @envelope_applied, @currency, @amount_inr, @is_international, @is_preauth
     )`
   ).run({
     id,
@@ -137,6 +138,7 @@ export function insertTransaction(db: Database.Database, data: NewTransaction): 
     currency: data.currency ?? "INR",
     amount_inr: data.amount_inr ?? null,
     is_international: data.is_international ?? 0,
+    is_preauth: data.is_preauth ?? 0,
   });
   return getTransaction(db, id) as Transaction;
 }
@@ -224,6 +226,12 @@ export function queryTransactions(db: Database.Database, filters: TransactionFil
   return db
     .prepare(`SELECT * FROM transactions ${where} ORDER BY datetime DESC LIMIT @limit`)
     .all(params) as Transaction[];
+}
+
+export function listPendingCorrelations(db: Database.Database): Transaction[] {
+  return db
+    .prepare("SELECT * FROM transactions WHERE correlation_status = 'pending' ORDER BY datetime ASC")
+    .all() as Transaction[];
 }
 
 export function updateTransaction(

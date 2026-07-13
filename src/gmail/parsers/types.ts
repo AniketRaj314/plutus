@@ -4,6 +4,7 @@ export interface EmailContent {
   from: string;
   subject: string;
   body: string;
+  htmlBody: string;
 }
 
 export interface ParsedTransaction {
@@ -20,6 +21,8 @@ export interface ParsedTransaction {
   is_international: boolean;
   notes: string | null;
   envelope_impact: number | null;
+  is_preauth: boolean;
+  correlation_status?: string;
 }
 
 export type ParsedFields = Omit<ParsedTransaction, "id" | "raw_email_id">;

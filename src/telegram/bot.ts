@@ -46,6 +46,22 @@ export async function sendMessage(text: string, replyToMessageId?: number): Prom
   return message.message_id;
 }
 
+export async function editMessage(messageId: number, newText: string): Promise<void> {
+  try {
+    const bot = getBot();
+    const chatId = getChatId();
+
+    await bot.editMessageText(newText, {
+      chat_id: chatId,
+      message_id: messageId,
+    });
+  } catch (err) {
+    // Telegram rejects edits on messages older than 48h, and the original
+    // message may have been deleted by the user — neither should crash the caller.
+    console.error(`[telegram] failed to edit message ${messageId}:`, err instanceof Error ? err.message : err);
+  }
+}
+
 export async function registerWebhook(): Promise<void> {
   const webhookUrl = process.env.WEBHOOK_URL;
   if (!webhookUrl) {
@@ -97,6 +113,12 @@ export function recordTransactionMessage(db: Database.Database, messageId: numbe
 
 export function getTransactionIdForMessage(db: Database.Database, messageId: number): string | undefined {
   return getMessageMap(db)[String(messageId)];
+}
+
+export function getMessageIdForTransaction(db: Database.Database, transactionId: string): number | undefined {
+  const map = getMessageMap(db);
+  const entry = Object.entries(map).find(([, txId]) => txId === transactionId);
+  return entry ? Number(entry[0]) : undefined;
 }
 
 // -- incoming webhook updates --

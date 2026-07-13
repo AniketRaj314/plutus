@@ -20,8 +20,9 @@ export function parseGmailMessage(message: gmail_v1.Schema$Message): ParsedTrans
   const from = headers.find((h) => h.name?.toLowerCase() === "from")?.value ?? "";
   const subject = headers.find((h) => h.name?.toLowerCase() === "subject")?.value ?? "";
   const body = extractBody(message.payload);
+  const htmlBody = extractRawHtml(message.payload);
 
-  const email: EmailContent = { from, subject, body };
+  const email: EmailContent = { from, subject, body, htmlBody };
   const fromLower = from.toLowerCase();
 
   const result = fromLower.includes("noreply@idfcfirstbank.com")
@@ -56,6 +57,12 @@ function extractBody(payload?: gmail_v1.Schema$MessagePart): string {
   if (html) return stripHtml(decodeBase64Url(html));
 
   return "";
+}
+
+function extractRawHtml(payload?: gmail_v1.Schema$MessagePart): string {
+  if (!payload) return "";
+  const html = findPart(payload, "text/html");
+  return html ? decodeBase64Url(html) : "";
 }
 
 function findPart(part: gmail_v1.Schema$MessagePart, mimeType: string): string | undefined {

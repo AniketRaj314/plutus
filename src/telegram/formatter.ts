@@ -13,11 +13,11 @@ const SOURCE_DISPLAY_NAMES: Record<string, string> = {
   idfc_upi: "IDFC UPI",
 };
 
-function formatINR(amount: number): string {
+export function formatINR(amount: number): string {
   return `₹${new Intl.NumberFormat("en-IN", { maximumFractionDigits: 0 }).format(Math.round(amount))}`;
 }
 
-function formatIstDateTime(isoUtc: string): string {
+export function formatIstDateTime(isoUtc: string): string {
   const d = new Date(isoUtc);
   const ist = new Date(d.getTime() + IST_OFFSET_MS);
   const day = String(ist.getUTCDate()).padStart(2, "0");
@@ -46,11 +46,9 @@ export function formatTransaction(transaction: Transaction, envelope: Envelope |
   const dateLine = `📅 ${formatIstDateTime(transaction.datetime ?? new Date().toISOString())}`;
 
   if (transaction.correlation_status === "pending") {
-    return [
-      `🔄 UPI Transfer (${sourceLabel(transaction.source)})`,
-      `${formatINR(transaction.amount ?? 0)} · Matching receipt...`,
-      dateLine,
-    ].join("\n");
+    return [`🔄 UPI Transfer · IDFC`, `${formatINR(transaction.amount ?? 0)} · Matching receipt...`, dateLine].join(
+      "\n"
+    );
   }
 
   if (transaction.correlation_status === "matched") {

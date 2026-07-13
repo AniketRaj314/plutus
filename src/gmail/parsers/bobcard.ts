@@ -42,6 +42,7 @@ export function parseBobCard(email: EmailContent): ParsedFields | null {
       is_international: true,
       envelope_impact: 0,
       notes: "pending_forex_resolution",
+      is_preauth: false,
     };
   }
 
@@ -57,5 +58,6 @@ export function parseBobCard(email: EmailContent): ParsedFields | null {
     is_international: false,
     envelope_impact: null,
     notes: null,
+    is_preauth: false,
   };
 }
