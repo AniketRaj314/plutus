@@ -204,8 +204,15 @@ export function queryTransactions(db: Database.Database, filters: TransactionFil
     params.since = filters.since;
   }
   if (filters.until) {
-    clauses.push("datetime <= @until");
-    params.until = filters.until;
+    if (/^\d{4}-\d{2}-\d{2}$/.test(filters.until)) {
+      const next = new Date(`${filters.until}T00:00:00.000Z`);
+      next.setUTCDate(next.getUTCDate() + 1);
+      clauses.push("datetime < @until_exclusive");
+      params.until_exclusive = next.toISOString().slice(0, 10);
+    } else {
+      clauses.push("datetime <= @until");
+      params.until = filters.until;
+    }
   }
   if (filters.source) {
     clauses.push("source = @source");

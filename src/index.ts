@@ -2,10 +2,10 @@ import "dotenv/config";
 import Fastify from "fastify";
 import { getDb, runMigrations } from "./db/schema";
 import { startPoller } from "./gmail/poller";
-import { startEnvelopeCron } from "./envelope/engine";
-import { registerWebhook, flushPendingRebalanceMessage } from "./telegram/bot";
+import { registerWebhook } from "./telegram/bot";
 import { registerRoutes, registerApiRoutes } from "./api/routes";
 import { startCorrelator } from "./enrichment/correlator";
+import { startInferenceCron } from "./agent/inference";
 
 async function main() {
   console.log("Plutus starting...");
@@ -18,8 +18,8 @@ async function main() {
   runMigrations(db);
   console.log("DB ready");
 
-  startEnvelopeCron(db);
   startCorrelator(db);
+  startInferenceCron(db);
 
   const app = Fastify();
   registerRoutes(app, db);
@@ -33,8 +33,6 @@ async function main() {
     await registerWebhook();
     console.log(`Telegram webhook registered at ${process.env.WEBHOOK_URL}`);
   }
-
-  await flushPendingRebalanceMessage(db);
 
   startPoller(db);
 }

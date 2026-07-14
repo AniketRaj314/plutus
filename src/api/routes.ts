@@ -25,6 +25,7 @@ const MAX_TRANSACTIONS_LIMIT = 100;
 const AGENT_TIMEOUT_MS = 120_000;
 const AGENT_RATE_LIMIT_MAX = 10;
 const AGENT_RATE_LIMIT_WINDOW_MS = 60_000;
+export const PACKAGE_VERSION = (require("../../package.json") as { version?: string }).version ?? "unknown";
 
 // -- webhook + health (unchanged, no auth) --
 
@@ -58,11 +59,14 @@ export function registerRoutes(app: FastifyInstance, db: Database.Database): voi
 
     return {
       status: "ok",
+      version: PACKAGE_VERSION,
       uptime: process.uptime(),
       db: "ok",
       node_version: process.version,
       environment: process.env.NODE_ENV,
       poll_interval: process.env.POLL_INTERVAL_MINS,
+      auto_inference_enabled: process.env.AUTO_INFERENCE_ENABLED !== "false",
+      auto_inference_interval: process.env.AUTO_INFERENCE_INTERVAL_MINS ?? "5",
     };
   });
 }
@@ -258,11 +262,18 @@ export function registerApiRoutes(app: FastifyInstance, db: Database.Database): 
         const byMerchant: Record<string, { total: number; count: number }> = {};
         let internationalPendingCount = 0;
         let lowConfidenceCount = 0;
+        let includedTransactionCount = 0;
 
         for (const t of inPeriod) {
-          const amount = t.amount ?? 0;
+          if (t.is_cancelled_out || t.is_credit_card_payment) continue;
+          if (t.is_international && t.amount_inr === null) {
+            internationalPendingCount++;
+            continue;
+          }
+          const amount = t.is_international ? t.amount_inr ?? 0 : t.amount ?? 0;
           const signed = t.is_reversal ? -amount : amount;
           totalSpent += signed;
+          includedTransactionCount++;
 
           const category = t.category ?? "Uncategorized";
           if (!byCategory[category]) byCategory[category] = { total: 0, count: 0 };
@@ -274,7 +285,6 @@ export function registerApiRoutes(app: FastifyInstance, db: Database.Database): 
           byMerchant[merchant].total += signed;
           byMerchant[merchant].count += 1;
 
-          if (t.is_international && t.amount_inr === null) internationalPendingCount++;
           if (t.notes === "enrichment_failed" || (t.enrichment_confidence !== null && t.enrichment_confidence < 0.7)) {
             lowConfidenceCount++;
           }
@@ -282,8 +292,10 @@ export function registerApiRoutes(app: FastifyInstance, db: Database.Database): 
 
         return {
           period,
+          metric: "legacy_raw_activity_inr",
+          warning: "Raw calendar activity is not true personal spend. Use the v2 funding summary for salary-envelope reasoning.",
           total_spent: round2(totalSpent),
-          transaction_count: inPeriod.length,
+          transaction_count: includedTransactionCount,
           by_category: Object.entries(byCategory)
             .sort((a, b) => b[1].total - a[1].total)
             .map(([category, v]) => ({ category, total: round2(v.total), count: v.count })),
@@ -394,27 +406,29 @@ interface McpToolSpec {
 // also happens to map more directly onto tools.ts's existing JSON Schema
 // parameter definitions, so most of these are thin passthroughs.
 const MCP_TOOL_NAMES = [
-  "get_envelope",
-  "get_transactions",
-  "get_summary",
-  "get_splits_owed",
-  "get_card_billing_window",
-  "update_transaction",
-  "mark_as_split",
-  "settle_split",
-  "set_committed_expense",
-  "recalculate_envelope",
-  "set_context",
-  "get_context",
-  "create_transaction",
-  "bulk_create_transactions",
-  "delete_transaction",
-  "reconcile_envelope",
-  "list_context",
-  "delete_committed_expense",
+  "create_raw_transaction",
+  "bulk_create_raw_transactions",
+  "get_raw_transactions",
+  "get_salary_profile",
+  "update_salary_profile",
+  "get_card_cycle_for_date",
+  "list_uninterpreted_transactions",
+  "infer_raw_transaction",
+  "interpret_pending_transactions",
+  "create_envelope_entry",
+  "list_envelope_entries",
+  "get_funding_summary",
+  "set_context_fact",
+  "list_context_facts",
+  "create_receivable",
+  "update_receivable",
+  "list_receivables",
+  "create_commitment",
+  "update_commitment",
+  "list_commitments_v2",
 ] as const;
 
-function buildMcpToolSpecs(): McpToolSpec[] {
+export function buildMcpToolSpecs(): McpToolSpec[] {
   const specs: McpToolSpec[] = [];
 
   for (const name of MCP_TOOL_NAMES) {
@@ -427,13 +441,6 @@ function buildMcpToolSpecs(): McpToolSpec[] {
       run: (db, args) => tool.handler(db, args),
     });
   }
-
-  specs.push({
-    name: "get_committed",
-    description: "Get all committed (recurring/fixed) expenses.",
-    inputSchema: { type: "object", properties: {}, required: [] },
-    run: (db) => listCommittedExpenses(db),
-  });
 
   specs.push({
     name: "post_agent_message",

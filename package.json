@@ -1,6 +1,6 @@
 {
   "name": "plutus",
-  "version": "0.1.0",
+  "version": "1.0.0",
   "description": "Personal finance tracker that reads Gmail transaction alerts and communicates via Telegram",
   "main": "dist/index.js",
   "private": true,
@@ -8,6 +8,7 @@
     "node": "22.x"
   },
   "scripts": {
+    "test": "node --test tests/*.test.cjs",
     "dev": "ts-node-dev --respawn --transpile-only src/index.ts",
     "build": "tsc",
     "start": "node dist/index.js",
