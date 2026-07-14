@@ -18,8 +18,12 @@ judgment and weekly-budget recommendations belong to the MCP client/agent.
    question. Telegram replies or MCP agents can resolve them.
 5. Corrections create a new entry with `supersedes_id`; raw evidence is never
    overwritten and old interpretations remain auditable.
-6. `get_funding_summary` only groups and sums stored interpretations. The agent
-   uses those facts to recommend a weekly budget.
+6. `get_spend_month_summary` is the canonical answer to questions such as
+   "how much did I spend in July?". It combines card cycles ending in July
+   with direct IDFC savings/UPI activity occurring in July IST.
+7. `get_funding_summary` remains a separate salary-settlement view. Agents use
+   the spend-month summary for the ₹1,20,000 envelope and funding summaries for
+   cash-flow questions.
 
 ## Impact fields
 
@@ -51,6 +55,20 @@ month. Current boundaries are:
 - AmEx: 21st–20th, due 8th.
 - BOBCARD: 22nd–21st, due 9th.
 - IDFC CC: 20th–19th, due 4th.
+
+## Spending month versus funding month
+
+The monthly spending envelope is derived rather than stored twice:
+
+- Card entries use the month of `card_cycle_end`.
+- IDFC savings/UPI entries use the IST month of `occurred_at`.
+- `personal_impact` supplies reimbursements, splits, settlements, and other
+  interpretation decisions.
+
+`get_spend_month_summary` returns actual and forecast personal impact
+separately, their expected total, the configured monthly limit, and remaining
+budget. `funding_month` is unchanged and still identifies the salary expected
+to settle an obligation.
 
 ## Migration
 

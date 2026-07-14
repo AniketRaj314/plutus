@@ -1,6 +1,7 @@
 import type Database from "better-sqlite3";
 import { getCreditCard } from "../db/queries";
 import {
+  aggregateSpendMonth,
   aggregateEnvelopeEntries,
   createCommitment,
   createEnvelopeEntry,
@@ -366,6 +367,24 @@ export const v2Tools: V2ToolDefinition[] = [
         raw_transaction_id: args.raw_transaction_id as string | undefined,
         include_superseded: args.include_superseded as boolean | undefined,
         limit: args.limit as number | undefined,
+      }),
+  },
+  {
+    name: "get_spend_month_summary",
+    description:
+      "Canonical tool for questions like 'how much did I spend in July?'. Card entries are selected by card-cycle end month; IDFC savings/UPI entries are selected by IST occurrence month. Returns actual, forecast, expected personal impact, the ₹1.2L limit, and remaining budget. Use get_funding_summary instead only for salary-settlement or cash-funding questions.",
+    parameters: {
+      type: "object",
+      properties: {
+        spend_month: { type: "string", description: "Spending envelope month in YYYY-MM" },
+        group_by: { type: "string", enum: ["source", "category", "treatment", "state"] },
+      },
+      required: ["spend_month"],
+    },
+    handler: (db, args) =>
+      aggregateSpendMonth(db, {
+        spend_month: args.spend_month as string,
+        group_by: args.group_by as LedgerGroupBy | undefined,
       }),
   },
   {

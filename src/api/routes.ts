@@ -19,6 +19,7 @@ import {
   listCreditCards,
 } from "../db/queries";
 import { getRemainingWeeksInMonth, parseIstDateOnly, getBillingWindow } from "../envelope/engine";
+import { getSchedulerHealth } from "../scheduler/status";
 
 const VALID_SOURCES = ["idfc_cc", "bobcard", "amex", "idfc_upi"];
 const MAX_TRANSACTIONS_LIMIT = 100;
@@ -57,9 +58,12 @@ export function registerRoutes(app: FastifyInstance, db: Database.Database): voi
       return { status: "degraded", db: "error" };
     }
 
+    const checkedAt = new Date();
+    const schedulerHealth = getSchedulerHealth(checkedAt);
     return {
       status: "ok",
       version: PACKAGE_VERSION,
+      checked_at: checkedAt.toISOString(),
       uptime: process.uptime(),
       db: "ok",
       node_version: process.version,
@@ -67,6 +71,7 @@ export function registerRoutes(app: FastifyInstance, db: Database.Database): voi
       poll_interval: process.env.POLL_INTERVAL_MINS,
       auto_inference_enabled: process.env.AUTO_INFERENCE_ENABLED !== "false",
       auto_inference_interval: process.env.AUTO_INFERENCE_INTERVAL_MINS ?? "5",
+      ...schedulerHealth,
     };
   });
 }
@@ -417,6 +422,7 @@ const MCP_TOOL_NAMES = [
   "interpret_pending_transactions",
   "create_envelope_entry",
   "list_envelope_entries",
+  "get_spend_month_summary",
   "get_funding_summary",
   "set_context_fact",
   "list_context_facts",

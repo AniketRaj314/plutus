@@ -18,6 +18,7 @@ import {
   isAutoInferenceEnabled,
   type InferenceOutcome,
 } from "../agent/inference";
+import { configureScheduler, runSchedulerCycle } from "../scheduler/status";
 
 const CORRELATION_WINDOW_MS = 30 * 60 * 1000;
 const GRACE_PERIOD_MS = 60 * 1000;
@@ -70,8 +71,13 @@ function getClient(): OpenAI {
 }
 
 export function startCorrelator(db: Database.Database): void {
+  configureScheduler("upi_correlation", {
+    label: "UPI receipt correlator",
+    interval_minutes: 5,
+    enabled: true,
+  });
   cron.schedule("*/5 * * * *", () => {
-    void checkPendingCorrelations(db);
+    void runSchedulerCycle("upi_correlation", () => checkPendingCorrelations(db));
   });
   console.log("UPI correlator scheduled every 5 minutes");
 }
