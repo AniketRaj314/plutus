@@ -1,4 +1,5 @@
 import type { Transaction, Envelope } from "../db/queries";
+import type { EnvelopeEntry } from "../db/v2-queries";
 import { getRemainingWeeksInMonth, parseIstDateOnly, BIG_PURCHASE_THRESHOLD } from "../envelope/engine";
 
 const IST_OFFSET_MS = 5.5 * 60 * 60 * 1000;
@@ -103,6 +104,63 @@ export function formatTransaction(transaction: Transaction, envelope: Envelope |
   const lines = [header, merchantLine, dateLine];
   const week = weekRemainingLine(envelope);
   if (week) lines.push(week);
+  return lines.join("\n");
+}
+
+export interface V2TransactionPresentation {
+  status: "interpreted" | "already_interpreted" | "needs_context" | "failed" | "correlating";
+  entry?: EnvelopeEntry;
+  personal_remaining?: number;
+  question?: string;
+}
+
+export function formatV2Transaction(
+  transaction: Transaction,
+  presentation: V2TransactionPresentation
+): string {
+  const dateLine = `📅 ${formatIstDateTime(transaction.datetime ?? new Date().toISOString())}`;
+  if (presentation.status === "correlating") {
+    return [
+      `🔄 UPI Transfer · IDFC`,
+      `${formatINR(transaction.amount ?? 0)} · Matching receipt...`,
+      dateLine,
+    ].join("\n");
+  }
+
+  const amount = transaction.is_international
+    ? transaction.amount_inr ?? transaction.amount ?? 0
+    : transaction.amount ?? 0;
+  const merchant = transaction.merchant_clean ?? transaction.merchant_raw ?? "Unknown";
+  const header = transaction.is_reversal
+    ? `↩️ Refund · ${sourceLabel(transaction.source)}`
+    : transaction.source === "idfc_upi"
+    ? `💸 UPI · IDFC`
+    : `💳 ${sourceLabel(transaction.source)}`;
+  const amountLine = transaction.is_international && transaction.amount_inr === null
+    ? `${transaction.currency} ${transaction.amount} · ${merchant}`
+    : `${formatINR(amount)} · ${merchant}`;
+  const lines = [header, amountLine, dateLine];
+
+  if (presentation.entry) {
+    const entry = presentation.entry;
+    lines.push(`🧾 ${entry.treatment} · Personal ${formatINR(entry.personal_impact)}`);
+    if (entry.cashflow_impact !== entry.personal_impact) {
+      lines.push(`💵 Cash needed ${formatINR(entry.cashflow_impact)}`);
+    }
+    if (entry.receivable_amount > 0) {
+      lines.push(`↩️ Expected back ${formatINR(entry.receivable_amount)}`);
+    }
+    lines.push(`📆 ${entry.funding_month} funding month`);
+    if (presentation.personal_remaining !== undefined) {
+      lines.push(`📊 ${formatINR(presentation.personal_remaining)} personal envelope remaining`);
+    }
+  } else if (presentation.status === "needs_context") {
+    lines.push(`🤔 ${presentation.question ?? "I need context before counting this."}`);
+  } else {
+    lines.push("⏳ Saved, but automatic interpretation is pending");
+  }
+
+  lines.push("Reply to correct or add context");
   return lines.join("\n");
 }
 

@@ -31,6 +31,8 @@ import {
   getBillingWindow,
 } from "../envelope/engine";
 import { enrichTransaction } from "../enrichment/gpt";
+import { v2Tools } from "./v2-tools";
+import { insertRawTransaction } from "../db/v2-queries";
 
 function round2(n: number): number {
   return Math.round(n * 100) / 100;
@@ -267,11 +269,18 @@ function getSummaryTool(db: Database.Database, args: GetSummaryArgs): unknown {
   const byCategory: Record<string, number> = {};
   const byMerchant: Record<string, number> = {};
   let internationalPendingCount = 0;
+  let includedTransactionCount = 0;
 
   for (const t of inPeriod) {
-    const amount = t.amount ?? 0;
+    if (t.is_cancelled_out || t.is_credit_card_payment) continue;
+    if (t.is_international && t.amount_inr === null) {
+      internationalPendingCount++;
+      continue;
+    }
+    const amount = t.is_international ? t.amount_inr ?? 0 : t.amount ?? 0;
     const signed = t.is_reversal ? -amount : amount;
     totalSpent += signed;
+    includedTransactionCount++;
 
     const category = t.category ?? "Uncategorized";
     byCategory[category] = (byCategory[category] ?? 0) + signed;
@@ -279,10 +288,11 @@ function getSummaryTool(db: Database.Database, args: GetSummaryArgs): unknown {
     const merchant = t.merchant_clean ?? t.merchant_raw ?? "Unknown";
     byMerchant[merchant] = (byMerchant[merchant] ?? 0) + signed;
 
-    if (t.is_international && t.amount_inr === null) internationalPendingCount++;
   }
 
   return {
+    metric: "legacy_raw_activity_inr",
+    warning: "Raw calendar activity is not true personal spend. Use get_funding_summary for salary-envelope reasoning.",
     total_spent: round2(totalSpent),
     by_category: Object.entries(byCategory)
       .sort((a, b) => b[1] - a[1])
@@ -292,7 +302,7 @@ function getSummaryTool(db: Database.Database, args: GetSummaryArgs): unknown {
       .slice(0, 10)
       .map(([merchant, amount]) => ({ merchant, amount: round2(amount) })),
     envelope_state: envelope,
-    transaction_count: inPeriod.length,
+    transaction_count: includedTransactionCount,
     international_pending_count: internationalPendingCount,
   };
 }
@@ -369,11 +379,13 @@ interface CreateTransactionArgs {
   is_cancelled_out?: boolean;
   is_reversal?: boolean;
   is_international?: boolean;
+  is_preauth?: boolean;
   envelope_impact?: number;
   notes?: string;
 }
 
 async function createTransactionTool(db: Database.Database, args: CreateTransactionArgs): Promise<unknown> {
+  const manualRawEmailId = `manual_backfill_${newId()}`;
   const created = insertTransaction(db, {
     source: args.source,
     amount: args.amount,
@@ -388,11 +400,28 @@ async function createTransactionTool(db: Database.Database, args: CreateTransact
     is_cancelled_out: args.is_cancelled_out ? 1 : 0,
     is_reversal: args.is_reversal ? 1 : 0,
     is_international: args.is_international ? 1 : 0,
+    is_preauth: args.is_preauth ? 1 : 0,
     envelope_impact: args.envelope_impact,
     notes: args.notes,
     // Marks the row as manually created so email-dedup logic never mistakes
     // it for (or gets confused by) a real Gmail-sourced transaction.
-    raw_email_id: `manual_backfill_${newId()}`,
+    raw_email_id: manualRawEmailId,
+  });
+
+  insertRawTransaction(db, {
+    id: created.id,
+    source: args.source,
+    amount: args.amount,
+    currency: args.currency ?? "INR",
+    amount_inr: args.amount_inr,
+    merchant_raw: args.merchant_raw,
+    occurred_at: args.datetime,
+    card_last4: args.card_last4,
+    is_reversal: args.is_reversal,
+    is_international: args.is_international,
+    is_preauth: args.is_preauth,
+    raw_email_id: manualRawEmailId,
+    raw_payload: JSON.stringify({ origin: "manual_backfill" }),
   });
 
   const hasCleanData = args.merchant_clean !== undefined && args.category !== undefined;
@@ -509,6 +538,7 @@ function deleteCommittedExpenseTool(db: Database.Database, args: { id: string })
 // -- tool registry --
 
 export const tools: ToolDefinition[] = [
+  ...v2Tools,
   {
     name: "get_envelope",
     description: "Get the full current envelope state, including week/month progress as percentages.",
@@ -617,7 +647,8 @@ export const tools: ToolDefinition[] = [
   },
   {
     name: "get_summary",
-    description: "Get a spending summary for the current week or month: totals, by-category breakdown, top merchants.",
+    description:
+      "Legacy raw calendar activity summary in INR. It is not true personal spend and does not model salary funding months; use get_funding_summary for recommendations.",
     parameters: {
       type: "object",
       properties: {

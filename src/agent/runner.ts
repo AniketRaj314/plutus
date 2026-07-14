@@ -2,7 +2,7 @@ import OpenAI from "openai";
 import type Database from "better-sqlite3";
 import type { ChatCompletionMessageParam, ChatCompletionTool } from "openai/resources/chat/completions";
 import { buildSystemPrompt } from "./prompts";
-import { tools } from "./tools";
+import { v2Tools as tools } from "./v2-tools";
 import { listRecentAgentMessages, insertAgentMessage, getTransaction } from "../db/queries";
 
 const MODEL = "o3";

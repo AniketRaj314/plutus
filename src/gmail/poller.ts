@@ -5,9 +5,15 @@ import { getGmailClient } from "./auth";
 import { getContext, setContext, getTransaction, getTransactionByRawEmailId, findTransactionByContentKey, insertTransaction } from "../db/queries";
 import { parseGmailMessage } from "./parsers";
 import { enrichTransaction } from "../enrichment/gpt";
-import { applyTransaction, getEnvelopeState } from "../envelope/engine";
-import { sendMessage, recordTransactionMessage } from "../telegram/bot";
-import { formatTransaction } from "../telegram/formatter";
+import { sendMessage, recordTransactionMessage, getMessageIdForTransaction } from "../telegram/bot";
+import { formatV2Transaction } from "../telegram/formatter";
+import { aggregateEnvelopeEntries, insertRawTransaction } from "../db/v2-queries";
+import {
+  inferRawTransaction,
+  isAutoInferenceEnabled,
+  type InferenceGenerator,
+  type InferenceOutcome,
+} from "../agent/inference";
 
 const WATCHED_SENDERS = [
   "noreply@idfcfirstbank.com",
@@ -18,6 +24,7 @@ const WATCHED_SENDERS = [
 const LAST_POLL_KEY = "last_gmail_poll";
 const PROCESSED_IDS_KEY = "processed_message_ids";
 const MAX_PROCESSED_IDS = 2000;
+const activePollDatabases = new WeakSet<Database.Database>();
 
 export function startPoller(db: Database.Database): void {
   const intervalMins = Number(process.env.POLL_INTERVAL_MINS) || 10;
@@ -31,6 +38,11 @@ export function startPoller(db: Database.Database): void {
 }
 
 export async function pollOnce(db: Database.Database): Promise<void> {
+  if (activePollDatabases.has(db)) {
+    console.log("[gmail] previous poll is still running, skipping overlapping cron tick");
+    return;
+  }
+  activePollDatabases.add(db);
   try {
     const gmail = getGmailClient();
     const sinceSeconds = getLastPollTimestamp(db);
@@ -61,10 +73,22 @@ export async function pollOnce(db: Database.Database): Promise<void> {
     );
   } catch (err) {
     console.error("[gmail] poll cycle failed:", err);
+  } finally {
+    activePollDatabases.delete(db);
   }
 }
 
-export async function processMessage(db: Database.Database, message: gmail_v1.Schema$Message): Promise<void> {
+export interface ProcessMessageOptions {
+  inferenceGenerator?: InferenceGenerator;
+  minConfidence?: number;
+  sendTelegram?: (text: string, replyToMessageId?: number) => Promise<number>;
+}
+
+export async function processMessage(
+  db: Database.Database,
+  message: gmail_v1.Schema$Message,
+  options: ProcessMessageOptions = {}
+): Promise<void> {
   const headers = message.payload?.headers ?? [];
   const from = headers.find((h) => h.name === "From")?.value ?? "(unknown sender)";
   const subject = headers.find((h) => h.name === "Subject")?.value ?? "(no subject)";
@@ -79,8 +103,15 @@ export async function processMessage(db: Database.Database, message: gmail_v1.Sc
     return;
   }
 
-  if (getTransactionByRawEmailId(db, parsed.raw_email_id)) {
-    console.log(`[gmail] transaction already recorded for raw_email_id=${parsed.raw_email_id}, skipping`);
+  const existing = getTransactionByRawEmailId(db, parsed.raw_email_id);
+  if (existing) {
+    if (getMessageIdForTransaction(db, existing.id)) {
+      console.log(`[gmail] transaction already completed for raw_email_id=${parsed.raw_email_id}, skipping`);
+      return;
+    }
+    console.log(`[gmail] recovering incomplete processing for raw_email_id=${parsed.raw_email_id}`);
+    if (!existing.merchant_clean) await enrichTransaction(db, existing);
+    await finalizeTransaction(db, getTransaction(db, existing.id) ?? existing, options);
     return;
   }
 
@@ -116,57 +147,83 @@ export async function processMessage(db: Database.Database, message: gmail_v1.Sc
     correlation_status: parsed.correlation_status ?? "none",
   });
 
+  insertRawTransaction(db, {
+    id: transaction.id,
+    source: parsed.source,
+    amount: parsed.amount,
+    currency: parsed.currency,
+    amount_inr: parsed.amount_inr,
+    merchant_raw: parsed.merchant_raw,
+    occurred_at: parsed.datetime,
+    card_last4: parsed.card_last4,
+    is_reversal: parsed.is_reversal,
+    is_international: parsed.is_international,
+    is_preauth: parsed.is_preauth,
+    raw_email_id: parsed.raw_email_id,
+    raw_payload: JSON.stringify({ from, subject, snippet }),
+  });
+
   console.log(
     `[gmail] parsed transaction: source=${transaction.source} amount=${transaction.amount} currency=${transaction.currency} merchant="${transaction.merchant_raw ?? "(none)"}" datetime=${transaction.datetime} card_last4=${transaction.card_last4} is_reversal=${transaction.is_reversal} is_international=${transaction.is_international} id=${transaction.id}`
   );
 
   await enrichTransaction(db, transaction);
+  await finalizeTransaction(db, getTransaction(db, transaction.id) ?? transaction, options);
+}
 
-  const enriched = getTransaction(db, transaction.id) ?? transaction;
+async function finalizeTransaction(
+  db: Database.Database,
+  transaction: NonNullable<ReturnType<typeof getTransaction>>,
+  options: ProcessMessageOptions
+): Promise<void> {
+  const sendTelegram = options.sendTelegram ?? sendMessage;
 
-  if (enriched.source === "idfc_upi" && enriched.correlation_status === "pending") {
+  if (transaction.source === "idfc_upi" && transaction.correlation_status === "pending") {
     // Envelope apply and final formatting are deferred to the correlation
     // engine (src/enrichment/correlator.ts) — it edits this same message
     // in-place once a matching merchant receipt is found or the 30-minute
     // window expires.
-    const pendingText = formatTransaction(enriched, getEnvelopeState(db));
-    if (pendingText) {
-      try {
-        const messageId = await sendMessage(pendingText);
-        recordTransactionMessage(db, messageId, enriched.id);
-        console.log(`[telegram] sent pending UPI message ${messageId} for transaction ${enriched.id}`);
-      } catch (err) {
-        console.error(`[telegram] failed to send pending UPI message for transaction ${enriched.id}:`, err);
-      }
+    const pendingText = formatV2Transaction(transaction, { status: "correlating" });
+    try {
+      const messageId = await sendTelegram(pendingText);
+      recordTransactionMessage(db, messageId, transaction.id);
+      console.log(`[telegram] sent pending UPI message ${messageId} for transaction ${transaction.id}`);
+    } catch (err) {
+      console.error(`[telegram] failed to send pending UPI message for transaction ${transaction.id}:`, err);
+      throw err;
     }
     return;
   }
 
-  const applyResult = applyTransaction(db, enriched);
-
-  if (applyResult) {
-    console.log(
-      `[envelope] applied transaction ${enriched.id}: week_remaining=${applyResult.week_remaining.toFixed(2)} month_remaining=${applyResult.month_remaining.toFixed(2)}`
-    );
-    if (applyResult.triggered_rebalance) {
-      setContext(db, "pending_rebalance_message", applyResult.triggered_rebalance.message);
-      console.log(`[envelope] rebalance triggered: ${applyResult.triggered_rebalance.message}`);
-    }
+  let inference: InferenceOutcome = {
+    status: "failed",
+    raw_transaction_id: transaction.id,
+    error: "automatic inference is disabled",
+  };
+  if (isAutoInferenceEnabled() || options.inferenceGenerator) {
+    inference = await inferRawTransaction(db, transaction.id, {
+      generate: options.inferenceGenerator,
+      minConfidence: options.minConfidence,
+    });
   }
 
-  const finalTransaction = getTransaction(db, transaction.id) ?? enriched;
-  const messageText = formatTransaction(finalTransaction, getEnvelopeState(db));
+  const summary = inference.entry
+    ? aggregateEnvelopeEntries(db, { funding_month: inference.entry.funding_month })
+    : undefined;
+  const messageText = formatV2Transaction(transaction, {
+    status: inference.status,
+    entry: inference.entry,
+    personal_remaining: summary?.personal_remaining,
+    question: inference.question,
+  });
 
-  if (messageText) {
-    try {
-      const messageId = await sendMessage(messageText);
-      recordTransactionMessage(db, messageId, finalTransaction.id);
-      console.log(`[telegram] sent transaction message ${messageId} for transaction ${finalTransaction.id}`);
-    } catch (err) {
-      console.error(`[telegram] failed to send message for transaction ${finalTransaction.id}:`, err);
-    }
-  } else {
-    console.log(`[telegram] transaction ${finalTransaction.id} is committed, no message sent`);
+  try {
+    const messageId = await sendTelegram(messageText);
+    recordTransactionMessage(db, messageId, transaction.id);
+    console.log(`[telegram] sent transaction message ${messageId} for transaction ${transaction.id}`);
+  } catch (err) {
+    console.error(`[telegram] failed to send message for transaction ${transaction.id}:`, err);
+    throw err;
   }
 }
 

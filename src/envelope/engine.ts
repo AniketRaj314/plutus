@@ -222,17 +222,61 @@ export function getEnvelopeState(db: Database.Database): Envelope | undefined {
 }
 
 export function getBillingWindow(card: CreditCard, referenceDate: Date): { start: string; end: string } {
+  const cycle = getCardCycleForDate(card, referenceDate);
+  return { start: cycle.start, end: cycle.end };
+}
+
+export interface CardCycle {
+  start: string;
+  end: string;
+  due_date: string;
+  funding_month: string;
+}
+
+export function getSalaryFundingMonthForDate(referenceDate: Date, salaryDay: number): string {
+  if (!Number.isInteger(salaryDay) || salaryDay < 1 || salaryDay > 31) {
+    throw new Error("salaryDay must be an integer between 1 and 31");
+  }
+  const ref = toIstDateOnly(referenceDate);
+  const lastDayOfMonth = new Date(Date.UTC(ref.getUTCFullYear(), ref.getUTCMonth() + 1, 0)).getUTCDate();
+  const effectiveSalaryDay = Math.min(salaryDay, lastDayOfMonth);
+  const fundingDate = new Date(
+    Date.UTC(ref.getUTCFullYear(), ref.getUTCMonth() - (ref.getUTCDate() < effectiveSalaryDay ? 1 : 0), 1)
+  );
+  return formatIstDate(fundingDate).slice(0, 7);
+}
+
+// Pure date routing helper. It does not decide financial meaning; it only
+// answers which configured statement cycle contains a transaction and which
+// salary month contains that cycle's due date.
+export function getCardCycleForDate(card: CreditCard, referenceDate: Date): CardCycle {
   const ref = toIstDateOnly(referenceDate);
   const year = ref.getUTCFullYear();
   const month = ref.getUTCMonth();
+  const day = ref.getUTCDate();
+  const startDay = card.billing_start_day ?? 1;
+  const endDay = card.billing_end_day ?? 28;
+  const dueDay = card.due_day ?? 1;
 
-  // Cycles cross a month boundary for all known cards (e.g. 22 May - 21 Jun):
-  // window_start = billing_start_day of the PREVIOUS month,
-  // window_end   = billing_end_day of the CURRENT month.
-  const start = new Date(Date.UTC(year, month - 1, card.billing_start_day ?? 1));
-  const end = new Date(Date.UTC(year, month, card.billing_end_day ?? 28));
+  // Cycles cross a month boundary for every configured card. Before the
+  // start day, the transaction belongs to the cycle that began last month;
+  // on/after the start day, it belongs to the newly-opened cycle.
+  const startsThisMonth = day >= startDay;
+  const start = new Date(Date.UTC(year, startsThisMonth ? month : month - 1, startDay));
+  const end = new Date(Date.UTC(year, startsThisMonth ? month + 1 : month, endDay));
 
-  return { start: formatIstDate(start), end: formatIstDate(end) };
+  // All current cards are due early in the month after statement close. The
+  // conditional also supports a future card whose due day is later in the
+  // same month as its cycle end.
+  const dueMonthOffset = dueDay <= endDay ? 1 : 0;
+  const due = new Date(Date.UTC(end.getUTCFullYear(), end.getUTCMonth() + dueMonthOffset, dueDay));
+
+  return {
+    start: formatIstDate(start),
+    end: formatIstDate(end),
+    due_date: formatIstDate(due),
+    funding_month: formatIstDate(due).slice(0, 7),
+  };
 }
 
 export function isCreditCardPayment(db: Database.Database, transaction: Transaction): boolean {

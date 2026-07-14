@@ -8,11 +8,16 @@ import {
   getTransaction,
   type Transaction,
 } from "../db/queries";
-import { applyTransaction, getEnvelopeState } from "../envelope/engine";
 import { editMessage, getMessageIdForTransaction } from "../telegram/bot";
-import { formatTransaction, formatINR, formatIstDateTime } from "../telegram/formatter";
+import { formatV2Transaction } from "../telegram/formatter";
 import { getProcessedIds, saveProcessedIds } from "../gmail/poller";
 import { CATEGORIES } from "./gpt";
+import { aggregateEnvelopeEntries } from "../db/v2-queries";
+import {
+  inferRawTransaction,
+  isAutoInferenceEnabled,
+  type InferenceOutcome,
+} from "../agent/inference";
 
 const CORRELATION_WINDOW_MS = 30 * 60 * 1000;
 const GRACE_PERIOD_MS = 60 * 1000;
@@ -90,7 +95,8 @@ export async function checkPendingCorrelations(db: Database.Database): Promise<v
     if (ageMs > CORRELATION_WINDOW_MS) {
       updateTransaction(db, transaction.id, { correlation_status: "unmatched" });
       const refreshed = getTransaction(db, transaction.id) ?? transaction;
-      await updateTelegramMessage(db, refreshed, "unmatched");
+      const inference = await inferAfterCorrelation(db, refreshed.id);
+      await updateTelegramMessage(db, refreshed, inference);
       console.log(`[correlator] transaction ${transaction.id} window expired, marked unmatched`);
       continue;
     }
@@ -151,13 +157,9 @@ export async function attemptCorrelation(db: Database.Database, transaction: Tra
       notes: `correlated:${result.reasoning}`,
     });
 
-    const refreshed = getTransaction(db, transaction.id);
-    if (refreshed && !refreshed.envelope_applied) {
-      applyTransaction(db, refreshed);
-    }
-
     const finalTransaction = getTransaction(db, transaction.id) ?? transaction;
-    await updateTelegramMessage(db, finalTransaction, "matched");
+    const inference = await inferAfterCorrelation(db, finalTransaction.id);
+    await updateTelegramMessage(db, finalTransaction, inference);
 
     if (matchedCandidate) {
       const processedIds = getProcessedIds(db);
@@ -258,7 +260,7 @@ function parseCorrelationResponse(raw: string): CorrelationResult | null {
 async function updateTelegramMessage(
   db: Database.Database,
   transaction: Transaction,
-  status: "matched" | "unmatched"
+  inference: InferenceOutcome
 ): Promise<void> {
   const messageId = getMessageIdForTransaction(db, transaction.id);
   if (!messageId) {
@@ -266,25 +268,25 @@ async function updateTelegramMessage(
     return;
   }
 
-  if (status === "matched") {
-    const text = formatTransaction(transaction, getEnvelopeState(db));
-    if (text) await editMessage(messageId, text);
-    return;
-  }
-
-  const envelope = getEnvelopeState(db);
-  const weekRemainingLine = envelope
-    ? `\n📊 Week: ${formatINR((envelope.current_week_budget ?? 0) - (envelope.current_week_spent ?? 0))} remaining`
-    : "";
-
-  const text =
-    [
-      `💸 UPI Transfer · IDFC`,
-      `${formatINR(transaction.amount ?? 0)} · ${transaction.merchant_raw ?? "Unknown"}`,
-      `📅 ${formatIstDateTime(transaction.datetime ?? new Date().toISOString())}`,
-    ].join("\n") +
-    weekRemainingLine +
-    "\nReply to add context";
-
+  const summary = inference.entry
+    ? aggregateEnvelopeEntries(db, { funding_month: inference.entry.funding_month })
+    : undefined;
+  const text = formatV2Transaction(transaction, {
+    status: inference.status,
+    entry: inference.entry,
+    personal_remaining: summary?.personal_remaining,
+    question: inference.question,
+  });
   await editMessage(messageId, text);
+}
+
+async function inferAfterCorrelation(db: Database.Database, transactionId: string): Promise<InferenceOutcome> {
+  if (!isAutoInferenceEnabled()) {
+    return {
+      status: "failed",
+      raw_transaction_id: transactionId,
+      error: "automatic inference is disabled",
+    };
+  }
+  return inferRawTransaction(db, transactionId);
 }
