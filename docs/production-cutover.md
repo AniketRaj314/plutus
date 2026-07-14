@@ -23,12 +23,14 @@ INFERENCE_MODEL=gpt-4o
 
 ## 2. Deployment smoke test
 
-1. Confirm `/health` reports `status=ok` and the new database path appears in
-   startup logs.
+1. Confirm `/health` reports `status=ok`, the expected package version,
+   `next_cron_at`, and scheduler-specific `next_run_at` values. The new database
+   path appears in startup logs.
 2. Confirm MCP lists `create_raw_transaction`,
    `bulk_create_raw_transactions`, `list_uninterpreted_transactions`,
    `infer_raw_transaction`, `interpret_pending_transactions`,
-   `create_envelope_entry`, and `get_funding_summary`.
+   `create_envelope_entry`, `get_spend_month_summary`, and
+   `get_funding_summary`.
 3. Confirm legacy envelope mutators such as `recalculate_envelope` are absent.
 4. Confirm `get_salary_profile` returns salary day 1 and monthly limit
    ₹1,20,000.

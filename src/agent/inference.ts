@@ -19,6 +19,11 @@ import {
 } from "../db/v2-queries";
 import { getCardCycleForDate, getSalaryFundingMonthForDate, type CardCycle } from "../envelope/engine";
 import { CATEGORIES } from "../enrichment/gpt";
+import {
+  configureScheduler,
+  normalizeCronInterval,
+  runSchedulerCycle,
+} from "../scheduler/status";
 
 const MODEL = process.env.INFERENCE_MODEL || "gpt-4o";
 const DEFAULT_MIN_CONFIDENCE = 0.75;
@@ -450,12 +455,20 @@ export async function processInferenceQueue(
 }
 
 export function startInferenceCron(db: Database.Database): void {
-  const intervalMins = Math.min(59, Math.max(1, Number(process.env.AUTO_INFERENCE_INTERVAL_MINS) || 5));
+  const intervalMins = normalizeCronInterval(process.env.AUTO_INFERENCE_INTERVAL_MINS, 5);
+  const enabled = isAutoInferenceEnabled();
+  configureScheduler("automatic_inference", {
+    label: "Automatic transaction inference",
+    interval_minutes: intervalMins,
+    enabled,
+  });
   cron.schedule(`*/${intervalMins} * * * *`, () => {
-    if (!isAutoInferenceEnabled()) return;
-    void processInferenceQueue(db).catch((error) => {
-      console.error("[inference] queue processing failed:", error);
+    if (!enabled) return;
+    void runSchedulerCycle("automatic_inference", async () => {
+      await processInferenceQueue(db);
     });
   });
-  console.log(`AI inference queue scheduled every ${intervalMins} minute(s)`);
+  console.log(
+    `AI inference queue scheduled every ${intervalMins} minute(s)${enabled ? "" : " (disabled)"}`
+  );
 }

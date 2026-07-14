@@ -381,6 +381,161 @@ export function listEnvelopeEntries(db: Database.Database, filters: EnvelopeEntr
 
 export type LedgerGroupBy = "source" | "category" | "treatment" | "state";
 
+export interface SpendMonthSummary {
+  spend_month: string;
+  definition_version: number;
+  definition: {
+    cards: string;
+    idfc_upi: string;
+    impact: string;
+  };
+  monthly_limit_inr: number;
+  gross_amount_inr: number;
+  personal_impact: number;
+  actual_personal_impact: number;
+  forecast_personal_impact: number;
+  cashflow_impact: number;
+  receivable_amount: number;
+  outstanding_receivables: number;
+  personal_remaining: number;
+  entry_count: number;
+  actual_entry_count: number;
+  forecast_entry_count: number;
+  card_cycles: Array<{
+    source: string;
+    card_cycle_start: string;
+    card_cycle_end: string;
+    due_date: string | null;
+  }>;
+  upi_window: { start: string; end: string };
+  groups: Array<Record<string, string | number | null>>;
+}
+
+function spendMonthWhere(sourceAlias = ""): string {
+  const prefix = sourceAlias ? `${sourceAlias}.` : "";
+  return `(
+    (${prefix}source IN ('amex', 'bobcard', 'idfc_cc')
+      AND substr(${prefix}card_cycle_end, 1, 7) = @spend_month)
+    OR
+    (${prefix}source = 'idfc_upi'
+      AND strftime('%Y-%m', datetime(${prefix}occurred_at, '+5 hours', '+30 minutes')) = @spend_month)
+  )`;
+}
+
+function monthEnd(month: string): string {
+  const [year, monthNumber] = month.split("-").map(Number);
+  return new Date(Date.UTC(year, monthNumber, 0)).toISOString().slice(0, 10);
+}
+
+/**
+ * Canonical monthly-spend view used by every agent.
+ *
+ * A card entry belongs to the month in which its statement cycle ends. A
+ * direct IDFC savings/UPI entry belongs to its IST calendar month. Financial
+ * judgment is already represented by personal_impact; this query only applies
+ * the user's deterministic month-selection convention.
+ */
+export function aggregateSpendMonth(
+  db: Database.Database,
+  filters: { spend_month: string; group_by?: LedgerGroupBy }
+): SpendMonthSummary {
+  assertFundingMonth(filters.spend_month);
+  if (filters.group_by && !("source category treatment state".split(" ") as string[]).includes(filters.group_by)) {
+    throw new Error("group_by must be source, category, treatment, or state");
+  }
+
+  const params = { spend_month: filters.spend_month };
+  const activeWhere = `superseded_at IS NULL AND state != 'cancelled' AND ${spendMonthWhere()}`;
+  const totals = db
+    .prepare(
+      `SELECT
+        COALESCE(SUM(gross_amount_inr), 0) AS gross_amount_inr,
+        COALESCE(SUM(personal_impact), 0) AS personal_impact,
+        COALESCE(SUM(CASE WHEN state = 'forecast' THEN 0 ELSE personal_impact END), 0) AS actual_personal_impact,
+        COALESCE(SUM(CASE WHEN state = 'forecast' THEN personal_impact ELSE 0 END), 0) AS forecast_personal_impact,
+        COALESCE(SUM(cashflow_impact), 0) AS cashflow_impact,
+        COALESCE(SUM(receivable_amount), 0) AS receivable_amount,
+        COUNT(*) AS entry_count,
+        COALESCE(SUM(CASE WHEN state = 'forecast' THEN 0 ELSE 1 END), 0) AS actual_entry_count,
+        COALESCE(SUM(CASE WHEN state = 'forecast' THEN 1 ELSE 0 END), 0) AS forecast_entry_count
+       FROM envelope_entries WHERE ${activeWhere}`
+    )
+    .get(params) as Omit<
+      SpendMonthSummary,
+      | "spend_month"
+      | "definition_version"
+      | "definition"
+      | "monthly_limit_inr"
+      | "outstanding_receivables"
+      | "personal_remaining"
+      | "card_cycles"
+      | "upi_window"
+      | "groups"
+    >;
+
+  let groups: Array<Record<string, string | number | null>> = [];
+  if (filters.group_by) {
+    const column = filters.group_by;
+    groups = db
+      .prepare(
+        `SELECT ${column} AS group_key,
+          COALESCE(SUM(gross_amount_inr), 0) AS gross_amount_inr,
+          COALESCE(SUM(personal_impact), 0) AS personal_impact,
+          COALESCE(SUM(CASE WHEN state = 'forecast' THEN 0 ELSE personal_impact END), 0) AS actual_personal_impact,
+          COALESCE(SUM(CASE WHEN state = 'forecast' THEN personal_impact ELSE 0 END), 0) AS forecast_personal_impact,
+          COALESCE(SUM(cashflow_impact), 0) AS cashflow_impact,
+          COALESCE(SUM(receivable_amount), 0) AS receivable_amount,
+          COUNT(*) AS entry_count
+         FROM envelope_entries WHERE ${activeWhere}
+         GROUP BY ${column} ORDER BY personal_impact DESC`
+      )
+      .all(params) as Array<Record<string, string | number | null>>;
+  }
+
+  const outstanding = db
+    .prepare(
+      `SELECT COALESCE(SUM(r.amount_inr - r.received_inr), 0) AS total
+       FROM receivables r
+       JOIN envelope_entries e ON e.id = r.envelope_entry_id
+       WHERE e.superseded_at IS NULL
+         AND e.state != 'cancelled'
+         AND r.status IN ('pending', 'partial')
+         AND ${spendMonthWhere("e")}`
+    )
+    .get(params) as { total: number };
+
+  const cardCycles = db
+    .prepare(
+      `SELECT DISTINCT source, card_cycle_start, card_cycle_end, due_date
+       FROM envelope_entries
+       WHERE superseded_at IS NULL
+         AND state != 'cancelled'
+         AND source IN ('amex', 'bobcard', 'idfc_cc')
+         AND substr(card_cycle_end, 1, 7) = @spend_month
+       ORDER BY card_cycle_end, source`
+    )
+    .all(params) as SpendMonthSummary["card_cycles"];
+
+  const profile = getActiveSalaryProfile(db);
+  const monthlyLimit = profile?.monthly_limit_inr ?? 0;
+  return {
+    spend_month: filters.spend_month,
+    definition_version: 1,
+    definition: {
+      cards: "include active entries whose card cycle ends in spend_month",
+      idfc_upi: "include active entries whose occurrence date falls in spend_month in Asia/Kolkata",
+      impact: "sum stored personal_impact; settlements and bookkeeping should already have zero impact",
+    },
+    monthly_limit_inr: monthlyLimit,
+    ...totals,
+    outstanding_receivables: outstanding.total,
+    personal_remaining: monthlyLimit - totals.personal_impact,
+    card_cycles: cardCycles,
+    upi_window: { start: `${filters.spend_month}-01`, end: monthEnd(filters.spend_month) },
+    groups,
+  };
+}
+
 export function aggregateEnvelopeEntries(
   db: Database.Database,
   filters: { funding_month: string; source?: string; group_by?: LedgerGroupBy }

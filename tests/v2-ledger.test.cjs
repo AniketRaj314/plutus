@@ -7,6 +7,7 @@ const Database = require("better-sqlite3");
 const { runMigrations } = require("../src/db/schema");
 const { getCreditCard, insertTransaction, queryTransactions, setContext } = require("../src/db/queries");
 const {
+  aggregateSpendMonth,
   aggregateEnvelopeEntries,
   createCommitment,
   createEnvelopeEntry,
@@ -30,8 +31,14 @@ const {
   processInferenceQueue,
 } = require("../src/agent/inference");
 const { getSalaryFundingMonthForDate } = require("../src/envelope/engine");
-const { buildMcpToolSpecs, PACKAGE_VERSION } = require("../src/api/routes");
+const { buildMcpToolSpecs, PACKAGE_VERSION, registerRoutes } = require("../src/api/routes");
 const { processMessage } = require("../src/gmail/poller");
+const {
+  configureScheduler,
+  getSchedulerHealth,
+  nextCronTick,
+  resetSchedulerHealthForTests,
+} = require("../src/scheduler/status");
 const {
   getMessageIdForTransaction,
   getTransactionIdForMessage,
@@ -110,6 +117,54 @@ test("legacy user context is migrated into shared scoped facts without internal 
   const facts = listContextFacts(db, { scope_type: "global" });
   assert.equal(facts.some((fact) => fact.key === "railway_commitment" && fact.value === "USD 5 monthly"), true);
   assert.equal(facts.some((fact) => fact.key === "processed_message_ids"), false);
+  const definition = facts.find((fact) => fact.key === "monthly_spending_envelope_definition");
+  assert.ok(definition);
+  assert.equal(JSON.parse(definition.value).canonical_mcp_tool, "get_spend_month_summary");
+  db.close();
+});
+
+test("canonical spend-month summary combines card cycles ending in month with IST UPI activity", () => {
+  const db = makeDb();
+  const add = (entry) =>
+    createEnvelopeEntry(db, {
+      funding_month: entry.funding_month ?? "2026-08",
+      occurred_at: entry.occurred_at,
+      source: entry.source,
+      card_cycle_start: entry.card_cycle_start,
+      card_cycle_end: entry.card_cycle_end,
+      due_date: entry.due_date,
+      treatment: entry.treatment ?? "normal",
+      state: entry.state ?? "actual",
+      gross_amount_inr: Math.abs(entry.personal_impact),
+      personal_impact: entry.personal_impact,
+      cashflow_impact: entry.personal_impact,
+      receivable_amount: 0,
+      created_by: "test",
+    });
+
+  add({ source: "amex", occurred_at: "2026-06-25T12:00:00+05:30", card_cycle_start: "2026-06-21", card_cycle_end: "2026-07-20", due_date: "2026-08-08", personal_impact: 1000 });
+  add({ source: "amex", occurred_at: "2026-07-20T12:00:00+05:30", card_cycle_start: "2026-06-21", card_cycle_end: "2026-07-20", due_date: "2026-08-08", personal_impact: 100, state: "forecast" });
+  add({ source: "amex", occurred_at: "2026-07-21T12:00:00+05:30", card_cycle_start: "2026-07-21", card_cycle_end: "2026-08-20", due_date: "2026-09-08", funding_month: "2026-09", personal_impact: 2000 });
+  add({ source: "bobcard", occurred_at: "2026-07-21T12:00:00+05:30", card_cycle_start: "2026-06-22", card_cycle_end: "2026-07-21", due_date: "2026-08-09", personal_impact: 300 });
+  add({ source: "idfc_cc", occurred_at: "2026-07-19T12:00:00+05:30", card_cycle_start: "2026-06-20", card_cycle_end: "2026-07-19", due_date: "2026-08-04", personal_impact: 400 });
+  add({ source: "idfc_upi", occurred_at: "2026-07-01T12:00:00+05:30", funding_month: "2026-07", personal_impact: 500 });
+  add({ source: "idfc_upi", occurred_at: "2026-07-31T18:00:00.000Z", funding_month: "2026-07", personal_impact: 200 });
+  add({ source: "idfc_upi", occurred_at: "2026-07-31T18:45:00.000Z", funding_month: "2026-08", personal_impact: 700 });
+  add({ source: "idfc_upi", occurred_at: "2026-07-08T12:00:00+05:30", funding_month: "2026-08", personal_impact: -30, treatment: "split" });
+  add({ source: "idfc_upi", occurred_at: "2026-07-03T12:00:00+05:30", funding_month: "2026-07", personal_impact: 0, treatment: "settlement" });
+
+  const summary = aggregateSpendMonth(db, { spend_month: "2026-07", group_by: "source" });
+  assert.equal(summary.personal_impact, 2470);
+  assert.equal(summary.actual_personal_impact, 2370);
+  assert.equal(summary.forecast_personal_impact, 100);
+  assert.equal(summary.personal_remaining, 117530);
+  assert.equal(summary.entry_count, 8);
+  assert.equal(summary.actual_entry_count, 7);
+  assert.equal(summary.forecast_entry_count, 1);
+  assert.deepEqual(summary.upi_window, { start: "2026-07-01", end: "2026-07-31" });
+  assert.equal(summary.card_cycles.length, 3);
+  assert.equal(summary.groups.find((group) => group.group_key === "idfc_upi").personal_impact, 670);
+  assert.equal(summary.definition_version, 1);
   db.close();
 });
 
@@ -704,6 +759,7 @@ test("all v2 MCP tools are registered for external agents", () => {
     "interpret_pending_transactions",
     "create_envelope_entry",
     "list_envelope_entries",
+    "get_spend_month_summary",
     "get_funding_summary",
     "set_context_fact",
     "list_context_facts",
@@ -728,6 +784,35 @@ test("production MCP surface exposes v2 finance tools and no legacy envelope mut
 
 test("health metadata reads the deployed package version", () => {
   assert.equal(PACKAGE_VERSION, require("../package.json").version);
+});
+
+test("health reports the next enabled cron and per-scheduler timing", async () => {
+  resetSchedulerHealthForTests();
+  configureScheduler("gmail_poll", { label: "Gmail", interval_minutes: 5, enabled: true });
+  configureScheduler("automatic_inference", { label: "Inference", interval_minutes: 5, enabled: false });
+
+  const now = new Date("2026-07-14T10:12:34.000Z");
+  assert.equal(nextCronTick(5, now).toISOString(), "2026-07-14T10:15:00.000Z");
+  const snapshot = getSchedulerHealth(now);
+  assert.equal(snapshot.next_cron_at, "2026-07-14T10:15:00.000Z");
+  assert.equal(snapshot.next_cron_in_seconds, 146);
+  assert.equal(snapshot.schedulers.gmail_poll.next_run_at, "2026-07-14T10:15:00.000Z");
+  assert.equal(snapshot.schedulers.automatic_inference.next_run_at, null);
+  assert.equal(snapshot.schedulers.automatic_inference.next_tick_at, "2026-07-14T10:15:00.000Z");
+
+  const db = makeDb();
+  const app = require("fastify")();
+  registerRoutes(app, db);
+  const response = await app.inject({ method: "GET", url: "/health" });
+  assert.equal(response.statusCode, 200);
+  const health = response.json();
+  assert.equal(typeof health.checked_at, "string");
+  assert.equal(typeof health.next_cron_at, "string");
+  assert.equal(health.schedulers.gmail_poll.enabled, true);
+  assert.equal(health.schedulers.automatic_inference.enabled, false);
+  await app.close();
+  db.close();
+  resetSchedulerHealthForTests();
 });
 
 test("raw MCP ingestion is idempotent by email id and bulk failures are isolated", async () => {

@@ -14,6 +14,11 @@ import {
   type InferenceGenerator,
   type InferenceOutcome,
 } from "../agent/inference";
+import {
+  configureScheduler,
+  normalizeCronInterval,
+  runSchedulerCycle,
+} from "../scheduler/status";
 
 const WATCHED_SENDERS = [
   "noreply@idfcfirstbank.com",
@@ -27,11 +32,21 @@ const MAX_PROCESSED_IDS = 2000;
 const activePollDatabases = new WeakSet<Database.Database>();
 
 export function startPoller(db: Database.Database): void {
-  const intervalMins = Number(process.env.POLL_INTERVAL_MINS) || 10;
+  const intervalMins = normalizeCronInterval(process.env.POLL_INTERVAL_MINS, 10);
   const schedule = `*/${intervalMins} * * * *`;
 
+  const lastPollSeconds = Number(getContext(db, LAST_POLL_KEY)?.value);
+  configureScheduler("gmail_poll", {
+    label: "Gmail transaction poller",
+    interval_minutes: intervalMins,
+    enabled: true,
+    last_completed_at: Number.isFinite(lastPollSeconds)
+      ? new Date(lastPollSeconds * 1000).toISOString()
+      : null,
+  });
+
   cron.schedule(schedule, () => {
-    void pollOnce(db);
+    void runSchedulerCycle("gmail_poll", () => pollOnce(db));
   });
 
   console.log(`Gmail poller scheduled every ${intervalMins} minute(s)`);
@@ -73,6 +88,7 @@ export async function pollOnce(db: Database.Database): Promise<void> {
     );
   } catch (err) {
     console.error("[gmail] poll cycle failed:", err);
+    throw err;
   } finally {
     activePollDatabases.delete(db);
   }
@@ -256,7 +272,7 @@ async function listMessageIds(gmail: gmail_v1.Gmail, query: string): Promise<str
 function getLastPollTimestamp(db: Database.Database): number {
   const row = getContext(db, LAST_POLL_KEY);
   if (!row?.value) {
-    const intervalMins = Number(process.env.POLL_INTERVAL_MINS) || 10;
+    const intervalMins = normalizeCronInterval(process.env.POLL_INTERVAL_MINS, 10);
     return Math.floor(Date.now() / 1000) - intervalMins * 60;
   }
   return Number(row.value);

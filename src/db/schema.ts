@@ -246,6 +246,7 @@ export function runMigrations(db: Database.Database): void {
   seedSalaryProfile(db);
   backfillRawTransactions(db);
   backfillContextFacts(db);
+  seedCanonicalContextFacts(db);
 }
 
 function seedCreditCards(db: Database.Database): void {
@@ -333,6 +334,27 @@ function backfillContextFacts(db: Database.Database): void {
     if (internalKeys.has(row.key)) continue;
     insert.run(newId(), row.key, row.value);
   }
+}
+
+function seedCanonicalContextFacts(db: Database.Database): void {
+  const monthlySpendingDefinition = JSON.stringify({
+    definition_version: 1,
+    metric: "monthly_spending_envelope",
+    card_rule: "include active entries whose card_cycle_end month equals the requested spend month",
+    idfc_upi_rule: "include active entries whose occurred_at month in Asia/Kolkata equals the requested spend month",
+    impact_field: "personal_impact",
+    monthly_limit_source: "active salary profile",
+    excludes_via_zero_impact: ["settlement", "bookkeeping", "pass-through"],
+    canonical_mcp_tool: "get_spend_month_summary",
+  });
+  db.prepare(
+    `INSERT OR IGNORE INTO context_facts (
+      id, scope_type, scope_id, key, value, source, confidence
+    ) VALUES (
+      'system_monthly_spending_definition_v1', 'global', '',
+      'monthly_spending_envelope_definition', ?, 'system', 1
+    )`
+  ).run(monthlySpendingDefinition);
 }
 
 export function newId(): string {
