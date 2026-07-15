@@ -4,6 +4,20 @@ import { getRemainingWeeksInMonth, parseIstDateOnly, BIG_PURCHASE_THRESHOLD } fr
 
 const IST_OFFSET_MS = 5.5 * 60 * 60 * 1000;
 const MONTH_ABBR = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+const MONTH_NAMES = [
+  "January",
+  "February",
+  "March",
+  "April",
+  "May",
+  "June",
+  "July",
+  "August",
+  "September",
+  "October",
+  "November",
+  "December",
+];
 
 // Card display names are hardcoded here (rather than looked up from the
 // credit_cards table) since formatTransaction takes no db param by design.
@@ -110,8 +124,15 @@ export function formatTransaction(transaction: Transaction, envelope: Envelope |
 export interface V2TransactionPresentation {
   status: "interpreted" | "already_interpreted" | "needs_context" | "failed" | "correlating";
   entry?: EnvelopeEntry;
-  personal_remaining?: number;
+  spend_month?: string;
+  spend_month_remaining?: number;
   question?: string;
+}
+
+function spendMonthLabel(spendMonth: string): string {
+  const [year, month] = spendMonth.split("-").map(Number);
+  if (!year || month < 1 || month > 12) return spendMonth;
+  return `${MONTH_NAMES[month - 1]} ${year}`;
 }
 
 export function formatV2Transaction(
@@ -150,9 +171,14 @@ export function formatV2Transaction(
     if (entry.receivable_amount > 0) {
       lines.push(`↩️ Expected back ${formatINR(entry.receivable_amount)}`);
     }
-    lines.push(`📆 ${entry.funding_month} funding month`);
-    if (presentation.personal_remaining !== undefined) {
-      lines.push(`📊 ${formatINR(presentation.personal_remaining)} personal envelope remaining`);
+    if (presentation.spend_month && presentation.spend_month_remaining !== undefined) {
+      const label = spendMonthLabel(presentation.spend_month);
+      const remaining = presentation.spend_month_remaining;
+      lines.push(
+        remaining < 0
+          ? `📊 ${label} spending envelope: ${formatINR(Math.abs(remaining))} over`
+          : `📊 ${label} spending envelope: ${formatINR(remaining)} remaining`
+      );
     }
   } else if (presentation.status === "needs_context") {
     lines.push(`🤔 ${presentation.question ?? "I need context before counting this."}`);

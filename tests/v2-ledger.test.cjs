@@ -33,6 +33,8 @@ const {
 const { getSalaryFundingMonthForDate } = require("../src/envelope/engine");
 const { buildMcpToolSpecs, PACKAGE_VERSION, registerRoutes } = require("../src/api/routes");
 const { processMessage } = require("../src/gmail/poller");
+const { parseGmailMessage } = require("../src/gmail/parsers");
+const { formatV2Transaction } = require("../src/telegram/formatter");
 const {
   configureScheduler,
   getSchedulerHealth,
@@ -166,6 +168,62 @@ test("canonical spend-month summary combines card cycles ending in month with IS
   assert.equal(summary.groups.find((group) => group.group_key === "idfc_upi").personal_impact, 670);
   assert.equal(summary.definition_version, 1);
   db.close();
+});
+
+test("Telegram transaction presentation labels the canonical spend month and renders overspend clearly", () => {
+  const text = formatV2Transaction(
+    {
+      source: "amex",
+      amount: 277,
+      merchant_clean: "Razorpay Restaurants",
+      datetime: "2026-07-15T06:35:04.000Z",
+      is_reversal: 0,
+      is_international: 0,
+    },
+    {
+      status: "interpreted",
+      entry: {
+        treatment: "normal",
+        personal_impact: 277,
+        cashflow_impact: 277,
+        receivable_amount: 0,
+        funding_month: "2026-08",
+      },
+      spend_month: "2026-07",
+      spend_month_remaining: -4958,
+    }
+  );
+
+  assert.doesNotMatch(text, /funding month/);
+  assert.match(text, /July 2026 spending envelope: ₹4,958 over/);
+  assert.doesNotMatch(text, /personal envelope remaining/);
+});
+
+test("AmEx uses Gmail receipt time when its alert only contains a transaction date", () => {
+  const html = [
+    "<p>Date:</p><p>15 July 2026</p>",
+    "<p>Merchant:</p><p>Razorpay Restaurants</p>",
+    "<p>Amount:</p><p>INR 277.00</p>",
+    "<p>Account Ending: 41001</p>",
+  ].join("");
+  const message = {
+    id: "amex-received-time",
+    internalDate: String(Date.parse("2026-07-15T06:35:04.000Z")),
+    payload: {
+      headers: [
+        { name: "From", value: "AmericanExpress@welcome.americanexpress.com" },
+        { name: "Subject", value: "Your transaction update" },
+      ],
+      mimeType: "text/html",
+      body: { data: Buffer.from(html).toString("base64url") },
+    },
+  };
+
+  const parsed = parseGmailMessage(message);
+  assert.ok(parsed);
+  assert.equal(parsed.datetime, "2026-07-15T06:35:04.000Z");
+  assert.equal(parsed.amount, 277);
+  assert.equal(parsed.merchant_raw, "Razorpay Restaurants");
 });
 
 test("card-cycle routing changes funding month on each exact boundary", () => {
@@ -676,7 +734,9 @@ test("Gmail ingestion dual-writes evidence, invokes v2 inference, and does not m
   assert.equal(clean.personal_impact, -525.5);
   assert.equal(db.prepare("SELECT envelope_applied FROM transactions WHERE id = ?").get(raw.id).envelope_applied, 0);
   assert.match(telegramText, /refund · Personal/);
-  assert.match(telegramText, /funding month/);
+  assert.doesNotMatch(telegramText, /funding month/);
+  assert.match(telegramText, /June 2026 spending envelope/);
+  assert.doesNotMatch(telegramText, /personal envelope remaining/);
   assert.equal(getTransactionIdForMessage(db, 9876), raw.id);
   db.close();
 });

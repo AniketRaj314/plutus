@@ -422,6 +422,21 @@ function spendMonthWhere(sourceAlias = ""): string {
   )`;
 }
 
+export function getSpendMonthForEntry(
+  entry: Pick<EnvelopeEntry, "source" | "card_cycle_end" | "occurred_at">
+): string | null {
+  if (entry.source === "amex" || entry.source === "bobcard" || entry.source === "idfc_cc") {
+    const cycleMonth = entry.card_cycle_end?.slice(0, 7) ?? "";
+    return /^\d{4}-\d{2}$/.test(cycleMonth) ? cycleMonth : null;
+  }
+  if (entry.source !== "idfc_upi" || !entry.occurred_at) return null;
+
+  const occurredAt = new Date(entry.occurred_at);
+  if (Number.isNaN(occurredAt.getTime())) return null;
+  const occurredAtIst = new Date(occurredAt.getTime() + 5.5 * 60 * 60 * 1000);
+  return `${occurredAtIst.getUTCFullYear()}-${String(occurredAtIst.getUTCMonth() + 1).padStart(2, "0")}`;
+}
+
 function monthEnd(month: string): string {
   const [year, monthNumber] = month.split("-").map(Number);
   return new Date(Date.UTC(year, monthNumber, 0)).toISOString().slice(0, 10);

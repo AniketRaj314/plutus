@@ -5,6 +5,8 @@ export interface EmailContent {
   subject: string;
   body: string;
   htmlBody: string;
+  /** Gmail receipt timestamp, preferably sourced from message.internalDate. */
+  receivedAt?: string;
 }
 
 export interface ParsedTransaction {

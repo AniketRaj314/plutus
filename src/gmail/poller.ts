@@ -3,11 +3,11 @@ import type Database from "better-sqlite3";
 import type { gmail_v1 } from "googleapis";
 import { getGmailClient } from "./auth";
 import { getContext, setContext, getTransaction, getTransactionByRawEmailId, findTransactionByContentKey, insertTransaction } from "../db/queries";
-import { parseGmailMessage } from "./parsers";
+import { getGmailReceivedAt, parseGmailMessage } from "./parsers";
 import { enrichTransaction } from "../enrichment/gpt";
 import { sendMessage, recordTransactionMessage, getMessageIdForTransaction } from "../telegram/bot";
 import { formatV2Transaction } from "../telegram/formatter";
-import { aggregateEnvelopeEntries, insertRawTransaction } from "../db/v2-queries";
+import { aggregateSpendMonth, getSpendMonthForEntry, insertRawTransaction } from "../db/v2-queries";
 import {
   inferRawTransaction,
   isAutoInferenceEnabled,
@@ -176,7 +176,14 @@ export async function processMessage(
     is_international: parsed.is_international,
     is_preauth: parsed.is_preauth,
     raw_email_id: parsed.raw_email_id,
-    raw_payload: JSON.stringify({ from, subject, snippet }),
+    raw_payload: JSON.stringify({
+      from,
+      subject,
+      snippet,
+      gmail_received_at: getGmailReceivedAt(message),
+      timestamp_source:
+        parsed.source === "amex" ? "issuer_date_plus_gmail_received_time" : "issuer_alert",
+    }),
   });
 
   console.log(
@@ -223,13 +230,13 @@ async function finalizeTransaction(
     });
   }
 
-  const summary = inference.entry
-    ? aggregateEnvelopeEntries(db, { funding_month: inference.entry.funding_month })
-    : undefined;
+  const spendMonth = inference.entry ? getSpendMonthForEntry(inference.entry) : null;
+  const summary = spendMonth ? aggregateSpendMonth(db, { spend_month: spendMonth }) : undefined;
   const messageText = formatV2Transaction(transaction, {
     status: inference.status,
     entry: inference.entry,
-    personal_remaining: summary?.personal_remaining,
+    spend_month: spendMonth ?? undefined,
+    spend_month_remaining: summary?.personal_remaining,
     question: inference.question,
   });
 

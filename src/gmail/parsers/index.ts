@@ -12,6 +12,19 @@ export { parseBobCard } from "./bobcard";
 export { parseAmex } from "./amex";
 export { parseIdfcUpi } from "./idfc-upi";
 
+export function getGmailReceivedAt(message: gmail_v1.Schema$Message): string | null {
+  const internalDateMs = Number(message.internalDate);
+  if (Number.isFinite(internalDateMs) && internalDateMs > 0) {
+    return new Date(internalDateMs).toISOString();
+  }
+
+  const headers = message.payload?.headers ?? [];
+  const dateHeader = headers.find((header) => header.name?.toLowerCase() === "date")?.value;
+  if (!dateHeader) return null;
+  const parsed = new Date(dateHeader);
+  return Number.isNaN(parsed.getTime()) ? null : parsed.toISOString();
+}
+
 export function parseGmailMessage(message: gmail_v1.Schema$Message): ParsedTransaction | null {
   const messageId = message.id;
   if (!messageId) return null;
@@ -22,7 +35,8 @@ export function parseGmailMessage(message: gmail_v1.Schema$Message): ParsedTrans
   const body = extractBody(message.payload);
   const htmlBody = extractRawHtml(message.payload);
 
-  const email: EmailContent = { from, subject, body, htmlBody };
+  const receivedAt = getGmailReceivedAt(message);
+  const email: EmailContent = { from, subject, body, htmlBody, receivedAt: receivedAt ?? undefined };
   const fromLower = from.toLowerCase();
 
   const result = fromLower.includes("noreply@idfcfirstbank.com")

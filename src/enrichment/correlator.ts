@@ -12,7 +12,7 @@ import { editMessage, getMessageIdForTransaction } from "../telegram/bot";
 import { formatV2Transaction } from "../telegram/formatter";
 import { getProcessedIds, saveProcessedIds } from "../gmail/poller";
 import { CATEGORIES } from "./gpt";
-import { aggregateEnvelopeEntries } from "../db/v2-queries";
+import { aggregateSpendMonth, getSpendMonthForEntry } from "../db/v2-queries";
 import {
   inferRawTransaction,
   isAutoInferenceEnabled,
@@ -274,13 +274,13 @@ async function updateTelegramMessage(
     return;
   }
 
-  const summary = inference.entry
-    ? aggregateEnvelopeEntries(db, { funding_month: inference.entry.funding_month })
-    : undefined;
+  const spendMonth = inference.entry ? getSpendMonthForEntry(inference.entry) : null;
+  const summary = spendMonth ? aggregateSpendMonth(db, { spend_month: spendMonth }) : undefined;
   const text = formatV2Transaction(transaction, {
     status: inference.status,
     entry: inference.entry,
-    personal_remaining: summary?.personal_remaining,
+    spend_month: spendMonth ?? undefined,
+    spend_month_remaining: summary?.personal_remaining,
     question: inference.question,
   });
   await editMessage(messageId, text);

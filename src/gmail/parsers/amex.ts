@@ -16,6 +16,8 @@ const MONTHS: Record<string, number> = {
   december: 11,
 };
 
+const IST_OFFSET_MS = 5.5 * 60 * 60 * 1000;
+
 export function parseAmex(email: EmailContent): ParsedFields | null {
   if (!email.subject.includes("Your transaction update")) return null;
   if (!email.htmlBody) return null;
@@ -31,7 +33,7 @@ export function parseAmex(email: EmailContent): ParsedFields | null {
   const amountStr = valueAfterLabel(paragraphs, "Amount:");
   if (!dateStr || !merchantRaw || !amountStr) return null;
 
-  const datetime = buildIsoDatetime(dateStr);
+  const datetime = buildIsoDatetime(dateStr, email.receivedAt);
   if (!datetime) return null;
 
   const amountMatch = amountStr.match(/([A-Z]{3})\s+([\d,.]+)/);
@@ -81,7 +83,7 @@ function valueAfterLabel(paragraphs: string[], label: string): string | null {
   return paragraphs[index + 1];
 }
 
-function buildIsoDatetime(dateStr: string): string | null {
+function buildIsoDatetime(dateStr: string, receivedAt?: string): string | null {
   const match = dateStr.match(/(\d{1,2})\s+([A-Za-z]+)\s+(\d{4})/);
   if (!match) return null;
 
@@ -89,11 +91,26 @@ function buildIsoDatetime(dateStr: string): string | null {
   const month = MONTHS[monthStr.toLowerCase()];
   if (month === undefined) return null;
 
-  const mm = String(month + 1).padStart(2, "0");
-  const dd = String(Number(dayStr)).padStart(2, "0");
+  let hour = 0;
+  let minute = 0;
+  let second = 0;
+  let millisecond = 0;
+  if (receivedAt) {
+    const received = new Date(receivedAt);
+    if (!Number.isNaN(received.getTime())) {
+      const receivedIst = new Date(received.getTime() + IST_OFFSET_MS);
+      hour = receivedIst.getUTCHours();
+      minute = receivedIst.getUTCMinutes();
+      second = receivedIst.getUTCSeconds();
+      millisecond = receivedIst.getUTCMilliseconds();
+    }
+  }
 
-  const isoWithOffset = `${yearStr}-${mm}-${dd}T00:00:00+05:30`;
-  const parsed = new Date(isoWithOffset);
+  // AmEx supplies the transaction's IST calendar date but no time. Combine
+  // that authoritative date with Gmail's receipt time-of-day in IST.
+  const parsed = new Date(
+    Date.UTC(Number(yearStr), month, Number(dayStr), hour, minute, second, millisecond) - IST_OFFSET_MS
+  );
   if (Number.isNaN(parsed.getTime())) return null;
 
   return parsed.toISOString();
