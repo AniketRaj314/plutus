@@ -15,6 +15,7 @@ import {
   listReceivables,
   listRawTransactions,
   listUninterpretedTransactions,
+  recordConfirmedCreditAllocation,
   setContextFact,
   updateCommitment,
   updateReceivable,
@@ -24,6 +25,7 @@ import {
   type EnvelopeEntryState,
   type LedgerGroupBy,
   type ReceivableStatus,
+  type TransactionDirection,
 } from "../db/v2-queries";
 import { getCardCycleForDate } from "../envelope/engine";
 import { inferRawTransaction, processInferenceQueue } from "./inference";
@@ -41,6 +43,7 @@ const ENTRY_STATES: EnvelopeEntryState[] = ["forecast", "actual", "settled", "ca
 const CONTEXT_SCOPES: ContextScope[] = ["global", "merchant", "transaction", "card", "person"];
 const RECEIVABLE_STATES: ReceivableStatus[] = ["pending", "partial", "received", "written_off"];
 const COMMITMENT_STATES: CommitmentStatus[] = ["active", "paused", "completed", "cancelled"];
+const TRANSACTION_DIRECTIONS: TransactionDirection[] = ["debit", "credit"];
 
 function resolvedInrAmount(transaction: NonNullable<ReturnType<typeof getRawTransaction>>): number {
   if (transaction.is_international) return transaction.amount_inr ?? 0;
@@ -96,6 +99,7 @@ export const v2Tools: V2ToolDefinition[] = [
         is_reversal: { type: "boolean" },
         is_international: { type: "boolean" },
         is_preauth: { type: "boolean" },
+        direction: { type: "string", enum: TRANSACTION_DIRECTIONS },
         raw_email_id: { type: "string" },
         raw_payload: { type: "string" },
       },
@@ -114,6 +118,7 @@ export const v2Tools: V2ToolDefinition[] = [
         is_reversal: args.is_reversal as boolean | undefined,
         is_international: args.is_international as boolean | undefined,
         is_preauth: args.is_preauth as boolean | undefined,
+        direction: args.direction as TransactionDirection | undefined,
         raw_email_id: args.raw_email_id as string | undefined,
         raw_payload: args.raw_payload as string | undefined,
       }),
@@ -141,6 +146,7 @@ export const v2Tools: V2ToolDefinition[] = [
               is_reversal: { type: "boolean" },
               is_international: { type: "boolean" },
               is_preauth: { type: "boolean" },
+              direction: { type: "string", enum: TRANSACTION_DIRECTIONS },
               raw_email_id: { type: "string" },
               raw_payload: { type: "string" },
             },
@@ -167,6 +173,7 @@ export const v2Tools: V2ToolDefinition[] = [
             is_reversal: row.is_reversal as boolean | undefined,
             is_international: row.is_international as boolean | undefined,
             is_preauth: row.is_preauth as boolean | undefined,
+            direction: row.direction as TransactionDirection | undefined,
             raw_email_id: row.raw_email_id as string | undefined,
             raw_payload: row.raw_payload as string | undefined,
           });
@@ -189,6 +196,7 @@ export const v2Tools: V2ToolDefinition[] = [
       type: "object",
       properties: {
         source: { type: "string", enum: ALL_SOURCES },
+        direction: { type: "string", enum: TRANSACTION_DIRECTIONS },
         since: { type: "string" },
         until: { type: "string" },
         limit: { type: "number" },
@@ -198,6 +206,7 @@ export const v2Tools: V2ToolDefinition[] = [
     handler: (db, args) =>
       listRawTransactions(db, {
         source: args.source as string | undefined,
+        direction: args.direction as TransactionDirection | undefined,
         since: args.since as string | undefined,
         until: args.until as string | undefined,
         limit: args.limit as number | undefined,
@@ -522,6 +531,63 @@ export const v2Tools: V2ToolDefinition[] = [
         status: args.status as ReceivableStatus | undefined,
         counterparty: args.counterparty as string | undefined,
         include_closed: args.include_closed as boolean | undefined,
+      }),
+  },
+  {
+    name: "record_confirmed_credit_allocation",
+    description:
+      "After the user explicitly confirms how an incoming credit should be understood, atomically allocate it, update any referenced receivables, store a zero/nonzero personal impact chosen by the agent, and retain the allocation as shared transaction context. Never call before confirmation.",
+    parameters: {
+      type: "object",
+      properties: {
+        raw_transaction_id: { type: "string" },
+        allocations: {
+          type: "array",
+          items: {
+            type: "object",
+            properties: {
+              receivable_id: { type: ["string", "null"] },
+              kind: {
+                type: "string",
+                description: "Agent-chosen semantic label such as receivable_settlement or unallocated_surplus",
+              },
+              amount_inr: { type: "number" },
+              notes: { type: ["string", "null"] },
+            },
+            required: ["kind", "amount_inr"],
+          },
+        },
+        treatment: { type: "string" },
+        personal_impact: { type: "number" },
+        cashflow_impact: { type: "number" },
+        category: { type: "string" },
+        notes: { type: "string" },
+        created_by: { type: "string" },
+      },
+      required: [
+        "raw_transaction_id",
+        "allocations",
+        "treatment",
+        "personal_impact",
+        "cashflow_impact",
+        "created_by",
+      ],
+    },
+    handler: (db, args) =>
+      recordConfirmedCreditAllocation(db, {
+        raw_transaction_id: args.raw_transaction_id as string,
+        allocations: args.allocations as Array<{
+          receivable_id?: string | null;
+          kind: string;
+          amount_inr: number;
+          notes?: string | null;
+        }>,
+        treatment: args.treatment as string,
+        personal_impact: args.personal_impact as number,
+        cashflow_impact: args.cashflow_impact as number,
+        category: args.category as string | undefined,
+        notes: args.notes as string | undefined,
+        created_by: args.created_by as string,
       }),
   },
   {

@@ -1,4 +1,5 @@
 export type TransactionSource = "idfc_cc" | "bobcard" | "amex" | "idfc_upi";
+export type TransactionDirection = "debit" | "credit";
 
 export interface EmailContent {
   from: string;
@@ -24,6 +25,7 @@ export interface ParsedTransaction {
   notes: string | null;
   envelope_impact: number | null;
   is_preauth: boolean;
+  direction: TransactionDirection;
   correlation_status?: string;
 }
 

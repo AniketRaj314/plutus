@@ -35,6 +35,7 @@ export function runMigrations(db: Database.Database): void {
       amount_inr REAL,
       is_international INTEGER DEFAULT 0,
       is_preauth INTEGER DEFAULT 0,
+      direction TEXT NOT NULL DEFAULT 'debit',
       created_at TEXT DEFAULT (datetime('now'))
     );
 
@@ -123,6 +124,7 @@ export function runMigrations(db: Database.Database): void {
       is_reversal INTEGER NOT NULL DEFAULT 0,
       is_international INTEGER NOT NULL DEFAULT 0,
       is_preauth INTEGER NOT NULL DEFAULT 0,
+      direction TEXT NOT NULL DEFAULT 'debit',
       raw_email_id TEXT,
       raw_payload TEXT,
       created_at TEXT NOT NULL DEFAULT (datetime('now'))
@@ -238,7 +240,9 @@ export function runMigrations(db: Database.Database): void {
   ensureColumn(db, "transactions", "amount_inr", "REAL");
   ensureColumn(db, "transactions", "is_international", "INTEGER DEFAULT 0");
   ensureColumn(db, "transactions", "is_preauth", "INTEGER DEFAULT 0");
+  ensureColumn(db, "transactions", "direction", "TEXT NOT NULL DEFAULT 'debit'");
   ensureColumn(db, "raw_transactions", "is_preauth", "INTEGER NOT NULL DEFAULT 0");
+  ensureColumn(db, "raw_transactions", "direction", "TEXT NOT NULL DEFAULT 'debit'");
   db.exec(`CREATE INDEX IF NOT EXISTS idx_transactions_raw_email_id ON transactions (raw_email_id);`);
 
   seedEnvelope(db);
@@ -309,12 +313,13 @@ function backfillRawTransactions(db: Database.Database): void {
   db.prepare(
     `INSERT OR IGNORE INTO raw_transactions (
       id, source, amount, currency, amount_inr, merchant_raw, occurred_at,
-      card_last4, is_reversal, is_international, is_preauth, raw_email_id
+      card_last4, is_reversal, is_international, is_preauth, direction, raw_email_id
     )
     SELECT
       id, COALESCE(source, 'unknown'), COALESCE(amount, 0), COALESCE(currency, 'INR'),
       amount_inr, merchant_raw, COALESCE(datetime, created_at), card_last4,
-      COALESCE(is_reversal, 0), COALESCE(is_international, 0), COALESCE(is_preauth, 0), raw_email_id
+      COALESCE(is_reversal, 0), COALESCE(is_international, 0), COALESCE(is_preauth, 0),
+      COALESCE(direction, 'debit'), raw_email_id
     FROM transactions`
   ).run();
 }

@@ -26,6 +26,7 @@ export interface Transaction {
   amount_inr: number | null;
   is_international: number;
   is_preauth: number;
+  direction: "debit" | "credit";
   created_at: string;
 }
 
@@ -107,12 +108,12 @@ export function insertTransaction(db: Database.Database, data: NewTransaction): 
       id, source, amount, merchant_raw, merchant_clean, category, datetime,
       card_last4, is_committed, is_credit_card_payment, is_cancelled_out,
       split_id, envelope_impact, correlated_with, correlation_status, notes, raw_email_id, is_reversal,
-      enrichment_confidence, envelope_applied, currency, amount_inr, is_international, is_preauth
+      enrichment_confidence, envelope_applied, currency, amount_inr, is_international, is_preauth, direction
     ) VALUES (
       @id, @source, @amount, @merchant_raw, @merchant_clean, @category, @datetime,
       @card_last4, @is_committed, @is_credit_card_payment, @is_cancelled_out,
       @split_id, @envelope_impact, @correlated_with, @correlation_status, @notes, @raw_email_id, @is_reversal,
-      @enrichment_confidence, @envelope_applied, @currency, @amount_inr, @is_international, @is_preauth
+      @enrichment_confidence, @envelope_applied, @currency, @amount_inr, @is_international, @is_preauth, @direction
     )`
   ).run({
     id,
@@ -139,6 +140,7 @@ export function insertTransaction(db: Database.Database, data: NewTransaction): 
     amount_inr: data.amount_inr ?? null,
     is_international: data.is_international ?? 0,
     is_preauth: data.is_preauth ?? 0,
+    direction: data.direction ?? "debit",
   });
   return getTransaction(db, id) as Transaction;
 }

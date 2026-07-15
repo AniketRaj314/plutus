@@ -67,6 +67,14 @@ export function buildSystemPrompt(db: Database.Database): string {
   const v2Context = listContextFacts(db)
     .filter((fact) => fact.key !== "automatic_inference")
     .slice(0, 100);
+  const pendingCreditProposals = v2Context.filter((fact) => {
+    if (fact.key !== "credit_allocation") return false;
+    try {
+      return JSON.parse(fact.value).status === "proposed";
+    } catch {
+      return false;
+    }
+  });
   const uninterpreted = listUninterpretedTransactions(db, { limit: 20 });
 
   const weekRemaining = (envelope?.current_week_budget ?? 0) - (envelope?.current_week_spent ?? 0);
@@ -137,6 +145,12 @@ export function buildSystemPrompt(db: Database.Database): string {
     v2Context.length > 0
       ? v2Context.map((fact) => `- [${fact.scope_type}:${fact.scope_id || "global"}] ${fact.key}: ${fact.value}`).join("\n")
       : "(none)";
+  const pendingCreditProposalLines =
+    pendingCreditProposals.length > 0
+      ? pendingCreditProposals
+          .map((fact) => `- transaction ${fact.scope_id}: ${fact.value}`)
+          .join("\n")
+      : "(none)";
 
   return `You are Plutus, Aniket's personal finance agent. You are concise, direct, and slightly witty. You communicate primarily via Telegram so keep responses short and punchy unless the user explicitly asks for detail. Use ₹ for Indian Rupee amounts.
 
@@ -152,6 +166,9 @@ ${v2CommitmentLines}
 
 V2 OPEN RECEIVABLES:
 ${v2ReceivableLines}
+
+PENDING INCOMING-CREDIT PROPOSALS (AI suggestions awaiting the user's decision):
+${pendingCreditProposalLines}
 
 V2 SHARED CONTEXT:
 ${v2ContextLines}
@@ -192,6 +209,10 @@ RULES:
 - When correcting an interpretation, create a replacement entry with supersedes_id. Never create two active interpretations for one raw transaction.
 - Use set_context_fact for shared knowledge. Scope merchant rules to merchants, card rules to cards, transaction facts to transaction ids, and people-specific facts to people.
 - Reimbursements and split debts must also be stored with create_receivable and updated when money arrives.
+- Incoming credits require interpretation; the backend does not decide what they mean. Use sender/VPA, amount, open receivables, transaction context, and the pending AI proposal to reason about repayments, partial payments, combined payments, surplus, refunds, salary, or transfers.
+- Never confirm a proposed credit allocation merely because amounts match. Ask the user first. Only after explicit confirmation call record_confirmed_credit_allocation with allocations covering the complete credit.
+- A confirmed receivable repayment or intentional surplus normally has personal_impact=0, so it neither consumes nor increases the spending envelope. Use negative cashflow_impact to represent cash returning to the account when appropriate.
+- Preserve unexplained or intentional excess as a separate semantic allocation such as unallocated_surplus, with notes capturing the user's confirmation. Do not silently turn it into income, debt, or future credit.
 - A commitment is shared knowledge, not spend by itself. Create explicit forecast envelope entries for a funding month; an actual charge must supersede its forecast to avoid double-counting.
 - For questions such as "how much did I spend in July?", "July spend", or the monthly ₹1,20,000 envelope, always call get_spend_month_summary. Its canonical definition is: card entries belong to the month their statement cycle ends; IDFC savings/UPI entries belong to their IST occurrence month; stored personal_impact supplies the financial treatment. Do not substitute get_funding_summary for this question.
 - Use get_funding_summary only when the user asks which salary funds an obligation, what a salary must settle, or another cash-funding question.

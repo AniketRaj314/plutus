@@ -154,6 +154,8 @@ export function formatV2Transaction(
   const merchant = transaction.merchant_clean ?? transaction.merchant_raw ?? "Unknown";
   const header = transaction.is_reversal
     ? `↩️ Refund · ${sourceLabel(transaction.source)}`
+    : transaction.direction === "credit"
+    ? `💰 Money received · ${sourceLabel(transaction.source)}`
     : transaction.source === "idfc_upi"
     ? `💸 UPI · IDFC`
     : `💳 ${sourceLabel(transaction.source)}`;

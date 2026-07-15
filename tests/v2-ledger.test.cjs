@@ -19,6 +19,7 @@ const {
   listEnvelopeEntries,
   listReceivables,
   listUninterpretedTransactions,
+  recordConfirmedCreditAllocation,
   setContextFact,
   updateCommitment,
   updateReceivable,
@@ -32,7 +33,7 @@ const {
 } = require("../src/agent/inference");
 const { getSalaryFundingMonthForDate } = require("../src/envelope/engine");
 const { buildMcpToolSpecs, PACKAGE_VERSION, registerRoutes } = require("../src/api/routes");
-const { processMessage } = require("../src/gmail/poller");
+const { notifyPendingCreditInferences, processMessage } = require("../src/gmail/poller");
 const { parseGmailMessage } = require("../src/gmail/parsers");
 const { formatV2Transaction } = require("../src/telegram/formatter");
 const {
@@ -91,6 +92,7 @@ function inferenceProposal(overrides = {}) {
     notes: null,
     question: null,
     receivable: null,
+    credit_allocations: [],
     ...overrides,
   };
 }
@@ -224,6 +226,150 @@ test("AmEx uses Gmail receipt time when its alert only contains a transaction da
   assert.equal(parsed.datetime, "2026-07-15T06:35:04.000Z");
   assert.equal(parsed.amount, 277);
   assert.equal(parsed.merchant_raw, "Razorpay Restaurants");
+});
+
+test("IDFC UPI parser preserves incoming-credit direction, sender, and exact time", () => {
+  const body =
+    "INR 800.00 credited to your IDFC FIRST Bank Account ending 3029 via UPI on 15-JUL-2026 at 01:05 PM. UPI Ref: 123456789012. VPA: nishidha@upi Sender Name: Nishidha";
+  const message = {
+    id: "idfc-upi-credit",
+    snippet: body,
+    payload: {
+      headers: [
+        { name: "From", value: "noreply@idfcfirstbank.com" },
+        { name: "Subject", value: "Credit Alert: Your IDFC FIRST Bank Account" },
+      ],
+      mimeType: "text/plain",
+      body: { data: Buffer.from(body).toString("base64url") },
+    },
+  };
+
+  const parsed = parseGmailMessage(message);
+  assert.ok(parsed);
+  assert.equal(parsed.source, "idfc_upi");
+  assert.equal(parsed.direction, "credit");
+  assert.equal(parsed.correlation_status, "none");
+  assert.equal(parsed.amount, 800);
+  assert.equal(parsed.merchant_raw, "Nishidha");
+  assert.equal(parsed.datetime, "2026-07-15T07:35:00.000Z");
+});
+
+test("AI-proposed combined repayment and surplus waits for Telegram approval, then reconciles atomically", async () => {
+  const db = makeDb();
+  const paperAndPieEntry = createEnvelopeEntry(db, {
+    funding_month: "2026-08",
+    occurred_at: "2026-07-14T12:00:00+05:30",
+    source: "bobcard",
+    card_cycle_start: "2026-06-22",
+    card_cycle_end: "2026-07-21",
+    treatment: "split",
+    gross_amount_inr: 1018.5,
+    personal_impact: 468.5,
+    cashflow_impact: 1018.5,
+    receivable_amount: 550,
+    created_by: "test",
+  });
+  const groceriesEntry = createEnvelopeEntry(db, {
+    funding_month: "2026-08",
+    occurred_at: "2026-07-13T12:00:00+05:30",
+    source: "amex",
+    card_cycle_start: "2026-06-21",
+    card_cycle_end: "2026-07-20",
+    treatment: "split",
+    gross_amount_inr: 211,
+    personal_impact: 0,
+    cashflow_impact: 211,
+    receivable_amount: 211,
+    created_by: "test",
+  });
+  const paperAndPie = createReceivable(db, {
+    envelope_entry_id: paperAndPieEntry.id,
+    counterparty: "Nishidha",
+    label: "Paper and Pie split",
+    amount_inr: 550,
+    created_by: "test",
+  });
+  const groceries = createReceivable(db, {
+    envelope_entry_id: groceriesEntry.id,
+    counterparty: "Nishidha",
+    label: "Groceries",
+    amount_inr: 211,
+    created_by: "test",
+  });
+  const raw = insertRawTransaction(db, {
+    source: "idfc_upi",
+    amount: 800,
+    amount_inr: 800,
+    merchant_raw: "Nishidha",
+    occurred_at: "2026-07-15T13:05:00+05:30",
+    direction: "credit",
+    raw_email_id: "nishidha-800",
+  });
+  const allocations = [
+    { receivable_id: paperAndPie.id, kind: "receivable_settlement", amount_inr: 550, notes: null },
+    { receivable_id: groceries.id, kind: "receivable_settlement", amount_inr: 211, notes: null },
+    { receivable_id: null, kind: "unallocated_surplus", amount_inr: 39, notes: "Possible convenience surplus" },
+  ];
+
+  const outcome = await inferRawTransaction(db, raw.id, {
+    generate: async () =>
+      inferenceProposal({
+        decision: "needs_context",
+        merchant_clean: "Nishidha",
+        treatment: "receivable_settlement_with_surplus",
+        gross_amount_inr: 800,
+        personal_impact: 0,
+        cashflow_impact: -800,
+        receivable_amount: 0,
+        confidence: 0.96,
+        question:
+          "Nishidha sent ₹800. This could settle ₹550 for Paper & Pie and ₹211 for groceries, leaving ₹39 surplus. Confirm?",
+        credit_allocations: allocations,
+      }),
+  });
+  assert.equal(outcome.status, "needs_context");
+  assert.equal(listReceivables(db).length, 2);
+  assert.equal(listEnvelopeEntries(db, { raw_transaction_id: raw.id }).length, 0);
+  const proposed = listContextFacts(db, {
+    scope_type: "transaction",
+    scope_id: raw.id,
+    key: "credit_allocation",
+  })[0];
+  assert.equal(JSON.parse(proposed.value).status, "proposed");
+  assert.equal(JSON.parse(proposed.value).allocations[2].amount_inr, 39);
+
+  let telegramText = "";
+  const sent = await notifyPendingCreditInferences(db, async (text) => {
+    telegramText = text;
+    return 4444;
+  });
+  assert.equal(sent, 1);
+  assert.match(telegramText, /Money received · IDFC UPI/);
+  assert.match(telegramText, /leaving ₹39 surplus/);
+  assert.equal(await notifyPendingCreditInferences(db, async () => 5555), 0);
+
+  const confirmed = recordConfirmedCreditAllocation(db, {
+    raw_transaction_id: raw.id,
+    allocations,
+    treatment: "receivable_settlement_with_surplus",
+    personal_impact: 0,
+    cashflow_impact: -800,
+    notes: "User confirmed both repayments and the intentional ₹39 surplus.",
+    created_by: "telegram_user",
+  });
+  assert.equal(confirmed.entry.personal_impact, 0);
+  assert.equal(confirmed.entry.cashflow_impact, -800);
+  assert.equal(listReceivables(db).length, 0);
+  assert.equal(listReceivables(db, { include_closed: true }).every((item) => item.status === "received"), true);
+  const stored = listContextFacts(db, {
+    scope_type: "transaction",
+    scope_id: raw.id,
+    key: "credit_allocation",
+  })[0];
+  assert.equal(JSON.parse(stored.value).status, "confirmed");
+  assert.equal(JSON.parse(stored.value).allocations[2].kind, "unallocated_surplus");
+  assert.equal(aggregateSpendMonth(db, { spend_month: "2026-07" }).personal_impact, 468.5);
+  db.close();
 });
 
 test("card-cycle routing changes funding month on each exact boundary", () => {
@@ -404,6 +550,28 @@ test("inference response validation rejects malformed financial output", () => {
   );
   assert.equal(
     parseInferenceResponse(JSON.stringify(inferenceProposal({ personal_impact: "1000" }))),
+    null
+  );
+  const validCredit = parseInferenceResponse(
+    JSON.stringify(
+      inferenceProposal({
+        decision: "needs_context",
+        credit_allocations: [
+          { receivable_id: "receivable-1", kind: "receivable_settlement", amount_inr: 550, notes: null },
+          { receivable_id: null, kind: "unallocated_surplus", amount_inr: 39, notes: "Confirm surplus" },
+        ],
+      })
+    )
+  );
+  assert.equal(validCredit.credit_allocations.length, 2);
+  assert.equal(
+    parseInferenceResponse(
+      JSON.stringify(
+        inferenceProposal({
+          credit_allocations: [{ receivable_id: null, kind: "surplus", amount_inr: -1, notes: null }],
+        })
+      )
+    ),
     null
   );
 });
@@ -826,6 +994,7 @@ test("all v2 MCP tools are registered for external agents", () => {
     "create_receivable",
     "update_receivable",
     "list_receivables",
+    "record_confirmed_credit_allocation",
     "create_commitment",
     "update_commitment",
     "list_commitments_v2",

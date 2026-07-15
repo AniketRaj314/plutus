@@ -36,6 +36,13 @@ export interface InferenceReceivableProposal {
   notes: string | null;
 }
 
+export interface InferenceCreditAllocationProposal {
+  receivable_id: string | null;
+  kind: string;
+  amount_inr: number;
+  notes: string | null;
+}
+
 export interface TransactionInferenceProposal {
   decision: "interpret" | "needs_context";
   merchant_clean: string | null;
@@ -49,6 +56,7 @@ export interface TransactionInferenceProposal {
   notes: string | null;
   question: string | null;
   receivable: InferenceReceivableProposal | null;
+  credit_allocations: InferenceCreditAllocationProposal[];
 }
 
 export interface InferenceContext {
@@ -161,6 +169,10 @@ Important rules:
 - Commitments are context, not automatic spend. This transaction is an actual event.
 - If context is insufficient to distinguish materially different financial treatments, choose needs_context and ask one short specific question.
 - Never invent a counterparty, reimbursement policy, split share, EMI amount, or settlement state.
+- raw.direction is immutable evidence. For an incoming credit, reason whether it could be a receivable repayment, refund, salary, self-transfer, gift, surplus, or something else.
+- If a credit plausibly settles open receivables, do not close them automatically. Return needs_context with a concise confirmation question and proposed credit_allocations covering the full credit.
+- Matching is AI judgment: use counterparty text, amount, timing, open receivables, and context. Exact equality is not required; explicitly handle partial, combined, and surplus amounts.
+- A proposed surplus may use a semantic kind such as unallocated_surplus with receivable_id=null. Repayments and confirmed surplus do not become personal spending or extra envelope allowance.
 
 Return exactly:
 {
@@ -181,8 +193,16 @@ Return exactly:
     "amount_inr": number,
     "expected_at": string | null,
     "notes": string | null
-  }
+  },
+  "credit_allocations": Array<{
+    "receivable_id": string | null,
+    "kind": string,
+    "amount_inr": number,
+    "notes": string | null
+  }>
 }
+
+For debit events, credit_allocations must be []. For a proposed incoming-credit match, populate the proposed treatment and impact fields even though decision is needs_context; user confirmation is still required before persistence.
 
 category, when non-null, must be one of: ${CATEGORIES.join(", ")}.`;
 
@@ -250,6 +270,30 @@ export function parseInferenceResponse(raw: string): TransactionInferenceProposa
     };
   }
 
+  const creditAllocationsRaw = o.credit_allocations ?? [];
+  if (!Array.isArray(creditAllocationsRaw)) return null;
+  const creditAllocations: InferenceCreditAllocationProposal[] = [];
+  for (const item of creditAllocationsRaw) {
+    if (typeof item !== "object" || item === null) return null;
+    const allocation = item as Record<string, unknown>;
+    if (allocation.receivable_id !== null && typeof allocation.receivable_id !== "string") return null;
+    if (typeof allocation.kind !== "string" || !allocation.kind.trim()) return null;
+    if (
+      typeof allocation.amount_inr !== "number" ||
+      !Number.isFinite(allocation.amount_inr) ||
+      allocation.amount_inr <= 0
+    ) {
+      return null;
+    }
+    if (allocation.notes !== null && typeof allocation.notes !== "string") return null;
+    creditAllocations.push({
+      receivable_id: allocation.receivable_id as string | null,
+      kind: allocation.kind,
+      amount_inr: allocation.amount_inr,
+      notes: allocation.notes as string | null,
+    });
+  }
+
   return {
     decision: o.decision,
     merchant_clean: o.merchant_clean as string | null,
@@ -263,6 +307,7 @@ export function parseInferenceResponse(raw: string): TransactionInferenceProposa
     notes: o.notes as string | null,
     question: o.question as string | null,
     receivable,
+    credit_allocations: creditAllocations,
   };
 }
 
@@ -271,7 +316,7 @@ function recordInferenceState(
   rawTransactionId: string,
   state: { status: string; question?: string; error?: string; confidence?: number }
 ): void {
-  const previous = getInferenceState(db, rawTransactionId);
+  const previous = getStoredInferenceState(db, rawTransactionId);
   const attempts = (previous?.attempts ?? 0) + (state.status === "completed" ? 0 : 1);
   setContextFact(db, {
     scope_type: "transaction",
@@ -283,7 +328,7 @@ function recordInferenceState(
   });
 }
 
-interface StoredInferenceState {
+export interface StoredInferenceState {
   status: string;
   question?: string;
   error?: string;
@@ -291,7 +336,10 @@ interface StoredInferenceState {
   attempts: number;
 }
 
-function getInferenceState(db: Database.Database, rawTransactionId: string): StoredInferenceState | undefined {
+export function getStoredInferenceState(
+  db: Database.Database,
+  rawTransactionId: string
+): StoredInferenceState | undefined {
   const fact = listContextFacts(db, {
     scope_type: "transaction",
     scope_id: rawTransactionId,
@@ -337,6 +385,24 @@ export async function inferRawTransaction(
       const question =
         proposal.question ??
         `How should ${raw.merchant_raw ?? "this transaction"} for ₹${resolvedInrAmount(raw) ?? raw.amount} be treated?`;
+      if (raw.direction === "credit" && proposal.credit_allocations.length > 0) {
+        setContextFact(db, {
+          scope_type: "transaction",
+          scope_id: raw.id,
+          key: "credit_allocation",
+          value: JSON.stringify({
+            status: "proposed",
+            question,
+            allocations: proposal.credit_allocations,
+            treatment: proposal.treatment,
+            personal_impact: proposal.personal_impact,
+            cashflow_impact: proposal.cashflow_impact,
+            notes: proposal.notes,
+          }),
+          source: "automatic_inference",
+          confidence: proposal.confidence,
+        });
+      }
       recordInferenceState(db, raw.id, {
         status: "needs_context",
         question,
@@ -437,7 +503,7 @@ export async function processInferenceQueue(
     const outcomes: InferenceOutcome[] = [];
     for (const raw of pending) {
       if (outcomes.length >= requestedLimit) break;
-      const state = getInferenceState(db, raw.id);
+      const state = getStoredInferenceState(db, raw.id);
       if (state?.status === "needs_context" || (state?.status === "failed" && state.attempts >= 3)) continue;
       const legacy = getTransaction(db, raw.id);
       if (legacy?.correlation_status === "pending") continue;

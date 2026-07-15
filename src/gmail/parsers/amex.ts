@@ -58,6 +58,7 @@ export function parseAmex(email: EmailContent): ParsedFields | null {
       envelope_impact: 0,
       notes: "pending_forex_resolution",
       is_preauth: false,
+      direction: "debit",
     };
   }
 
@@ -74,6 +75,7 @@ export function parseAmex(email: EmailContent): ParsedFields | null {
     envelope_impact: null,
     notes: null,
     is_preauth: false,
+    direction: "debit",
   };
 }
 

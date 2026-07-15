@@ -74,6 +74,7 @@ function parseAlert(email: EmailContent): ParsedFields | null {
     notes: null,
     envelope_impact: null,
     is_preauth: false,
+    direction: "debit",
   };
 }
 
@@ -101,6 +102,7 @@ function parseDebitAlert(email: EmailContent): ParsedFields | null {
     notes: null,
     envelope_impact: null,
     is_preauth: false,
+    direction: "debit",
   };
 }
 
@@ -127,6 +129,7 @@ function parseReversal(email: EmailContent): ParsedFields | null {
     notes: null,
     envelope_impact: null,
     is_preauth: false,
+    direction: "credit",
   };
 }
 

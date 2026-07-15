@@ -8,6 +8,7 @@ import type { EmailContent, ParsedFields } from "./types";
 const SUBJECT_VARIANTS = [
   "Alert: Your IDFC FIRST Bank Account",
   "Debit Alert: Your IDFC FIRST Bank Account",
+  "Credit Alert: Your IDFC FIRST Bank Account",
   "UPI Transaction Alert",
 ];
 
@@ -26,13 +27,15 @@ const MONTHS: Record<string, number> = {
   dec: 11,
 };
 
-// "INR 500.00 debited from your IDFC FIRST Bank Account ending 1234 via UPI
-//  on 13-JUL-2026 at 09:15 AM. UPI Ref: 123456789012. VPA: merchant@upi"
+// "INR 500.00 debited from your IDFC FIRST Bank Account ending 1234 via UPI ..."
+// "INR 500.00 credited to your IDFC FIRST Bank Account ending 1234 via UPI ..."
+// These are provisional until the first real credit alert confirms IDFC's wording.
 const TRANSACTION_PATTERN =
-  /INR\s*([\d,]+\.\d{2})\s*debited from your IDFC FIRST Bank Account ending\s*(?:XX)?(\d{4})\s*via UPI\s*on\s*(\d{1,2})[\s-]([A-Za-z]{3})[\s-](\d{4})\s*at\s*(\d{1,2}:\d{2}\s*[AP]M)/i;
+  /INR\s*([\d,]+\.\d{2})\s*(debited\s+from|credited\s+(?:to|into))\s+your IDFC FIRST Bank Account ending\s*(?:XX)?(\d{4})\s*via UPI\s*on\s*(\d{1,2})[\s-]([A-Za-z]{3})[\s-](\d{4})\s*at\s*(\d{1,2}:\d{2}\s*[AP]M)/i;
 
 const UPI_REF_PATTERN = /UPI\s*Ref:?\s*([\w-]+)/i;
 const VPA_PATTERN = /VPA:?\s*([\w.\-]+@[\w.\-]+)/i;
+const SENDER_PATTERN = /(?:Sender|Remitter)(?:\s+Name)?:?\s*([A-Za-z][A-Za-z .'-]{1,80})/i;
 
 export function parseIdfcUpi(email: EmailContent): ParsedFields | null {
   if (!SUBJECT_VARIANTS.some((subject) => email.subject.includes(subject))) {
@@ -46,7 +49,7 @@ export function parseIdfcUpi(email: EmailContent): ParsedFields | null {
     return null;
   }
 
-  const [, amountStr, accountLast4, dayStr, monthStr, yearStr, timeStr] = match;
+  const [, amountStr, directionPhrase, accountLast4, dayStr, monthStr, yearStr, timeStr] = match;
   const month = MONTHS[monthStr.toLowerCase()];
   if (month === undefined) return null;
 
@@ -56,13 +59,16 @@ export function parseIdfcUpi(email: EmailContent): ParsedFields | null {
   const amount = Number(amountStr.replace(/,/g, ""));
   const vpaMatch = email.body.match(VPA_PATTERN);
   const vpa = vpaMatch ? vpaMatch[1] : null;
+  const senderMatch = email.body.match(SENDER_PATTERN);
+  const sender = senderMatch ? senderMatch[1].trim() : null;
   const upiRefMatch = email.body.match(UPI_REF_PATTERN);
   const upiRef = upiRefMatch ? upiRefMatch[1] : null;
+  const direction = directionPhrase.toLowerCase().startsWith("credited") ? "credit" : "debit";
 
   return {
     source: "idfc_upi",
     amount,
-    merchant_raw: vpa ?? "UPI Transfer",
+    merchant_raw: direction === "credit" ? sender ?? vpa ?? "Incoming UPI credit" : vpa ?? "UPI Transfer",
     datetime,
     card_last4: accountLast4,
     is_reversal: false,
@@ -72,7 +78,8 @@ export function parseIdfcUpi(email: EmailContent): ParsedFields | null {
     envelope_impact: null,
     notes: upiRef ? `upi_ref:${upiRef}` : null,
     is_preauth: false,
-    correlation_status: "pending",
+    direction,
+    correlation_status: direction === "credit" ? "none" : "pending",
   };
 }
 

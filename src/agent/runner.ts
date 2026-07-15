@@ -3,6 +3,7 @@ import type Database from "better-sqlite3";
 import type { ChatCompletionMessageParam, ChatCompletionTool } from "openai/resources/chat/completions";
 import { buildSystemPrompt } from "./prompts";
 import { v2Tools as tools } from "./v2-tools";
+import { getRawTransaction } from "../db/v2-queries";
 import { listRecentAgentMessages, insertAgentMessage, getTransaction } from "../db/queries";
 
 const MODEL = "o3";
@@ -51,12 +52,15 @@ export async function runAgent(db: Database.Database, payload: RunAgentPayload):
   let effectiveUserMessage = payload.user_message;
   if (payload.replied_to_transaction_id) {
     const transaction = getTransaction(db, payload.replied_to_transaction_id);
-    if (transaction) {
+    const raw = getRawTransaction(db, payload.replied_to_transaction_id);
+    if (transaction || raw) {
       const contextLine = `[Context: user is referring to transaction — ${
-        transaction.merchant_clean ?? transaction.merchant_raw ?? "Unknown"
-      } · ₹${transaction.amount ?? 0} · ${transaction.datetime ?? "unknown date"} · ${
-        transaction.category ?? "uncategorized"
-      }]`;
+        transaction?.merchant_clean ?? transaction?.merchant_raw ?? raw?.merchant_raw ?? "Unknown"
+      } · ₹${transaction?.amount ?? raw?.amount ?? 0} · ${
+        transaction?.datetime ?? raw?.occurred_at ?? "unknown date"
+      } · ${transaction?.direction ?? raw?.direction ?? "debit"} · ${
+        transaction?.category ?? "uncategorized"
+      } · raw_transaction_id=${payload.replied_to_transaction_id}]`;
       effectiveUserMessage = `${contextLine}\n${payload.user_message}`;
     }
   }

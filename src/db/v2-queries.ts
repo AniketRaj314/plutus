@@ -1,10 +1,12 @@
 import type Database from "better-sqlite3";
 import { newId } from "./schema";
+import { getSalaryFundingMonthForDate } from "../envelope/engine";
 
 export type EnvelopeEntryState = "forecast" | "actual" | "settled" | "cancelled";
 export type ContextScope = "global" | "merchant" | "transaction" | "card" | "person";
 export type ReceivableStatus = "pending" | "partial" | "received" | "written_off";
 export type CommitmentStatus = "active" | "paused" | "completed" | "cancelled";
+export type TransactionDirection = "debit" | "credit";
 
 export interface SalaryProfile {
   id: string;
@@ -29,6 +31,7 @@ export interface RawTransactionV2 {
   is_reversal: number;
   is_international: number;
   is_preauth: number;
+  direction: TransactionDirection;
   raw_email_id: string | null;
   raw_payload: string | null;
   created_at: string;
@@ -46,6 +49,7 @@ export interface CreateRawTransactionInput {
   is_reversal?: boolean;
   is_international?: boolean;
   is_preauth?: boolean;
+  direction?: TransactionDirection;
   raw_email_id?: string | null;
   raw_payload?: string | null;
 }
@@ -138,6 +142,24 @@ export interface Receivable {
   updated_at: string;
 }
 
+export interface CreditAllocation {
+  receivable_id?: string | null;
+  kind: string;
+  amount_inr: number;
+  notes?: string | null;
+}
+
+export interface ConfirmCreditAllocationInput {
+  raw_transaction_id: string;
+  allocations: CreditAllocation[];
+  treatment: string;
+  personal_impact: number;
+  cashflow_impact: number;
+  category?: string;
+  notes?: string;
+  created_by: string;
+}
+
 export interface Commitment {
   id: string;
   label: string;
@@ -186,10 +208,10 @@ export function insertRawTransaction(db: Database.Database, input: CreateRawTran
   db.prepare(
     `INSERT OR IGNORE INTO raw_transactions (
       id, source, amount, currency, amount_inr, merchant_raw, occurred_at,
-      card_last4, is_reversal, is_international, is_preauth, raw_email_id, raw_payload
+      card_last4, is_reversal, is_international, is_preauth, direction, raw_email_id, raw_payload
     ) VALUES (
       @id, @source, @amount, @currency, @amount_inr, @merchant_raw, @occurred_at,
-      @card_last4, @is_reversal, @is_international, @is_preauth, @raw_email_id, @raw_payload
+      @card_last4, @is_reversal, @is_international, @is_preauth, @direction, @raw_email_id, @raw_payload
     )`
   ).run({
     id,
@@ -203,6 +225,7 @@ export function insertRawTransaction(db: Database.Database, input: CreateRawTran
     is_reversal: input.is_reversal ? 1 : 0,
     is_international: input.is_international ? 1 : 0,
     is_preauth: input.is_preauth ? 1 : 0,
+    direction: input.direction ?? "debit",
     raw_email_id: input.raw_email_id ?? null,
     raw_payload: input.raw_payload ?? null,
   });
@@ -669,13 +692,17 @@ export function listUninterpretedTransactions(
 
 export function listRawTransactions(
   db: Database.Database,
-  filters: { source?: string; since?: string; until?: string; limit?: number } = {}
+  filters: { source?: string; direction?: TransactionDirection; since?: string; until?: string; limit?: number } = {}
 ): RawTransactionV2[] {
   const clauses: string[] = [];
   const params: Record<string, unknown> = { limit: Math.min(Math.max(filters.limit ?? 100, 1), 1000) };
   if (filters.source) {
     clauses.push("source = @source");
     params.source = filters.source;
+  }
+  if (filters.direction) {
+    clauses.push("direction = @direction");
+    params.direction = filters.direction;
   }
   if (filters.since) {
     clauses.push("occurred_at >= @since");
@@ -862,6 +889,101 @@ export function listReceivables(
   }
   const where = clauses.length ? `WHERE ${clauses.join(" AND ")}` : "";
   return db.prepare(`SELECT * FROM receivables ${where} ORDER BY created_at DESC`).all(params) as Receivable[];
+}
+
+/**
+ * Persist a user-confirmed interpretation of an incoming credit atomically.
+ * The caller (normally the Telegram AI agent) supplies the semantic allocation;
+ * this function only validates accounting consistency and stores the result.
+ */
+export function recordConfirmedCreditAllocation(
+  db: Database.Database,
+  input: ConfirmCreditAllocationInput
+): { entry: EnvelopeEntry; receivables: Receivable[]; context: ContextFact } {
+  const raw = getRawTransaction(db, input.raw_transaction_id);
+  if (!raw) throw new Error(`transaction ${input.raw_transaction_id} not found`);
+  if (raw.source !== "idfc_upi") throw new Error("credit allocation currently supports IDFC savings/UPI credits");
+  if (raw.direction !== "credit") throw new Error("credit allocation requires an incoming credit transaction");
+  if (input.allocations.length === 0) throw new Error("at least one allocation is required");
+  assertFiniteMoney("personal_impact", input.personal_impact);
+  assertFiniteMoney("cashflow_impact", input.cashflow_impact);
+
+  const amountInr = raw.is_international ? raw.amount_inr : raw.amount;
+  if (amountInr === null || !Number.isFinite(amountInr)) throw new Error("credit must have a resolved INR amount");
+  let allocationTotal = 0;
+  for (const allocation of input.allocations) {
+    if (!allocation.kind.trim()) throw new Error("allocation kind is required");
+    if (!Number.isFinite(allocation.amount_inr) || allocation.amount_inr <= 0) {
+      throw new Error("allocation amount_inr must be positive");
+    }
+    allocationTotal += allocation.amount_inr;
+  }
+  if (Math.abs(allocationTotal - amountInr) > 0.01) {
+    throw new Error(`allocations must total ₹${amountInr}; received ₹${allocationTotal}`);
+  }
+  if (listEnvelopeEntries(db, { raw_transaction_id: raw.id, limit: 1 }).length > 0) {
+    throw new Error("credit transaction already has an active interpretation");
+  }
+
+  return db.transaction(() => {
+    const updatedReceivables: Receivable[] = [];
+    for (const allocation of input.allocations) {
+      if (!allocation.receivable_id) continue;
+      const receivable = db
+        .prepare("SELECT * FROM receivables WHERE id = ?")
+        .get(allocation.receivable_id) as Receivable | undefined;
+      if (!receivable) throw new Error(`receivable ${allocation.receivable_id} not found`);
+      const outstanding = receivable.amount_inr - receivable.received_inr;
+      if (allocation.amount_inr - outstanding > 0.01) {
+        throw new Error(
+          `allocation ₹${allocation.amount_inr} exceeds ₹${outstanding} outstanding for ${receivable.label}`
+        );
+      }
+      const updated = updateReceivable(db, receivable.id, {
+        received_inr: receivable.received_inr + allocation.amount_inr,
+      });
+      if (!updated) throw new Error(`receivable ${receivable.id} could not be updated`);
+      updatedReceivables.push(updated);
+    }
+
+    const occurredAt = new Date(raw.occurred_at);
+    const salaryDay = getActiveSalaryProfile(db)?.salary_day ?? 1;
+    const fundingMonth = getSalaryFundingMonthForDate(occurredAt, salaryDay);
+    const entry = createEnvelopeEntry(db, {
+      raw_transaction_id: raw.id,
+      funding_month: fundingMonth,
+      occurred_at: raw.occurred_at,
+      source: raw.source,
+      merchant_clean: raw.merchant_raw ?? undefined,
+      category: input.category,
+      treatment: input.treatment,
+      state: "actual",
+      gross_amount_inr: amountInr,
+      personal_impact: input.personal_impact,
+      cashflow_impact: input.cashflow_impact,
+      receivable_amount: 0,
+      notes: input.notes,
+      confidence: 1,
+      created_by: input.created_by,
+    });
+    const context = setContextFact(db, {
+      scope_type: "transaction",
+      scope_id: raw.id,
+      key: "credit_allocation",
+      value: JSON.stringify({
+        status: "confirmed",
+        amount_inr: amountInr,
+        allocations: input.allocations,
+        treatment: input.treatment,
+        personal_impact: input.personal_impact,
+        cashflow_impact: input.cashflow_impact,
+        notes: input.notes ?? null,
+      }),
+      source: input.created_by,
+      confidence: 1,
+    });
+    return { entry, receivables: updatedReceivables, context };
+  })();
 }
 
 export function createCommitment(
