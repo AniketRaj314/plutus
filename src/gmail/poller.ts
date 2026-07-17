@@ -44,8 +44,20 @@ const WATCHED_SENDERS = [
 
 const LAST_POLL_KEY = "last_gmail_poll";
 const PROCESSED_IDS_KEY = "processed_message_ids";
+const UNPARSEABLE_IDS_KEY = "unparseable_gmail_message_ids";
+const PARSER_REVISION_KEY = "gmail_parser_revision";
+const PARSER_REVISION = "amex-symbol-currency-v1";
+const PARSER_REPLAY_WINDOW_SECONDS = 48 * 60 * 60;
 const MAX_PROCESSED_IDS = 2000;
+const MAX_UNPARSEABLE_IDS = 200;
 const activePollDatabases = new WeakSet<Database.Database>();
+
+export type ProcessMessageOutcome = "recorded" | "duplicate" | "ignored" | "unparseable";
+
+export interface PollOnceOptions {
+  gmail?: gmail_v1.Gmail;
+  processMessageOptions?: ProcessMessageOptions;
+}
 
 export function startPoller(db: Database.Database): void {
   const intervalMins = normalizeCronInterval(process.env.POLL_INTERVAL_MINS, 10);
@@ -68,41 +80,71 @@ export function startPoller(db: Database.Database): void {
   console.log(`Gmail poller scheduled every ${intervalMins} minute(s)`);
 }
 
-export async function pollOnce(db: Database.Database): Promise<void> {
+export async function pollOnce(db: Database.Database, options: PollOnceOptions = {}): Promise<void> {
   if (activePollDatabases.has(db)) {
     console.log("[gmail] previous poll is still running, skipping overlapping cron tick");
     return;
   }
   activePollDatabases.add(db);
   try {
-    const gmail = getGmailClient();
-    const sinceSeconds = getLastPollTimestamp(db);
+    const gmail = options.gmail ?? getGmailClient();
+    const lastPollSeconds = getLastPollTimestamp(db);
     const processedIds = getProcessedIds(db);
+    const unparseableIds = getUnparseableIds(db);
+    const replayParserRevision = getContext(db, PARSER_REVISION_KEY)?.value !== PARSER_REVISION;
+    const sinceSeconds = replayParserRevision
+      ? Math.min(lastPollSeconds, Math.floor(Date.now() / 1000) - PARSER_REPLAY_WINDOW_SECONDS)
+      : lastPollSeconds;
 
     const query = `from:(${WATCHED_SENDERS.join(" OR ")}) after:${sinceSeconds}`;
     const messageIds = await listMessageIds(gmail, query);
-    const newIds = messageIds.filter((id) => !processedIds.has(id));
+    const idsToProcess = selectMessageIdsForPoll(
+      messageIds,
+      processedIds,
+      unparseableIds,
+      replayParserRevision
+    );
+    const outcomes: Record<ProcessMessageOutcome, number> = {
+      recorded: 0,
+      duplicate: 0,
+      ignored: 0,
+      unparseable: 0,
+    };
 
-    for (const id of newIds) {
+    for (const id of idsToProcess) {
       const message = await gmail.users.messages.get({
         userId: "me",
         id,
         format: "full",
       });
 
-      await processMessage(db, message.data);
-      processedIds.add(id);
+      const outcome = await processMessage(db, message.data, options.processMessageOptions);
+      outcomes[outcome] += 1;
+      if (outcome === "unparseable") {
+        processedIds.delete(id);
+        unparseableIds.add(id);
+      } else {
+        processedIds.add(id);
+        unparseableIds.delete(id);
+      }
     }
 
     saveProcessedIds(db, processedIds);
+    saveUnparseableIds(db, unparseableIds);
     setContext(db, LAST_POLL_KEY, String(Math.floor(Date.now() / 1000)));
+    setContext(db, PARSER_REVISION_KEY, PARSER_REVISION);
 
     console.log(
-      newIds.length === 0
-        ? "[gmail] poll complete, no new messages"
-        : `[gmail] poll complete, ${newIds.length} new message(s) processed`
+      `[gmail] poll complete: examined=${idsToProcess.length} recorded=${outcomes.recorded} ` +
+        `duplicates=${outcomes.duplicate} ignored=${outcomes.ignored} ` +
+        `unparseable=${outcomes.unparseable} replay=${replayParserRevision ? "yes" : "no"}`
     );
     await notifyPendingCreditInferences(db);
+    if (outcomes.unparseable > 0) {
+      throw new Error(
+        `${outcomes.unparseable} likely transaction alert(s) remain unparseable and will be retried`
+      );
+    }
   } catch (err) {
     console.error("[gmail] poll cycle failed:", err);
     throw err;
@@ -176,13 +218,14 @@ export interface ProcessMessageOptions {
   inferenceGenerator?: InferenceGenerator;
   minConfidence?: number;
   sendTelegram?: (text: string, replyToMessageId?: number) => Promise<number>;
+  enrich?: typeof enrichTransaction;
 }
 
 export async function processMessage(
   db: Database.Database,
   message: gmail_v1.Schema$Message,
   options: ProcessMessageOptions = {}
-): Promise<void> {
+): Promise<ProcessMessageOutcome> {
   const headers = message.payload?.headers ?? [];
   const from = headers.find((h) => h.name === "From")?.value ?? "(unknown sender)";
   const subject = headers.find((h) => h.name === "Subject")?.value ?? "(no subject)";
@@ -193,20 +236,26 @@ export async function processMessage(
 
   const parsed = parseGmailMessage(message);
   if (!parsed) {
-    console.log(`[gmail] no parser matched or unparseable, skipping id=${id}`);
-    return;
+    if (isLikelyTransactionAlert(message)) {
+      console.error(`[gmail] likely transaction alert is unparseable, queueing retry id=${id}`);
+      return "unparseable";
+    }
+    console.log(`[gmail] non-transaction message ignored id=${id}`);
+    return "ignored";
   }
+
+  const enrich = options.enrich ?? enrichTransaction;
 
   const existing = getTransactionByRawEmailId(db, parsed.raw_email_id);
   if (existing) {
     if (getMessageIdForTransaction(db, existing.id)) {
       console.log(`[gmail] transaction already completed for raw_email_id=${parsed.raw_email_id}, skipping`);
-      return;
+      return "duplicate";
     }
     console.log(`[gmail] recovering incomplete processing for raw_email_id=${parsed.raw_email_id}`);
-    if (!existing.merchant_clean) await enrichTransaction(db, existing);
+    if (!existing.merchant_clean) await enrich(db, existing);
     await finalizeTransaction(db, getTransaction(db, existing.id) ?? existing, options);
-    return;
+    return "recorded";
   }
 
   const minuteKey = parsed.datetime.slice(0, 16);
@@ -221,7 +270,7 @@ export async function processMessage(
     console.log(
       `[gmail] duplicate transaction content (same amount/merchant/minute) already recorded as ${contentDuplicate.id}, skipping raw_email_id=${parsed.raw_email_id}`
     );
-    return;
+    return "duplicate";
   }
 
   const transaction = insertTransaction(db, {
@@ -271,8 +320,30 @@ export async function processMessage(
     `[gmail] parsed transaction: source=${transaction.source} amount=${transaction.amount} currency=${transaction.currency} merchant="${transaction.merchant_raw ?? "(none)"}" datetime=${transaction.datetime} card_last4=${transaction.card_last4} is_reversal=${transaction.is_reversal} is_international=${transaction.is_international} id=${transaction.id}`
   );
 
-  await enrichTransaction(db, transaction);
+  await enrich(db, transaction);
   await finalizeTransaction(db, getTransaction(db, transaction.id) ?? transaction, options);
+  return "recorded";
+}
+
+export function isLikelyTransactionAlert(message: gmail_v1.Schema$Message): boolean {
+  const headers = message.payload?.headers ?? [];
+  const from = headers.find((header) => header.name?.toLowerCase() === "from")?.value?.toLowerCase() ?? "";
+  const subject =
+    headers.find((header) => header.name?.toLowerCase() === "subject")?.value?.toLowerCase() ?? "";
+
+  if (from.includes("americanexpress.com")) return subject.includes("your transaction update");
+  if (from.includes("no-reply@getonecard.app")) {
+    return subject.includes("payment update on your bobcard one credit card");
+  }
+  if (from.includes("noreply@idfcfirstbank.com")) {
+    return (
+      subject.includes("idfc first credit card") ||
+      subject.includes("transaction reversal") ||
+      subject.includes("idfc first bank account") ||
+      subject.includes("upi transaction alert")
+    );
+  }
+  return false;
 }
 
 async function finalizeTransaction(
@@ -384,4 +455,32 @@ export function getProcessedIds(db: Database.Database): Set<string> {
 export function saveProcessedIds(db: Database.Database, ids: Set<string>): void {
   const trimmed = Array.from(ids).slice(-MAX_PROCESSED_IDS);
   setContext(db, PROCESSED_IDS_KEY, JSON.stringify(trimmed));
+}
+
+export function getUnparseableIds(db: Database.Database): Set<string> {
+  const row = getContext(db, UNPARSEABLE_IDS_KEY);
+  if (!row?.value) return new Set();
+  try {
+    const parsed = JSON.parse(row.value);
+    return new Set(Array.isArray(parsed) ? parsed.filter((id): id is string => typeof id === "string") : []);
+  } catch {
+    return new Set();
+  }
+}
+
+export function saveUnparseableIds(db: Database.Database, ids: Set<string>): void {
+  const trimmed = Array.from(ids).slice(-MAX_UNPARSEABLE_IDS);
+  setContext(db, UNPARSEABLE_IDS_KEY, JSON.stringify(trimmed));
+}
+
+export function selectMessageIdsForPoll(
+  messageIds: string[],
+  processedIds: Set<string>,
+  unparseableIds: Set<string>,
+  replayParserRevision: boolean
+): string[] {
+  const selected = replayParserRevision
+    ? messageIds
+    : messageIds.filter((id) => !processedIds.has(id));
+  return Array.from(new Set([...selected, ...unparseableIds]));
 }

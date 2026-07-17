@@ -325,7 +325,13 @@ function backfillRawTransactions(db: Database.Database): void {
 }
 
 function backfillContextFacts(db: Database.Database): void {
-  const internalKeys = new Set(["telegram_message_map", "processed_message_ids", "last_gmail_poll"]);
+  const internalKeys = new Set([
+    "telegram_message_map",
+    "processed_message_ids",
+    "unparseable_gmail_message_ids",
+    "last_gmail_poll",
+    "gmail_parser_revision",
+  ]);
   const legacy = db.prepare("SELECT key, value FROM context WHERE value IS NOT NULL").all() as Array<{
     key: string;
     value: string;

@@ -18,6 +18,14 @@ const MONTHS: Record<string, number> = {
 
 const IST_OFFSET_MS = 5.5 * 60 * 60 * 1000;
 
+const CURRENCY_SYMBOLS: Record<string, string> = {
+  "$": "USD",
+  "₹": "INR",
+  "€": "EUR",
+  "£": "GBP",
+  "¥": "JPY",
+};
+
 export function parseAmex(email: EmailContent): ParsedFields | null {
   if (!email.subject.includes("Your transaction update")) return null;
   if (!email.htmlBody) return null;
@@ -36,10 +44,11 @@ export function parseAmex(email: EmailContent): ParsedFields | null {
   const datetime = buildIsoDatetime(dateStr, email.receivedAt);
   if (!datetime) return null;
 
-  const amountMatch = amountStr.match(/([A-Z]{3})\s+([\d,.]+)/);
-  if (!amountMatch) return null;
-  const [, currency, amountDigits] = amountMatch;
+  const parsedAmount = parseAmount(amountStr);
+  if (!parsedAmount) return null;
+  const { currency, amountDigits } = parsedAmount;
   const amount = Number(amountDigits.replace(/,/g, ""));
+  if (!Number.isFinite(amount)) return null;
 
   const endingMatch = email.htmlBody.match(/Account Ending:\s*(\d+)/i);
   const cardLast4 = endingMatch ? endingMatch[1] : "";
@@ -77,6 +86,18 @@ export function parseAmex(email: EmailContent): ParsedFields | null {
     is_preauth: false,
     direction: "debit",
   };
+}
+
+function parseAmount(value: string): { currency: string; amountDigits: string } | null {
+  const codeMatch = value.match(/^\s*([A-Z]{3})\s+([\d,.]+)\s*$/i);
+  if (codeMatch) {
+    return { currency: codeMatch[1].toUpperCase(), amountDigits: codeMatch[2] };
+  }
+
+  const symbolMatch = value.match(/^\s*([$₹€£¥])\s*([\d,.]+)\s*$/);
+  if (!symbolMatch) return null;
+  const currency = CURRENCY_SYMBOLS[symbolMatch[1]];
+  return currency ? { currency, amountDigits: symbolMatch[2] } : null;
 }
 
 function valueAfterLabel(paragraphs: string[], label: string): string | null {

@@ -5,7 +5,7 @@ const assert = require("node:assert/strict");
 const Database = require("better-sqlite3");
 
 const { runMigrations } = require("../src/db/schema");
-const { getCreditCard, insertTransaction, queryTransactions, setContext } = require("../src/db/queries");
+const { getContext, getCreditCard, insertTransaction, queryTransactions, setContext } = require("../src/db/queries");
 const {
   aggregateSpendMonth,
   aggregateEnvelopeEntries,
@@ -33,7 +33,13 @@ const {
 } = require("../src/agent/inference");
 const { getSalaryFundingMonthForDate } = require("../src/envelope/engine");
 const { buildMcpToolSpecs, PACKAGE_VERSION, registerRoutes } = require("../src/api/routes");
-const { notifyPendingCreditInferences, processMessage } = require("../src/gmail/poller");
+const {
+  isLikelyTransactionAlert,
+  notifyPendingCreditInferences,
+  pollOnce,
+  processMessage,
+  selectMessageIdsForPoll,
+} = require("../src/gmail/poller");
 const { parseGmailMessage } = require("../src/gmail/parsers");
 const { formatV2Transaction } = require("../src/telegram/formatter");
 const {
@@ -226,6 +232,145 @@ test("AmEx uses Gmail receipt time when its alert only contains a transaction da
   assert.equal(parsed.datetime, "2026-07-15T06:35:04.000Z");
   assert.equal(parsed.amount, 277);
   assert.equal(parsed.merchant_raw, "Razorpay Restaurants");
+});
+
+test("AmEx parses dollar-symbol transaction alerts as pending USD transactions", () => {
+  const html = [
+    "<p>Date:</p><p>16 July 2026</p>",
+    "<p>Merchant:</p><p>Points a Plusgrade Co.</p>",
+    "<p>Amount:</p><p>$50.00</p>",
+    "<p>Account Ending: 41001</p>",
+  ].join("");
+  const message = {
+    id: "amex-dollar-symbol",
+    internalDate: String(Date.parse("2026-07-16T15:13:45.000Z")),
+    payload: {
+      headers: [
+        { name: "From", value: "American Express <AmericanExpress@welcome.americanexpress.com>" },
+        { name: "Subject", value: "Your transaction update" },
+      ],
+      mimeType: "text/html",
+      body: { data: Buffer.from(html).toString("base64url") },
+    },
+  };
+
+  const parsed = parseGmailMessage(message);
+  assert.ok(parsed);
+  assert.equal(parsed.amount, 50);
+  assert.equal(parsed.currency, "USD");
+  assert.equal(parsed.amount_inr, null);
+  assert.equal(parsed.is_international, true);
+  assert.equal(parsed.notes, "pending_forex_resolution");
+  assert.equal(parsed.merchant_raw, "Points a Plusgrade Co.");
+});
+
+test("Gmail distinguishes ignored mail from an unparseable likely transaction alert", async () => {
+  const db = makeDb();
+  const unparseable = {
+    id: "unparseable-amex-alert",
+    payload: {
+      headers: [
+        { name: "From", value: "AmericanExpress@welcome.americanexpress.com" },
+        { name: "Subject", value: "Your transaction update" },
+      ],
+      mimeType: "text/html",
+      body: {
+        data: Buffer.from(
+          "<p>Date:</p><p>16 July 2026</p><p>Merchant:</p><p>Unknown</p><p>Amount:</p><p>fifty dollars</p>"
+        ).toString("base64url"),
+      },
+    },
+  };
+  const informational = {
+    id: "amex-points-transfer",
+    payload: {
+      headers: [
+        { name: "From", value: "AmericanExpress@welcome.americanexpress.com" },
+        { name: "Subject", value: "Good news! Your points have been transferred" },
+      ],
+    },
+  };
+
+  assert.equal(isLikelyTransactionAlert(unparseable), true);
+  assert.equal(await processMessage(db, unparseable), "unparseable");
+  assert.equal(isLikelyTransactionAlert(informational), false);
+  assert.equal(await processMessage(db, informational), "ignored");
+  db.close();
+});
+
+test("Gmail parser revision replay recovers a recent alert already marked processed", async () => {
+  const db = makeDb();
+  const message = {
+    id: "previously-skipped-dollar-alert",
+    internalDate: String(Date.parse("2026-07-16T15:13:45.000Z")),
+    snippet: "Transaction Update",
+    payload: {
+      headers: [
+        { name: "From", value: "American Express <AmericanExpress@welcome.americanexpress.com>" },
+        { name: "Subject", value: "Your transaction update" },
+      ],
+      mimeType: "text/html",
+      body: {
+        data: Buffer.from(
+          [
+            "<p>Date:</p><p>16 July 2026</p>",
+            "<p>Merchant:</p><p>Points a Plusgrade Co.</p>",
+            "<p>Amount:</p><p>$50.00</p>",
+            "<p>Account Ending: 41001</p>",
+          ].join("")
+        ).toString("base64url"),
+      },
+    },
+  };
+  setContext(db, "processed_message_ids", JSON.stringify([message.id]));
+  setContext(db, "last_gmail_poll", String(Math.floor(Date.now() / 1000)));
+
+  const gmail = {
+    users: {
+      messages: {
+        list: async () => ({ data: { messages: [{ id: message.id }] } }),
+        get: async () => ({ data: message }),
+      },
+    },
+  };
+
+  await pollOnce(db, {
+    gmail,
+    processMessageOptions: {
+      enrich: async () => {},
+      inferenceGenerator: async () =>
+        JSON.stringify(
+          inferenceProposal({
+            decision: "needs_context",
+            merchant_clean: "Points a Plusgrade Co.",
+            treatment: "pending_forex_resolution",
+            gross_amount_inr: 50,
+            personal_impact: 0,
+            cashflow_impact: 0,
+            receivable_amount: 0,
+            question: "Waiting for the final INR amount.",
+          })
+        ),
+      sendTelegram: async () => 7654,
+    },
+  });
+
+  const raw = db
+    .prepare("SELECT * FROM raw_transactions WHERE raw_email_id = ?")
+    .get(message.id);
+  assert.ok(raw);
+  assert.equal(raw.amount, 50);
+  assert.equal(raw.currency, "USD");
+  assert.equal(raw.is_international, 1);
+  assert.equal(getContext(db, "gmail_parser_revision").value, "amex-symbol-currency-v1");
+  db.close();
+});
+
+test("Gmail poll selection includes retries and parser-revision replay candidates", () => {
+  const processed = new Set(["seen"]);
+  const retries = new Set(["retry"]);
+  assert.deepEqual(selectMessageIdsForPoll(["seen", "fresh"], processed, retries, false), ["fresh", "retry"]);
+  assert.deepEqual(selectMessageIdsForPoll(["seen", "fresh"], processed, retries, true), ["seen", "fresh", "retry"]);
 });
 
 test("IDFC UPI parser preserves incoming-credit direction, sender, and exact time", () => {
