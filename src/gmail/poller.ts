@@ -40,13 +40,14 @@ const WATCHED_SENDERS = [
   "noreply@idfcfirstbank.com",
   "no-reply@getonecard.app",
   "AmericanExpress@welcome.americanexpress.com",
+  "credit_cards@icici.bank.in",
 ];
 
 const LAST_POLL_KEY = "last_gmail_poll";
 const PROCESSED_IDS_KEY = "processed_message_ids";
 const UNPARSEABLE_IDS_KEY = "unparseable_gmail_message_ids";
 const PARSER_REVISION_KEY = "gmail_parser_revision";
-const PARSER_REVISION = "amex-symbol-currency-v1";
+const PARSER_REVISION = "icici-credit-card-v1";
 const PARSER_REPLAY_WINDOW_SECONDS = 48 * 60 * 60;
 const MAX_PROCESSED_IDS = 2000;
 const MAX_UNPARSEABLE_IDS = 200;
@@ -311,7 +312,11 @@ export async function processMessage(
       snippet,
       gmail_received_at: getGmailReceivedAt(message),
       timestamp_source:
-        parsed.source === "amex" ? "issuer_date_plus_gmail_received_time" : "issuer_alert",
+        parsed.source === "amex"
+          ? "issuer_date_plus_gmail_received_time"
+          : parsed.source === "icici_cc"
+          ? "issuer_datetime_disambiguated_by_gmail_received_time"
+          : "issuer_alert",
       direction: parsed.direction,
     }),
   });
@@ -332,6 +337,10 @@ export function isLikelyTransactionAlert(message: gmail_v1.Schema$Message): bool
     headers.find((header) => header.name?.toLowerCase() === "subject")?.value?.toLowerCase() ?? "";
 
   if (from.includes("americanexpress.com")) return subject.includes("your transaction update");
+  if (from.includes("credit_cards@icici.bank.in")) {
+    const snippet = message.snippet?.toLowerCase() ?? "";
+    return subject.includes("transaction alert for your icici bank credit card") && !snippet.includes("declined");
+  }
   if (from.includes("no-reply@getonecard.app")) {
     return subject.includes("payment update on your bobcard one credit card");
   }

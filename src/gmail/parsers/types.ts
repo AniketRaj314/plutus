@@ -1,4 +1,4 @@
-export type TransactionSource = "idfc_cc" | "bobcard" | "amex" | "idfc_upi";
+export type TransactionSource = "idfc_cc" | "icici_cc" | "bobcard" | "amex" | "idfc_upi";
 export type TransactionDirection = "debit" | "credit";
 
 export interface EmailContent {

@@ -23,6 +23,7 @@ const MONTH_NAMES = [
 // credit_cards table) since formatTransaction takes no db param by design.
 const SOURCE_DISPLAY_NAMES: Record<string, string> = {
   idfc_cc: "IDFC CC",
+  icici_cc: "ICICI CC",
   bobcard: "BOBCARD One",
   amex: "AmEx",
   idfc_upi: "IDFC UPI",

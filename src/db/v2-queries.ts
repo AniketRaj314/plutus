@@ -437,7 +437,7 @@ export interface SpendMonthSummary {
 function spendMonthWhere(sourceAlias = ""): string {
   const prefix = sourceAlias ? `${sourceAlias}.` : "";
   return `(
-    (${prefix}source IN ('amex', 'bobcard', 'idfc_cc')
+    (${prefix}source IN ('amex', 'bobcard', 'idfc_cc', 'icici_cc')
       AND substr(${prefix}card_cycle_end, 1, 7) = @spend_month)
     OR
     (${prefix}source = 'idfc_upi'
@@ -448,7 +448,12 @@ function spendMonthWhere(sourceAlias = ""): string {
 export function getSpendMonthForEntry(
   entry: Pick<EnvelopeEntry, "source" | "card_cycle_end" | "occurred_at">
 ): string | null {
-  if (entry.source === "amex" || entry.source === "bobcard" || entry.source === "idfc_cc") {
+  if (
+    entry.source === "amex" ||
+    entry.source === "bobcard" ||
+    entry.source === "idfc_cc" ||
+    entry.source === "icici_cc"
+  ) {
     const cycleMonth = entry.card_cycle_end?.slice(0, 7) ?? "";
     return /^\d{4}-\d{2}$/.test(cycleMonth) ? cycleMonth : null;
   }
@@ -548,7 +553,7 @@ export function aggregateSpendMonth(
        FROM envelope_entries
        WHERE superseded_at IS NULL
          AND state != 'cancelled'
-         AND source IN ('amex', 'bobcard', 'idfc_cc')
+         AND source IN ('amex', 'bobcard', 'idfc_cc', 'icici_cc')
          AND substr(card_cycle_end, 1, 7) = @spend_month
        ORDER BY card_cycle_end, source`
     )

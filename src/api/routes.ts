@@ -21,7 +21,7 @@ import {
 import { getRemainingWeeksInMonth, parseIstDateOnly, getBillingWindow } from "../envelope/engine";
 import { getSchedulerHealth } from "../scheduler/status";
 
-const VALID_SOURCES = ["idfc_cc", "bobcard", "amex", "idfc_upi"];
+const VALID_SOURCES = ["idfc_cc", "icici_cc", "bobcard", "amex", "idfc_upi"];
 const MAX_TRANSACTIONS_LIMIT = 100;
 const AGENT_TIMEOUT_MS = 120_000;
 const AGENT_RATE_LIMIT_MAX = 10;

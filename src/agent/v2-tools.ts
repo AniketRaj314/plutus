@@ -37,7 +37,7 @@ interface V2ToolDefinition {
   handler: (db: Database.Database, args: Record<string, unknown>) => unknown | Promise<unknown>;
 }
 
-const CARD_SOURCES = ["amex", "bobcard", "idfc_cc"];
+const CARD_SOURCES = ["amex", "bobcard", "idfc_cc", "icici_cc"];
 const ALL_SOURCES = [...CARD_SOURCES, "idfc_upi"];
 const ENTRY_STATES: EnvelopeEntryState[] = ["forecast", "actual", "settled", "cancelled"];
 const CONTEXT_SCOPES: ContextScope[] = ["global", "merchant", "transaction", "card", "person"];

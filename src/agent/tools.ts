@@ -554,7 +554,7 @@ export const tools: ToolDefinition[] = [
       properties: {
         since: { type: "string", description: "ISO date, inclusive lower bound on transaction datetime" },
         until: { type: "string", description: "ISO date, inclusive upper bound on transaction datetime" },
-        source: { type: "string", enum: ["idfc_cc", "bobcard", "amex", "idfc_upi"] },
+        source: { type: "string", enum: ["idfc_cc", "icici_cc", "bobcard", "amex", "idfc_upi"] },
         category: { type: "string" },
         min_amount: { type: "number" },
         limit: { type: "number", description: "Max rows to return, default 20" },
@@ -695,7 +695,7 @@ export const tools: ToolDefinition[] = [
     parameters: {
       type: "object",
       properties: {
-        source: { type: "string", enum: ["idfc_cc", "bobcard", "amex"] },
+        source: { type: "string", enum: ["idfc_cc", "icici_cc", "bobcard", "amex"] },
       },
       required: ["source"],
     },
@@ -708,7 +708,7 @@ export const tools: ToolDefinition[] = [
     parameters: {
       type: "object",
       properties: {
-        source: { type: "string", enum: ["idfc_cc", "bobcard", "amex", "idfc_upi"] },
+        source: { type: "string", enum: ["idfc_cc", "icici_cc", "bobcard", "amex", "idfc_upi"] },
         amount: { type: "number" },
         merchant_raw: { type: "string" },
         merchant_clean: { type: "string", description: "If provided along with category, enrichment is skipped" },
@@ -740,7 +740,7 @@ export const tools: ToolDefinition[] = [
           items: {
             type: "object",
             properties: {
-              source: { type: "string", enum: ["idfc_cc", "bobcard", "amex", "idfc_upi"] },
+              source: { type: "string", enum: ["idfc_cc", "icici_cc", "bobcard", "amex", "idfc_upi"] },
               amount: { type: "number" },
               merchant_raw: { type: "string" },
               merchant_clean: { type: "string" },

@@ -115,6 +115,15 @@ test("v2 migration is repeatable and seeds salary/card configuration", () => {
   assert.equal(getCreditCard(db, "amex").billing_start_day, 21);
   assert.equal(getCreditCard(db, "bobcard").billing_end_day, 21);
   assert.equal(getCreditCard(db, "idfc_cc").due_day, 4);
+  assert.deepEqual(
+    {
+      last4: getCreditCard(db, "icici_cc").last4,
+      start: getCreditCard(db, "icici_cc").billing_start_day,
+      end: getCreditCard(db, "icici_cc").billing_end_day,
+      due: getCreditCard(db, "icici_cc").due_day,
+    },
+    { last4: "6017", start: 21, end: 20, due: 7 }
+  );
   db.close();
 });
 
@@ -157,6 +166,7 @@ test("canonical spend-month summary combines card cycles ending in month with IS
   add({ source: "amex", occurred_at: "2026-07-21T12:00:00+05:30", card_cycle_start: "2026-07-21", card_cycle_end: "2026-08-20", due_date: "2026-09-08", funding_month: "2026-09", personal_impact: 2000 });
   add({ source: "bobcard", occurred_at: "2026-07-21T12:00:00+05:30", card_cycle_start: "2026-06-22", card_cycle_end: "2026-07-21", due_date: "2026-08-09", personal_impact: 300 });
   add({ source: "idfc_cc", occurred_at: "2026-07-19T12:00:00+05:30", card_cycle_start: "2026-06-20", card_cycle_end: "2026-07-19", due_date: "2026-08-04", personal_impact: 400 });
+  add({ source: "icici_cc", occurred_at: "2026-07-18T18:03:26+05:30", card_cycle_start: "2026-06-21", card_cycle_end: "2026-07-20", due_date: "2026-08-07", personal_impact: 500 });
   add({ source: "idfc_upi", occurred_at: "2026-07-01T12:00:00+05:30", funding_month: "2026-07", personal_impact: 500 });
   add({ source: "idfc_upi", occurred_at: "2026-07-31T18:00:00.000Z", funding_month: "2026-07", personal_impact: 200 });
   add({ source: "idfc_upi", occurred_at: "2026-07-31T18:45:00.000Z", funding_month: "2026-08", personal_impact: 700 });
@@ -164,16 +174,17 @@ test("canonical spend-month summary combines card cycles ending in month with IS
   add({ source: "idfc_upi", occurred_at: "2026-07-03T12:00:00+05:30", funding_month: "2026-07", personal_impact: 0, treatment: "settlement" });
 
   const summary = aggregateSpendMonth(db, { spend_month: "2026-07", group_by: "source" });
-  assert.equal(summary.personal_impact, 2470);
-  assert.equal(summary.actual_personal_impact, 2370);
+  assert.equal(summary.personal_impact, 2970);
+  assert.equal(summary.actual_personal_impact, 2870);
   assert.equal(summary.forecast_personal_impact, 100);
-  assert.equal(summary.personal_remaining, 117530);
-  assert.equal(summary.entry_count, 8);
-  assert.equal(summary.actual_entry_count, 7);
+  assert.equal(summary.personal_remaining, 117030);
+  assert.equal(summary.entry_count, 9);
+  assert.equal(summary.actual_entry_count, 8);
   assert.equal(summary.forecast_entry_count, 1);
   assert.deepEqual(summary.upi_window, { start: "2026-07-01", end: "2026-07-31" });
-  assert.equal(summary.card_cycles.length, 3);
+  assert.equal(summary.card_cycles.length, 4);
   assert.equal(summary.groups.find((group) => group.group_key === "idfc_upi").personal_impact, 670);
+  assert.equal(summary.groups.find((group) => group.group_key === "icici_cc").personal_impact, 500);
   assert.equal(summary.definition_version, 1);
   db.close();
 });
@@ -205,6 +216,115 @@ test("Telegram transaction presentation labels the canonical spend month and ren
   assert.doesNotMatch(text, /funding month/);
   assert.match(text, /July 2026 spending envelope: ₹4,958 over/);
   assert.doesNotMatch(text, /personal envelope remaining/);
+});
+
+test("ICICI credit-card parser preserves the issuer timestamp and merchant", () => {
+  const body =
+    "Dear Customer, Your ICICI Bank Credit Card XX6017 has been used for a transaction of INR 500.00 on Jul 18, 2026 at 06:03:26. Info: AMAZON PAY INDIA PVT LTD. The Available Credit Limit on your card is INR 1,98,401.00 and Total Credit Limit is INR 2,00,000.00.";
+  const message = {
+    id: "icici-live-alert",
+    internalDate: String(Date.parse("2026-07-18T12:33:37.000Z")),
+    snippet: body,
+    payload: {
+      headers: [
+        { name: "From", value: "credit_cards@icici.bank.in" },
+        { name: "Subject", value: "Transaction alert for your ICICI Bank Credit Card" },
+      ],
+      mimeType: "text/plain",
+      body: { data: Buffer.from(body).toString("base64url") },
+    },
+  };
+
+  const parsed = parseGmailMessage(message);
+  assert.ok(parsed);
+  assert.equal(parsed.source, "icici_cc");
+  assert.equal(parsed.amount, 500);
+  assert.equal(parsed.currency, "INR");
+  assert.equal(parsed.card_last4, "6017");
+  assert.equal(parsed.merchant_raw, "AMAZON PAY INDIA PVT LTD");
+  assert.equal(parsed.datetime, "2026-07-18T12:33:26.000Z");
+  assert.equal(parsed.direction, "debit");
+});
+
+test("ICICI declined attempts and informational card mail are ignored", () => {
+  const declinedBody =
+    "Dear Customer, As the service for domestic online transactions is disabled, your transaction of INR 1000.00 using your ICICI Bank Credit Card XX6017 has been declined on Jun 08, 2026 at 12:41:57.";
+  const declined = {
+    id: "icici-declined-alert",
+    snippet: declinedBody,
+    payload: {
+      headers: [
+        { name: "From", value: "credit_cards@icici.bank.in" },
+        { name: "Subject", value: "Transaction alert for your ICICI Bank Credit Card" },
+      ],
+      mimeType: "text/plain",
+      body: { data: Buffer.from(declinedBody).toString("base64url") },
+    },
+  };
+  const paymentReceived = {
+    id: "icici-payment-received",
+    snippet: "We have received payment of INR 1000.00 on your ICICI Bank Credit Card account.",
+    payload: {
+      headers: [
+        { name: "From", value: "credit_cards@icici.bank.in" },
+        { name: "Subject", value: "Payment received on your ICICI Bank Credit Card." },
+      ],
+    },
+  };
+
+  assert.equal(parseGmailMessage(declined), null);
+  assert.equal(isLikelyTransactionAlert(declined), false);
+  assert.equal(parseGmailMessage(paymentReceived), null);
+  assert.equal(isLikelyTransactionAlert(paymentReceived), false);
+});
+
+test("ICICI Gmail ingestion creates a cycle-aware raw and clean ledger entry", async () => {
+  const db = makeDb();
+  const body =
+    "Dear Customer, Your ICICI Bank Credit Card XX6017 has been used for a transaction of INR 500.00 on Jul 18, 2026 at 06:03:26. Info: AMAZON PAY INDIA PVT LTD. The Available Credit Limit on your card is INR 1,98,401.00 and Total Credit Limit is INR 2,00,000.00.";
+  const message = {
+    id: "icici-ingestion-alert",
+    internalDate: String(Date.parse("2026-07-18T12:33:37.000Z")),
+    snippet: body,
+    payload: {
+      headers: [
+        { name: "From", value: "credit_cards@icici.bank.in" },
+        { name: "Subject", value: "Transaction alert for your ICICI Bank Credit Card" },
+      ],
+      mimeType: "text/plain",
+      body: { data: Buffer.from(body).toString("base64url") },
+    },
+  };
+
+  let telegramText = "";
+  const outcome = await processMessage(db, message, {
+    enrich: async () => {},
+    inferenceGenerator: async () =>
+      inferenceProposal({
+        merchant_clean: "Amazon Pay",
+        category: "Shopping",
+        gross_amount_inr: 500,
+        personal_impact: 500,
+        cashflow_impact: 500,
+      }),
+    sendTelegram: async (text) => {
+      telegramText = text;
+      return 6017;
+    },
+  });
+
+  assert.equal(outcome, "recorded");
+  const raw = db.prepare("SELECT * FROM raw_transactions WHERE raw_email_id = ?").get(message.id);
+  assert.equal(raw.source, "icici_cc");
+  assert.equal(raw.occurred_at, "2026-07-18T12:33:26.000Z");
+  const entry = listEnvelopeEntries(db, { raw_transaction_id: raw.id })[0];
+  assert.equal(entry.card_cycle_start, "2026-06-21");
+  assert.equal(entry.card_cycle_end, "2026-07-20");
+  assert.equal(entry.due_date, "2026-08-07");
+  assert.equal(entry.funding_month, "2026-08");
+  assert.match(telegramText, /ICICI CC/);
+  assert.match(telegramText, /July 2026 spending envelope/);
+  db.close();
 });
 
 test("AmEx uses Gmail receipt time when its alert only contains a transaction date", () => {
@@ -328,7 +448,10 @@ test("Gmail parser revision replay recovers a recent alert already marked proces
   const gmail = {
     users: {
       messages: {
-        list: async () => ({ data: { messages: [{ id: message.id }] } }),
+        list: async ({ q }) => {
+          assert.match(q, /credit_cards@icici\.bank\.in/);
+          return { data: { messages: [{ id: message.id }] } };
+        },
         get: async () => ({ data: message }),
       },
     },
@@ -362,7 +485,7 @@ test("Gmail parser revision replay recovers a recent alert already marked proces
   assert.equal(raw.amount, 50);
   assert.equal(raw.currency, "USD");
   assert.equal(raw.is_international, 1);
-  assert.equal(getContext(db, "gmail_parser_revision").value, "amex-symbol-currency-v1");
+  assert.equal(getContext(db, "gmail_parser_revision").value, "icici-credit-card-v1");
   db.close();
 });
 
@@ -526,6 +649,8 @@ test("card-cycle routing changes funding month on each exact boundary", () => {
     ["bobcard", "2026-07-22T12:00:00+05:30", "2026-07-22", "2026-08-21", "2026-09-09", "2026-09"],
     ["idfc_cc", "2026-07-19T12:00:00+05:30", "2026-06-20", "2026-07-19", "2026-08-04", "2026-08"],
     ["idfc_cc", "2026-07-20T12:00:00+05:30", "2026-07-20", "2026-08-19", "2026-09-04", "2026-09"],
+    ["icici_cc", "2026-07-20T12:00:00+05:30", "2026-06-21", "2026-07-20", "2026-08-07", "2026-08"],
+    ["icici_cc", "2026-07-21T12:00:00+05:30", "2026-07-21", "2026-08-20", "2026-09-07", "2026-09"],
   ];
 
   for (const [source, datetime, start, end, dueDate, fundingMonth] of cases) {
@@ -1145,6 +1270,14 @@ test("all v2 MCP tools are registered for external agents", () => {
     "list_commitments_v2",
   ];
   for (const name of expected) findTool(name);
+  assert.equal(
+    findTool("get_card_cycle_for_date").parameters.properties.source.enum.includes("icici_cc"),
+    true
+  );
+  assert.equal(
+    findTool("create_raw_transaction").parameters.properties.source.enum.includes("icici_cc"),
+    true
+  );
 });
 
 test("production MCP surface exposes v2 finance tools and no legacy envelope mutators", () => {

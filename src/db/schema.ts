@@ -258,6 +258,7 @@ function seedCreditCards(db: Database.Database): void {
     { id: "amex", name: "American Express", last4: "41001", billing_start_day: 21, billing_end_day: 20, due_day: 8, source: "amex" },
     { id: "bobcard", name: "BOBCARD One", last4: "8533", billing_start_day: 22, billing_end_day: 21, due_day: 9, source: "bobcard" },
     { id: "idfc_cc", name: "IDFC FIRST Credit Card", last4: "6198", billing_start_day: 20, billing_end_day: 19, due_day: 4, source: "idfc_cc" },
+    { id: "icici_cc", name: "Amazon Pay ICICI Credit Card", last4: "6017", billing_start_day: 21, billing_end_day: 20, due_day: 7, source: "icici_cc" },
   ];
 
   const stmt = db.prepare(

@@ -1,6 +1,7 @@
 import type { gmail_v1 } from "googleapis";
 import { newId } from "../../db/schema";
 import { parseIdfcCreditCard } from "./idfc-cc";
+import { parseIciciCreditCard } from "./icici-cc";
 import { parseBobCard } from "./bobcard";
 import { parseAmex } from "./amex";
 import { parseIdfcUpi } from "./idfc-upi";
@@ -8,6 +9,7 @@ import type { EmailContent, ParsedTransaction } from "./types";
 
 export type { ParsedTransaction, EmailContent, TransactionSource } from "./types";
 export { parseIdfcCreditCard } from "./idfc-cc";
+export { parseIciciCreditCard } from "./icici-cc";
 export { parseBobCard } from "./bobcard";
 export { parseAmex } from "./amex";
 export { parseIdfcUpi } from "./idfc-upi";
@@ -47,6 +49,8 @@ export function parseGmailMessage(message: gmail_v1.Schema$Message): ParsedTrans
     ? parseBobCard(email)
     : fromLower.includes("americanexpress.com")
     ? parseAmex(email)
+    : fromLower.includes("credit_cards@icici.bank.in")
+    ? parseIciciCreditCard(email)
     : null;
 
   if (!result) return null;
