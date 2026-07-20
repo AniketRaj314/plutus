@@ -97,9 +97,11 @@ requests, and stops retrying model failures after three attempts.
 The authenticated MCP exposes `search_transaction_emails` for investigating
 missing or recent transaction alerts. It reuses the poller's read-only Gmail
 OAuth credentials and searches only the configured AmEx, BOBCARD, IDFC, and
-ICICI senders. Results include email metadata, a bounded snippet, parser state,
-raw-storage state, and parsed transaction fields. Full email bodies are never
-returned, and the tool has no mailbox write or transaction-ingestion behavior.
+ICICI senders. Results include email metadata, a bounded transaction-alert
+snippet, parser state, raw-storage state, and parsed transaction fields. Full
+email bodies and snippets from ignored/non-transaction messages (including OTP
+mail) are never returned, and the tool has no mailbox write or
+transaction-ingestion behavior.
 
 Searches default to the latest three IST calendar days and are limited to a
 62-day window and 100 results. An `unparseable`/`retry_pending` result means the

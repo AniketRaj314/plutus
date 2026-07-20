@@ -172,6 +172,14 @@ function buildParsedSummary(
   };
 }
 
+function safeSnippet(message: gmail_v1.Schema$Message, parserStatus: ParserStatus): string {
+  // Known senders also deliver OTP/SafeKey and other account-security mail.
+  // Those messages are useful as diagnostic metadata but their content must
+  // never leave Gmail through this tool.
+  if (parserStatus === "ignored") return "";
+  return (message.snippet ?? "").replace(/\s+/g, " ").trim().slice(0, 300);
+}
+
 function normalizeArgs(
   args: SearchTransactionEmailsArgs,
   now: Date
@@ -245,7 +253,7 @@ export async function searchTransactionEmails(
       sender: header(message, "from"),
       subject: header(message, "subject"),
       received_at: getGmailReceivedAt(message),
-      snippet: (message.snippet ?? "").replace(/\s+/g, " ").trim().slice(0, 300),
+      snippet: safeSnippet(message, parserStatus),
       parser_status: parserStatus,
       storage_status: storageStatus,
       raw_transaction_id: raw?.id ?? null,
@@ -262,7 +270,8 @@ export async function searchTransactionEmails(
     count: messages.length,
     messages,
     poller: getPollerState(db),
-    privacy: "Read-only search limited to configured transaction senders; full email bodies are never returned.",
+    privacy:
+      "Read-only search limited to configured transaction senders; full bodies and non-transaction snippets are never returned.",
   };
 }
 

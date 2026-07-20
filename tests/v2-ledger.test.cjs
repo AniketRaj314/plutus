@@ -465,11 +465,11 @@ test("Gmail MCP diagnostics expose parser and storage state without returning em
     "points-email": {
       id: "points-email",
       internalDate: String(Date.parse("2026-07-20T06:53:00.000Z")),
-      snippet: "Your points transfer is complete",
+      snippet: "Your One-Time Password for INR 237.00 at Blinkit is: 673217",
       payload: {
         headers: [
           { name: "From", value: "AmericanExpress@welcome.americanexpress.com" },
-          { name: "Subject", value: "Good news! Your points have been transferred" },
+          { name: "Subject", value: "Your SafeKey One-Time Password to complete your online purchase" },
         ],
       },
     },
@@ -520,6 +520,8 @@ test("Gmail MCP diagnostics expose parser and storage state without returning em
   const ignored = result.messages.find((message) => message.message_id === "points-email");
   assert.equal(ignored.parser_status, "ignored");
   assert.equal(ignored.storage_status, "ignored");
+  assert.equal(ignored.snippet, "");
+  assert.doesNotMatch(JSON.stringify(result), /673217|One-Time Password for INR/);
   assert.doesNotMatch(JSON.stringify(result), /PRIVATE BODY|PRIVATE BROKEN BODY/);
   db.close();
 });
