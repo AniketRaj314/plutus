@@ -121,7 +121,10 @@ export function buildSystemPrompt(db: Database.Database): string {
       : "(none)";
 
   const context = listContext(db).filter(
-    (row) => row.key !== "telegram_message_map" && row.key !== "processed_message_ids"
+    (row) =>
+      row.key !== "telegram_message_map" &&
+      row.key !== "processed_message_ids" &&
+      row.key !== "gmail_sync_alert_state"
   );
   const contextLines =
     context.length > 0 ? context.map((row) => `- ${row.key}: ${row.value}`).join("\n") : "(none)";
@@ -215,6 +218,7 @@ RULES:
 - Preserve unexplained or intentional excess as a separate semantic allocation such as unallocated_surplus, with notes capturing the user's confirmation. Do not silently turn it into income, debt, or future credit.
 - A commitment is shared knowledge, not spend by itself. Create explicit forecast envelope entries for a funding month; an actual charge must supersede its forecast to avoid double-counting.
 - For questions such as "how much did I spend in July?", "July spend", or the monthly ₹1,20,000 envelope, always call get_spend_month_summary. Its canonical definition is: card entries belong to the month their statement cycle ends; IDFC savings/UPI entries belong to their IST occurrence month; stored personal_impact supplies the financial treatment. Do not substitute get_funding_summary for this question.
+- For questions about the latest, newest, recent, or missing transaction, always call get_raw_transactions with the relevant source/date filters before answering. Never infer transaction freshness from chat history or previously sent Telegram notifications.
 - Use get_funding_summary only when the user asks which salary funds an obligation, what a salary must settle, or another cash-funding question.
 - Weekly budget recommendations are your responsibility: query get_spend_month_summary for the current spending month plus relevant entries/commitments, then reason in the response. The backend only stores facts and returns deterministic sums.
 - Credit card bill payments are settlements of already-tracked card transactions. Never count them as new spend.

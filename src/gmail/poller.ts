@@ -48,6 +48,7 @@ const PROCESSED_IDS_KEY = "processed_message_ids";
 const UNPARSEABLE_IDS_KEY = "unparseable_gmail_message_ids";
 const PARSER_REVISION_KEY = "gmail_parser_revision";
 const PARSER_REVISION = "icici-credit-card-v1";
+const GMAIL_SYNC_ALERT_STATE_KEY = "gmail_sync_alert_state";
 const PARSER_REPLAY_WINDOW_SECONDS = 48 * 60 * 60;
 const MAX_PROCESSED_IDS = 2000;
 const MAX_UNPARSEABLE_IDS = 200;
@@ -75,10 +76,108 @@ export function startPoller(db: Database.Database): void {
   });
 
   cron.schedule(schedule, () => {
-    void runSchedulerCycle("gmail_poll", () => pollOnce(db));
+    void runSchedulerCycle("gmail_poll", () => runGmailPollCycle(db));
   });
 
   console.log(`Gmail poller scheduled every ${intervalMins} minute(s)`);
+}
+
+interface GmailPollCycleOptions {
+  poll?: () => Promise<void>;
+  sendTelegram?: (text: string, replyToMessageId?: number) => Promise<number>;
+}
+
+interface GmailSyncAlertState {
+  status: "healthy" | "failed";
+  updated_at: string;
+}
+
+function getGmailSyncAlertState(db: Database.Database): GmailSyncAlertState | null {
+  const value = getContext(db, GMAIL_SYNC_ALERT_STATE_KEY)?.value;
+  if (!value) return null;
+  try {
+    const parsed = JSON.parse(value) as Partial<GmailSyncAlertState>;
+    if (parsed.status !== "healthy" && parsed.status !== "failed") return null;
+    return {
+      status: parsed.status,
+      updated_at: typeof parsed.updated_at === "string" ? parsed.updated_at : "",
+    };
+  } catch {
+    return null;
+  }
+}
+
+function setGmailSyncAlertState(db: Database.Database, status: GmailSyncAlertState["status"]): void {
+  setContext(
+    db,
+    GMAIL_SYNC_ALERT_STATE_KEY,
+    JSON.stringify({ status, updated_at: new Date().toISOString() } satisfies GmailSyncAlertState)
+  );
+}
+
+function formatGmailFailureReason(error: unknown): string {
+  const message = error instanceof Error ? error.message : String(error);
+  if (message.toLowerCase().includes("invalid_grant")) {
+    return "Google authorization expired or was revoked. Replace GMAIL_REFRESH_TOKEN.";
+  }
+  if (
+    message.toLowerCase().includes("insufficient permission") ||
+    message.toLowerCase().includes("insufficient_scope")
+  ) {
+    return (
+      "Google authorization is missing Gmail read access. Reauthorize with " +
+      "https://www.googleapis.com/auth/gmail.readonly."
+    );
+  }
+  return `The Gmail poller returned: ${message.slice(0, 180)}`;
+}
+
+async function notifyGmailFailure(
+  db: Database.Database,
+  error: unknown,
+  sendTelegram: (text: string, replyToMessageId?: number) => Promise<number>
+): Promise<void> {
+  if (getGmailSyncAlertState(db)?.status === "failed") return;
+  try {
+    await sendTelegram(
+      `⚠️ Gmail transaction sync is down.\n` +
+        `Violet cannot read new bank/card emails right now. ${formatGmailFailureReason(error)}\n` +
+        `Transactions may be missing until sync recovers. Check /health for scheduler details.`
+    );
+    setGmailSyncAlertState(db, "failed");
+  } catch (alertError) {
+    console.error("[gmail] failed to send sync failure alert:", alertError);
+  }
+}
+
+async function notifyGmailRecovery(
+  db: Database.Database,
+  sendTelegram: (text: string, replyToMessageId?: number) => Promise<number>
+): Promise<void> {
+  if (getGmailSyncAlertState(db)?.status !== "failed") return;
+  try {
+    await sendTelegram(
+      `✅ Gmail transaction sync recovered.\n` +
+        `Violet can read transaction emails again and is catching up from the last successful checkpoint.`
+    );
+    setGmailSyncAlertState(db, "healthy");
+  } catch (alertError) {
+    console.error("[gmail] failed to send sync recovery alert:", alertError);
+  }
+}
+
+export async function runGmailPollCycle(
+  db: Database.Database,
+  options: GmailPollCycleOptions = {}
+): Promise<void> {
+  const sendTelegram = options.sendTelegram ?? sendMessage;
+  try {
+    await (options.poll ?? (() => pollOnce(db)))();
+  } catch (error) {
+    await notifyGmailFailure(db, error, sendTelegram);
+    throw error;
+  }
+  await notifyGmailRecovery(db, sendTelegram);
 }
 
 export async function pollOnce(db: Database.Database, options: PollOnceOptions = {}): Promise<void> {

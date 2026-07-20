@@ -73,6 +73,7 @@ export async function runSchedulerCycle(name: SchedulerName, task: () => Promise
   try {
     await task();
     state.last_completed_at = new Date().toISOString();
+    state.last_error = null;
     state.last_outcome = "success";
   } catch (error) {
     state.last_failed_at = new Date().toISOString();

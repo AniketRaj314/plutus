@@ -60,8 +60,13 @@ export function registerRoutes(app: FastifyInstance, db: Database.Database): voi
 
     const checkedAt = new Date();
     const schedulerHealth = getSchedulerHealth(checkedAt);
+    const failedSchedulers = Object.values(schedulerHealth.schedulers)
+      .filter((scheduler) => scheduler.enabled && scheduler.last_outcome === "error")
+      .map((scheduler) => scheduler.name);
+    const status = failedSchedulers.length > 0 ? "degraded" : "ok";
+    if (status === "degraded") reply.status(503);
     return {
-      status: "ok",
+      status,
       version: PACKAGE_VERSION,
       checked_at: checkedAt.toISOString(),
       uptime: process.uptime(),
@@ -71,6 +76,7 @@ export function registerRoutes(app: FastifyInstance, db: Database.Database): voi
       poll_interval: process.env.POLL_INTERVAL_MINS,
       auto_inference_enabled: process.env.AUTO_INFERENCE_ENABLED !== "false",
       auto_inference_interval: process.env.AUTO_INFERENCE_INTERVAL_MINS ?? "5",
+      degraded_components: failedSchedulers,
       ...schedulerHealth,
     };
   });

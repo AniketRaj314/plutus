@@ -38,15 +38,18 @@ const {
   notifyPendingCreditInferences,
   pollOnce,
   processMessage,
+  runGmailPollCycle,
   selectMessageIdsForPoll,
 } = require("../src/gmail/poller");
 const { parseGmailMessage } = require("../src/gmail/parsers");
+const { buildSystemPrompt } = require("../src/agent/prompts");
 const { formatV2Transaction } = require("../src/telegram/formatter");
 const {
   configureScheduler,
   getSchedulerHealth,
   nextCronTick,
   resetSchedulerHealthForTests,
+  runSchedulerCycle,
 } = require("../src/scheduler/status");
 const {
   getMessageIdForTransaction,
@@ -1320,6 +1323,89 @@ test("health reports the next enabled cron and per-scheduler timing", async () =
   await app.close();
   db.close();
   resetSchedulerHealthForTests();
+});
+
+test("health degrades for an enabled failed scheduler and recovers after success", async () => {
+  resetSchedulerHealthForTests();
+  configureScheduler("gmail_poll", { label: "Gmail", interval_minutes: 5, enabled: true });
+  await runSchedulerCycle("gmail_poll", async () => {
+    throw new Error("invalid_grant");
+  });
+
+  const db = makeDb();
+  const app = require("fastify")();
+  registerRoutes(app, db);
+
+  const degradedResponse = await app.inject({ method: "GET", url: "/health" });
+  assert.equal(degradedResponse.statusCode, 503);
+  const degraded = degradedResponse.json();
+  assert.equal(degraded.status, "degraded");
+  assert.deepEqual(degraded.degraded_components, ["gmail_poll"]);
+  assert.equal(degraded.schedulers.gmail_poll.last_outcome, "error");
+  assert.equal(degraded.schedulers.gmail_poll.last_error, "invalid_grant");
+
+  await runSchedulerCycle("gmail_poll", async () => {});
+  const recoveredResponse = await app.inject({ method: "GET", url: "/health" });
+  assert.equal(recoveredResponse.statusCode, 200);
+  const recovered = recoveredResponse.json();
+  assert.equal(recovered.status, "ok");
+  assert.deepEqual(recovered.degraded_components, []);
+  assert.equal(recovered.schedulers.gmail_poll.last_outcome, "success");
+  assert.equal(recovered.schedulers.gmail_poll.last_error, null);
+
+  await app.close();
+  db.close();
+  resetSchedulerHealthForTests();
+});
+
+test("Gmail poll failures and recovery send one operational Telegram alert each", async () => {
+  const db = makeDb();
+  const messages = [];
+  const sendTelegram = async (message) => {
+    messages.push(message);
+    return messages.length;
+  };
+  const failPoll = async () => {
+    throw new Error("invalid_grant");
+  };
+
+  await assert.rejects(
+    runGmailPollCycle(db, { poll: failPoll, sendTelegram }),
+    /invalid_grant/
+  );
+  await assert.rejects(
+    runGmailPollCycle(db, { poll: failPoll, sendTelegram }),
+    /invalid_grant/
+  );
+  assert.equal(messages.length, 1);
+  assert.match(messages[0], /Gmail transaction sync is down/);
+  assert.match(messages[0], /Replace GMAIL_REFRESH_TOKEN/);
+
+  await runGmailPollCycle(db, { poll: async () => {}, sendTelegram });
+  await runGmailPollCycle(db, { poll: async () => {}, sendTelegram });
+  assert.equal(messages.length, 2);
+  assert.match(messages[1], /Gmail transaction sync recovered/);
+  assert.equal(JSON.parse(getContext(db, "gmail_sync_alert_state").value).status, "healthy");
+
+  await assert.rejects(
+    runGmailPollCycle(db, {
+      poll: async () => {
+        throw new Error("Insufficient Permission");
+      },
+      sendTelegram,
+    }),
+    /Insufficient Permission/
+  );
+  assert.equal(messages.length, 3);
+  assert.match(messages[2], /gmail\.readonly/);
+  db.close();
+});
+
+test("Violet is required to query raw storage for recent transaction questions", () => {
+  const db = makeDb();
+  const prompt = buildSystemPrompt(db);
+  assert.match(prompt, /latest, newest, recent, or missing transaction, always call get_raw_transactions/);
+  db.close();
 });
 
 test("raw MCP ingestion is idempotent by email id and bulk failures are isolated", async () => {
