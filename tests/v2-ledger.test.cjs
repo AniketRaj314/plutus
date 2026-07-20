@@ -42,6 +42,10 @@ const {
   selectMessageIdsForPoll,
 } = require("../src/gmail/poller");
 const { parseGmailMessage } = require("../src/gmail/parsers");
+const {
+  describeGmailDiagnosticError,
+  searchTransactionEmails,
+} = require("../src/gmail/diagnostics");
 const { buildSystemPrompt } = require("../src/agent/prompts");
 const { formatV2Transaction } = require("../src/telegram/formatter");
 const {
@@ -419,6 +423,123 @@ test("Gmail distinguishes ignored mail from an unparseable likely transaction al
   assert.equal(isLikelyTransactionAlert(informational), false);
   assert.equal(await processMessage(db, informational), "ignored");
   db.close();
+});
+
+test("Gmail MCP diagnostics expose parser and storage state without returning email bodies", async () => {
+  const db = makeDb();
+  const matchedHtml = [
+    "<p>Date:</p><p>20 July 2026</p>",
+    "<p>Merchant:</p><p>Aladdin Shawarma</p>",
+    "<p>Amount:</p><p>INR 327.00</p>",
+    "<p>Account Ending: 41001</p>",
+    "<p>PRIVATE BODY CONTENT</p>",
+  ].join("");
+  const messages = {
+    "matched-alert": {
+      id: "matched-alert",
+      threadId: "thread-1",
+      internalDate: String(Date.parse("2026-07-20T06:51:00.000Z")),
+      snippet: "Transaction Update for Aladdin Shawarma",
+      payload: {
+        headers: [
+          { name: "From", value: "American Express <AmericanExpress@welcome.americanexpress.com>" },
+          { name: "Subject", value: "Your transaction update" },
+        ],
+        mimeType: "text/html",
+        body: { data: Buffer.from(matchedHtml).toString("base64url") },
+      },
+    },
+    "broken-alert": {
+      id: "broken-alert",
+      internalDate: String(Date.parse("2026-07-20T06:52:00.000Z")),
+      snippet: "A transaction that the parser cannot read",
+      payload: {
+        headers: [
+          { name: "From", value: "AmericanExpress@welcome.americanexpress.com" },
+          { name: "Subject", value: "Your transaction update" },
+        ],
+        mimeType: "text/html",
+        body: { data: Buffer.from("<p>PRIVATE BROKEN BODY</p>").toString("base64url") },
+      },
+    },
+    "points-email": {
+      id: "points-email",
+      internalDate: String(Date.parse("2026-07-20T06:53:00.000Z")),
+      snippet: "Your points transfer is complete",
+      payload: {
+        headers: [
+          { name: "From", value: "AmericanExpress@welcome.americanexpress.com" },
+          { name: "Subject", value: "Good news! Your points have been transferred" },
+        ],
+      },
+    },
+  };
+  insertRawTransaction(db, {
+    source: "amex",
+    amount: 327,
+    currency: "INR",
+    merchant_raw: "Aladdin Shawarma",
+    occurred_at: "2026-07-20T06:51:00.000Z",
+    card_last4: "41001",
+    raw_email_id: "matched-alert",
+  });
+  setContext(db, "unparseable_gmail_message_ids", JSON.stringify(["broken-alert"]));
+  setContext(db, "last_gmail_poll", String(Date.parse("2026-07-20T06:50:00.000Z") / 1000));
+  setContext(db, "gmail_sync_alert_state", JSON.stringify({ status: "healthy" }));
+
+  let listQuery = "";
+  const gmail = {
+    users: {
+      messages: {
+        list: async (args) => {
+          listQuery = args.q;
+          return { data: { messages: Object.keys(messages).map((id) => ({ id })) } };
+        },
+        get: async ({ id }) => ({ data: messages[id] }),
+      },
+    },
+  };
+
+  const result = await searchTransactionEmails(
+    db,
+    { provider: "amex", start_date: "2026-07-20", end_date: "2026-07-20", limit: 10 },
+    { gmail, now: new Date("2026-07-20T12:00:00.000Z") }
+  );
+
+  assert.match(listQuery, /^from:\(AmericanExpress@welcome\.americanexpress\.com\) after:\d+ before:\d+$/);
+  assert.equal(result.count, 3);
+  assert.equal(result.poller.last_successful_poll_at, "2026-07-20T06:50:00.000Z");
+  assert.equal(result.poller.sync_status, "healthy");
+  const matched = result.messages.find((message) => message.message_id === "matched-alert");
+  assert.equal(matched.parser_status, "matched");
+  assert.equal(matched.storage_status, "ingested");
+  assert.equal(matched.parsed_transaction.merchant_raw, "Aladdin Shawarma");
+  const broken = result.messages.find((message) => message.message_id === "broken-alert");
+  assert.equal(broken.parser_status, "unparseable");
+  assert.equal(broken.storage_status, "retry_pending");
+  const ignored = result.messages.find((message) => message.message_id === "points-email");
+  assert.equal(ignored.parser_status, "ignored");
+  assert.equal(ignored.storage_status, "ignored");
+  assert.doesNotMatch(JSON.stringify(result), /PRIVATE BODY|PRIVATE BROKEN BODY/);
+  db.close();
+});
+
+test("Gmail diagnostics reject broad mailbox windows", async () => {
+  const db = makeDb();
+  await assert.rejects(
+    searchTransactionEmails(db, { start_date: "2026-01-01", end_date: "2026-07-20" }, { gmail: {} }),
+    /date window cannot exceed 62 days/
+  );
+  db.close();
+});
+
+test("Gmail diagnostics return actionable but sanitized authorization errors", () => {
+  assert.match(describeGmailDiagnosticError(new Error("invalid_grant secret=abc")), /Replace GMAIL_REFRESH_TOKEN/);
+  assert.match(
+    describeGmailDiagnosticError(new Error("Insufficient Permission: insufficient_scope secret=abc")),
+    /gmail\.readonly/
+  );
+  assert.doesNotMatch(describeGmailDiagnosticError(new Error("upstream token=secret")), /secret/);
 });
 
 test("Gmail parser revision replay recovers a recent alert already marked processed", async () => {
@@ -1286,6 +1407,7 @@ test("all v2 MCP tools are registered for external agents", () => {
 test("production MCP surface exposes v2 finance tools and no legacy envelope mutators", () => {
   const names = buildMcpToolSpecs().map((spec) => spec.name);
   assert.equal(names.includes("interpret_pending_transactions"), true);
+  assert.equal(names.includes("search_transaction_emails"), true);
   assert.equal(names.includes("post_agent_message"), true);
   assert.equal(names.includes("get_envelope"), false);
   assert.equal(names.includes("recalculate_envelope"), false);

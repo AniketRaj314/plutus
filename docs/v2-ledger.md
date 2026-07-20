@@ -91,3 +91,18 @@ Automatic inference is controlled by `AUTO_INFERENCE_ENABLED` and defaults to
 enabled. The live Gmail path attempts inference immediately; the retry queue
 runs every `AUTO_INFERENCE_INTERVAL_MINS` (default five), skips clarification
 requests, and stops retrying model failures after three attempts.
+
+## Gmail diagnostics
+
+The authenticated MCP exposes `search_transaction_emails` for investigating
+missing or recent transaction alerts. It reuses the poller's read-only Gmail
+OAuth credentials and searches only the configured AmEx, BOBCARD, IDFC, and
+ICICI senders. Results include email metadata, a bounded snippet, parser state,
+raw-storage state, and parsed transaction fields. Full email bodies are never
+returned, and the tool has no mailbox write or transaction-ingestion behavior.
+
+Searches default to the latest three IST calendar days and are limited to a
+62-day window and 100 results. An `unparseable`/`retry_pending` result means the
+poller recognized a likely transaction alert and will retry it; `matched` plus
+`missing` identifies an email the parser understands but raw storage does not
+yet contain.

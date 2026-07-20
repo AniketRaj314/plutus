@@ -20,6 +20,7 @@ import {
 } from "../db/queries";
 import { getRemainingWeeksInMonth, parseIstDateOnly, getBillingWindow } from "../envelope/engine";
 import { getSchedulerHealth } from "../scheduler/status";
+import { describeGmailDiagnosticError, searchTransactionEmails } from "../gmail/diagnostics";
 
 const VALID_SOURCES = ["idfc_cc", "icici_cc", "bobcard", "amex", "idfc_upi"];
 const MAX_TRANSACTIONS_LIMIT = 100;
@@ -455,6 +456,44 @@ export function buildMcpToolSpecs(): McpToolSpec[] {
   }
 
   specs.push({
+    name: "search_transaction_emails",
+    description:
+      "Diagnose missing or recent transaction alerts directly in Gmail. Read-only and restricted to configured bank/card senders; returns metadata, parser status, storage status, and parsed transaction fields without full email bodies.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        provider: {
+          type: "string",
+          enum: ["all", "amex", "bobcard", "idfc", "icici"],
+          description: "Restrict the search to one configured card/bank email provider.",
+        },
+        start_date: {
+          type: "string",
+          description: "Inclusive IST calendar date in YYYY-MM-DD form. Defaults to two days before today.",
+        },
+        end_date: {
+          type: "string",
+          description: "Inclusive IST calendar date in YYYY-MM-DD form. Defaults to today.",
+        },
+        limit: {
+          type: "integer",
+          minimum: 1,
+          maximum: 100,
+          description: "Maximum number of emails to inspect. Defaults to 25.",
+        },
+      },
+      additionalProperties: false,
+    },
+    run: async (db, args) => {
+      try {
+        return await searchTransactionEmails(db, args);
+      } catch (error) {
+        return { status: "error", error: describeGmailDiagnosticError(error) };
+      }
+    },
+  });
+
+  specs.push({
     name: "post_agent_message",
     description: "Send a message to the Plutus finance agent and get its response.",
     inputSchema: {
@@ -469,7 +508,7 @@ export function buildMcpToolSpecs(): McpToolSpec[] {
 }
 
 function buildMcpServer(db: Database.Database): McpServer {
-  const server = new McpServer({ name: "plutus", version: "1.0.0" }, { capabilities: { tools: {} } });
+  const server = new McpServer({ name: "plutus", version: PACKAGE_VERSION }, { capabilities: { tools: {} } });
   const specs = buildMcpToolSpecs();
   const specByName = new Map(specs.map((s) => [s.name, s]));
 
