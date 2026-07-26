@@ -537,6 +537,7 @@ export interface SpendMonthSummary {
   definition: {
     cards: string;
     idfc_upi: string;
+    manual: string;
     impact: string;
   };
   monthly_limit_inr: number;
@@ -567,7 +568,7 @@ function spendMonthWhere(sourceAlias = ""): string {
     (${prefix}source IN ('amex', 'bobcard', 'idfc_cc', 'icici_cc')
       AND substr(${prefix}card_cycle_end, 1, 7) = @spend_month)
     OR
-    (${prefix}source = 'idfc_upi'
+    (${prefix}source IN ('idfc_upi', 'manual')
       AND strftime('%Y-%m', datetime(${prefix}occurred_at, '+5 hours', '+30 minutes')) = @spend_month)
   )`;
 }
@@ -584,7 +585,9 @@ export function getSpendMonthForEntry(
     const cycleMonth = entry.card_cycle_end?.slice(0, 7) ?? "";
     return /^\d{4}-\d{2}$/.test(cycleMonth) ? cycleMonth : null;
   }
-  if (entry.source !== "idfc_upi" || !entry.occurred_at) return null;
+  if ((entry.source !== "idfc_upi" && entry.source !== "manual") || !entry.occurred_at) {
+    return null;
+  }
 
   const occurredAt = new Date(entry.occurred_at);
   if (Number.isNaN(occurredAt.getTime())) return null;
@@ -690,10 +693,12 @@ export function aggregateSpendMonth(
   const monthlyLimit = profile?.monthly_limit_inr ?? 0;
   return {
     spend_month: filters.spend_month,
-    definition_version: 1,
+    definition_version: 2,
     definition: {
       cards: "include active entries whose card cycle ends in spend_month",
       idfc_upi: "include active entries whose occurrence date falls in spend_month in Asia/Kolkata",
+      manual:
+        "include explicit user-reported purchase events whose occurrence date falls in spend_month in Asia/Kolkata",
       impact: "sum stored personal_impact; settlements and bookkeeping should already have zero impact",
     },
     monthly_limit_inr: monthlyLimit,
@@ -1180,7 +1185,8 @@ export function getCounterpartyBalance(
         fact.key.replace(/^(counterparty|outstanding)_payable_/, "").replaceAll("_", " "),
       amount_inr: roundedMoney(amount),
       occurred_at: occurredAt,
-      raw_transaction_id: null,
+      raw_transaction_id:
+        typeof value.raw_transaction_id === "string" ? value.raw_transaction_id : null,
       source_id: fact.id,
       notes: typeof value.notes === "string" ? value.notes : null,
     });

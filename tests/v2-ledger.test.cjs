@@ -149,11 +149,14 @@ test("legacy user context is migrated into shared scoped facts without internal 
   assert.equal(facts.some((fact) => fact.key === "processed_message_ids"), false);
   const definition = facts.find((fact) => fact.key === "monthly_spending_envelope_definition");
   assert.ok(definition);
-  assert.equal(JSON.parse(definition.value).canonical_mcp_tool, "get_spend_month_summary");
+  const parsedDefinition = JSON.parse(definition.value);
+  assert.equal(parsedDefinition.canonical_mcp_tool, "get_spend_month_summary");
+  assert.equal(parsedDefinition.definition_version, 2);
+  assert.match(parsedDefinition.manual_rule, /user-reported purchase events/);
   db.close();
 });
 
-test("canonical spend-month summary combines card cycles ending in month with IST UPI activity", () => {
+test("canonical spend-month summary combines card cycles with IST UPI and manual purchase activity", () => {
   const db = makeDb();
   const add = (entry) =>
     createEnvelopeEntry(db, {
@@ -165,9 +168,9 @@ test("canonical spend-month summary combines card cycles ending in month with IS
       due_date: entry.due_date,
       treatment: entry.treatment ?? "normal",
       state: entry.state ?? "actual",
-      gross_amount_inr: Math.abs(entry.personal_impact),
+      gross_amount_inr: entry.gross_amount_inr ?? Math.abs(entry.personal_impact),
       personal_impact: entry.personal_impact,
-      cashflow_impact: entry.personal_impact,
+      cashflow_impact: entry.cashflow_impact ?? entry.personal_impact,
       receivable_amount: 0,
       created_by: "test",
     });
@@ -183,20 +186,31 @@ test("canonical spend-month summary combines card cycles ending in month with IS
   add({ source: "idfc_upi", occurred_at: "2026-07-31T18:45:00.000Z", funding_month: "2026-08", personal_impact: 700 });
   add({ source: "idfc_upi", occurred_at: "2026-07-08T12:00:00+05:30", funding_month: "2026-08", personal_impact: -30, treatment: "split" });
   add({ source: "idfc_upi", occurred_at: "2026-07-03T12:00:00+05:30", funding_month: "2026-07", personal_impact: 0, treatment: "settlement" });
+  add({
+    source: "manual",
+    occurred_at: "2026-07-26T12:00:00+05:30",
+    funding_month: "2026-07",
+    gross_amount_inr: 5687,
+    personal_impact: 3791.33,
+    cashflow_impact: 0,
+    treatment: "split",
+  });
 
   const summary = aggregateSpendMonth(db, { spend_month: "2026-07", group_by: "source" });
-  assert.equal(summary.personal_impact, 2970);
-  assert.equal(summary.actual_personal_impact, 2870);
+  assert.equal(summary.personal_impact, 6761.33);
+  assert.equal(summary.actual_personal_impact, 6661.33);
   assert.equal(summary.forecast_personal_impact, 100);
-  assert.equal(summary.personal_remaining, 117030);
-  assert.equal(summary.entry_count, 9);
-  assert.equal(summary.actual_entry_count, 8);
+  assert.equal(summary.personal_remaining, 113238.67);
+  assert.equal(summary.entry_count, 10);
+  assert.equal(summary.actual_entry_count, 9);
   assert.equal(summary.forecast_entry_count, 1);
   assert.deepEqual(summary.upi_window, { start: "2026-07-01", end: "2026-07-31" });
   assert.equal(summary.card_cycles.length, 4);
   assert.equal(summary.groups.find((group) => group.group_key === "idfc_upi").personal_impact, 670);
   assert.equal(summary.groups.find((group) => group.group_key === "icici_cc").personal_impact, 500);
-  assert.equal(summary.definition_version, 1);
+  assert.equal(summary.groups.find((group) => group.group_key === "manual").personal_impact, 3791.33);
+  assert.equal(summary.definition_version, 2);
+  assert.match(summary.definition.manual, /user-reported purchase events/);
   db.close();
 });
 
@@ -930,6 +944,133 @@ test("counterparty transfers are standalone facts and never mutate personal rece
   assert.equal(summary.net_balance_inr, 200);
   assert.equal(listReceivables(db, { counterparty: "Nishidha" })[0].received_inr, 0);
   assert.equal(listReceivables(db, { counterparty: "Nishidha" })[0].id, receivable.id);
+  db.close();
+});
+
+test("off-account purchases affect the envelope while later covered expenses only offset the counterparty net", () => {
+  const db = makeDb();
+  const plan = createFlexBudgetPlan(db, {
+    label: "Two-day flex plan",
+    start_date: "2026-07-26",
+    end_date: "2026-07-27",
+    total_target_inr: 10000,
+    created_by: "telegram_user",
+    periods: [
+      {
+        label: "Current period",
+        start_date: "2026-07-26",
+        end_date: "2026-07-27",
+        target_inr: 10000,
+      },
+    ],
+  });
+
+  const odysseyRaw = insertRawTransaction(db, {
+    source: "manual",
+    amount: 5687,
+    amount_inr: 5687,
+    merchant_raw: "The Odyssey tickets",
+    occurred_at: "2026-07-26T12:00:00+05:30",
+    direction: "debit",
+    raw_payload: JSON.stringify({
+      evidence_source: "user_report",
+      paid_by: "Nishidha",
+      user_share_inr: 3791.33,
+    }),
+  });
+  const odysseyEntry = createEnvelopeEntry(db, {
+    raw_transaction_id: odysseyRaw.id,
+    funding_month: "2026-07",
+    occurred_at: odysseyRaw.occurred_at,
+    source: "manual",
+    merchant_clean: "The Odyssey tickets",
+    category: "Entertainment",
+    treatment: "split",
+    gross_amount_inr: 5687,
+    personal_impact: 3791.33,
+    cashflow_impact: 0,
+    receivable_amount: 0,
+    created_by: "telegram_user",
+  });
+  setFlexBudgetClassification(db, {
+    plan_id: plan.id,
+    raw_transaction_id: odysseyRaw.id,
+    classification: "flex",
+    rationale: "The user's share of the tickets is discretionary spending.",
+    created_by: "telegram_user",
+  });
+  setContextFact(db, {
+    scope_type: "person",
+    scope_id: "Nishidha",
+    key: "counterparty_payable_the_odyssey_2026-07-26",
+    value: JSON.stringify({
+      status: "outstanding",
+      label: "The Odyssey tickets",
+      amount_owed_inr: 3791.33,
+      recorded_on: "2026-07-26",
+      raw_transaction_id: odysseyRaw.id,
+      envelope_entry_id: odysseyEntry.id,
+      notes: "Nishidha paid; Aniket owes two-thirds.",
+    }),
+    source: "telegram_user",
+    confidence: 1,
+  });
+
+  const dinnerRaw = insertRawTransaction(db, {
+    source: "amex",
+    amount: 6000,
+    amount_inr: 6000,
+    merchant_raw: "Dinner",
+    occurred_at: "2026-07-27T20:00:00+05:30",
+    direction: "debit",
+  });
+  const dinnerEntry = createEnvelopeEntry(db, {
+    raw_transaction_id: dinnerRaw.id,
+    funding_month: "2026-09",
+    occurred_at: dinnerRaw.occurred_at,
+    source: "amex",
+    card_cycle_start: "2026-07-21",
+    card_cycle_end: "2026-08-20",
+    merchant_clean: "Dinner",
+    category: "Dining",
+    treatment: "split",
+    gross_amount_inr: 6000,
+    personal_impact: 3000,
+    cashflow_impact: 6000,
+    receivable_amount: 3000,
+    created_by: "telegram_user",
+  });
+  createReceivable(db, {
+    envelope_entry_id: dinnerEntry.id,
+    counterparty: "Nishidha",
+    label: "Dinner share",
+    amount_inr: 3000,
+    created_by: "telegram_user",
+  });
+  setFlexBudgetClassification(db, {
+    plan_id: plan.id,
+    raw_transaction_id: dinnerRaw.id,
+    classification: "flex",
+    rationale: "Only Aniket's share consumes the flex budget.",
+    created_by: "telegram_user",
+  });
+
+  const julySpend = aggregateSpendMonth(db, { spend_month: "2026-07" });
+  assert.equal(julySpend.personal_impact, 3791.33);
+  assert.equal(julySpend.cashflow_impact, 0);
+
+  const balance = getCounterpartyBalance(db, "Nishidha");
+  assert.equal(balance.total_from_user_inr, 3000);
+  assert.equal(balance.total_from_counterparty_inr, 3791.33);
+  assert.equal(balance.net_balance_inr, -791.33);
+  assert.equal(balance.result, "user_owes_counterparty");
+  assert.equal(balance.value_from_counterparty[0].raw_transaction_id, odysseyRaw.id);
+
+  const flex = getFlexBudgetStatus(db, { plan_id: plan.id, as_of: "2026-07-27" });
+  assert.equal(flex.exact, true);
+  assert.equal(flex.plan_spent_inr, 6791.33);
+  assert.equal(flex.plan_remaining_inr, 3208.67);
+  assert.equal(flex.transactions.length, 2);
   db.close();
 });
 
@@ -1831,6 +1972,10 @@ test("all v2 MCP tools are registered for external agents", () => {
     findTool("create_raw_transaction").parameters.properties.source.enum.includes("icici_cc"),
     true
   );
+  assert.equal(
+    findTool("create_raw_transaction").parameters.properties.source.enum.includes("manual"),
+    true
+  );
 });
 
 test("production MCP surface exposes v2 finance tools and no legacy envelope mutators", () => {
@@ -1963,6 +2108,9 @@ test("Violet is required to query raw storage for recent transaction questions",
   );
   assert.match(prompt, /call get_counterparty_balance immediately before answering/);
   assert.match(prompt, /person-to-person payment is a standalone event, not an invoice allocation/);
+  assert.match(prompt, /source=manual raw transaction for the reported purchase event/);
+  assert.match(prompt, /cashflow_impact=0/);
+  assert.match(prompt, /independent opposite-side event/);
   assert.match(prompt, /Never blame the user's phrasing/);
   assert.doesNotMatch(prompt, /slightly witty/);
   db.close();

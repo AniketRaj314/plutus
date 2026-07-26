@@ -47,7 +47,7 @@ interface V2ToolDefinition {
 }
 
 const CARD_SOURCES = ["amex", "bobcard", "idfc_cc", "icici_cc"];
-const ALL_SOURCES = [...CARD_SOURCES, "idfc_upi"];
+const ALL_SOURCES = [...CARD_SOURCES, "idfc_upi", "manual"];
 const ENTRY_STATES: EnvelopeEntryState[] = ["forecast", "actual", "settled", "cancelled"];
 const CONTEXT_SCOPES: ContextScope[] = ["global", "merchant", "transaction", "card", "person"];
 const RECEIVABLE_STATES: ReceivableStatus[] = ["pending", "partial", "received", "written_off"];
@@ -96,7 +96,7 @@ export const v2Tools: V2ToolDefinition[] = [
   {
     name: "create_raw_transaction",
     description:
-      "Store one immutable bank/card fact without applying financial meaning. Duplicate raw_email_id values are idempotent.",
+      "Store one immutable transaction event without applying financial meaning. Sources may be bank/card evidence or an explicit user-reported manual event. Duplicate raw_email_id values are idempotent.",
     parameters: {
       type: "object",
       properties: {
@@ -138,7 +138,7 @@ export const v2Tools: V2ToolDefinition[] = [
   {
     name: "bulk_create_raw_transactions",
     description:
-      "Store immutable raw statement facts in one call. Rows are independent; one failure does not abort the rest and no envelope logic runs.",
+      "Store immutable transaction evidence in one call, including statement facts or explicit user-reported manual events. Rows are independent; one failure does not abort the rest and no envelope logic runs.",
     parameters: {
       type: "object",
       properties: {
@@ -203,7 +203,7 @@ export const v2Tools: V2ToolDefinition[] = [
   },
   {
     name: "get_raw_transactions",
-    description: "Read immutable bank/card evidence without financial interpretation.",
+    description: "Read immutable transaction evidence without financial interpretation.",
     parameters: {
       type: "object",
       properties: {
