@@ -212,6 +212,67 @@ export function runMigrations(db: Database.Database): void {
       updated_at TEXT NOT NULL DEFAULT (datetime('now'))
     );
 
+    -- A flex budget is an AI-authored plan whose arithmetic must be stable
+    -- across Telegram, MCP clients, and future agent sessions. The service
+    -- stores the chosen schedule and transaction classifications; it does not
+    -- infer whether a merchant is discretionary.
+    CREATE TABLE IF NOT EXISTS flex_budget_plans (
+      id TEXT PRIMARY KEY,
+      label TEXT NOT NULL,
+      start_date TEXT NOT NULL,
+      end_date TEXT NOT NULL,
+      total_target_inr REAL NOT NULL CHECK (total_target_inr >= 0),
+      timezone TEXT NOT NULL DEFAULT 'Asia/Kolkata',
+      daily_mode TEXT NOT NULL DEFAULT 'equal_slice'
+        CHECK (daily_mode IN ('equal_slice', 'period_pool')),
+      release_balance_on_last_day INTEGER NOT NULL DEFAULT 1,
+      policy_notes TEXT,
+      status TEXT NOT NULL DEFAULT 'active'
+        CHECK (status IN ('active', 'completed', 'cancelled', 'superseded')),
+      created_by TEXT NOT NULL,
+      supersedes_id TEXT,
+      superseded_at TEXT,
+      replaced_by_id TEXT,
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+      FOREIGN KEY (supersedes_id) REFERENCES flex_budget_plans(id),
+      FOREIGN KEY (replaced_by_id) REFERENCES flex_budget_plans(id)
+    );
+
+    CREATE TABLE IF NOT EXISTS flex_budget_periods (
+      id TEXT PRIMARY KEY,
+      plan_id TEXT NOT NULL,
+      sequence INTEGER NOT NULL,
+      label TEXT NOT NULL,
+      start_date TEXT NOT NULL,
+      end_date TEXT NOT NULL,
+      target_inr REAL NOT NULL CHECK (target_inr >= 0),
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      FOREIGN KEY (plan_id) REFERENCES flex_budget_plans(id) ON DELETE CASCADE,
+      UNIQUE (plan_id, sequence)
+    );
+
+    CREATE TABLE IF NOT EXISTS flex_budget_classifications (
+      id TEXT PRIMARY KEY,
+      plan_id TEXT NOT NULL,
+      raw_transaction_id TEXT NOT NULL,
+      classification TEXT NOT NULL
+        CHECK (classification IN ('flex', 'fixed', 'excluded')),
+      impact_override_inr REAL,
+      rationale TEXT,
+      confidence REAL CHECK (confidence IS NULL OR (confidence >= 0 AND confidence <= 1)),
+      created_by TEXT NOT NULL,
+      supersedes_id TEXT,
+      superseded_at TEXT,
+      replaced_by_id TEXT,
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+      FOREIGN KEY (plan_id) REFERENCES flex_budget_plans(id),
+      FOREIGN KEY (raw_transaction_id) REFERENCES raw_transactions(id),
+      FOREIGN KEY (supersedes_id) REFERENCES flex_budget_classifications(id),
+      FOREIGN KEY (replaced_by_id) REFERENCES flex_budget_classifications(id)
+    );
+
     CREATE INDEX IF NOT EXISTS idx_transactions_datetime ON transactions (datetime);
     CREATE INDEX IF NOT EXISTS idx_transactions_source ON transactions (source);
     CREATE INDEX IF NOT EXISTS idx_splits_transaction_id ON splits (transaction_id);
@@ -226,6 +287,13 @@ export function runMigrations(db: Database.Database): void {
       WHERE superseded_at IS NULL;
     CREATE INDEX IF NOT EXISTS idx_receivables_status ON receivables (status);
     CREATE INDEX IF NOT EXISTS idx_commitments_status ON commitments (status);
+    CREATE INDEX IF NOT EXISTS idx_flex_budget_plans_status_dates
+      ON flex_budget_plans (status, start_date, end_date);
+    CREATE INDEX IF NOT EXISTS idx_flex_budget_periods_plan_dates
+      ON flex_budget_periods (plan_id, start_date, end_date);
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_flex_budget_classifications_active
+      ON flex_budget_classifications (plan_id, raw_transaction_id)
+      WHERE superseded_at IS NULL;
     CREATE INDEX IF NOT EXISTS idx_raw_transactions_occurred_at ON raw_transactions (occurred_at);
     CREATE INDEX IF NOT EXISTS idx_raw_transactions_source ON raw_transactions (source);
     CREATE UNIQUE INDEX IF NOT EXISTS idx_raw_transactions_email

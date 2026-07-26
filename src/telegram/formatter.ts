@@ -1,5 +1,5 @@
 import type { Transaction, Envelope } from "../db/queries";
-import type { EnvelopeEntry } from "../db/v2-queries";
+import type { EnvelopeEntry, FlexBudgetStatus } from "../db/v2-queries";
 import { getRemainingWeeksInMonth, parseIstDateOnly, BIG_PURCHASE_THRESHOLD } from "../envelope/engine";
 
 const IST_OFFSET_MS = 5.5 * 60 * 60 * 1000;
@@ -127,6 +127,7 @@ export interface V2TransactionPresentation {
   entry?: EnvelopeEntry;
   spend_month?: string;
   spend_month_remaining?: number;
+  flex_budget?: FlexBudgetStatus;
   question?: string;
 }
 
@@ -182,6 +183,33 @@ export function formatV2Transaction(
           ? `📊 ${label} spending envelope: ${formatINR(Math.abs(remaining))} over`
           : `📊 ${label} spending envelope: ${formatINR(remaining)} remaining`
       );
+    }
+    if (presentation.flex_budget) {
+      const flex = presentation.flex_budget;
+      const allocation = flex.transactions.find(
+        (row) => row.raw_transaction_id === transaction.id
+      );
+      const unresolved = flex.unresolved.find(
+        (row) => row.raw_transaction_id === transaction.id
+      );
+      if (allocation?.classification === "flex" && flex.today && flex.current_period) {
+        lines.push(
+          `🎯 Flex left: ${formatINR(flex.today.remaining_inr)} today · ${formatINR(
+            flex.current_period.available_inr
+          )} ${flex.current_period.label}`
+        );
+      } else if (allocation && flex.today && flex.current_period) {
+        lines.push(
+          `🎯 Flex: ${allocation.classification} · ${formatINR(
+            flex.today.remaining_inr
+          )} today · ${formatINR(flex.current_period.available_inr)} ${flex.current_period.label}`
+        );
+      } else if (unresolved) {
+        lines.push("🎯 Flex: classification pending · totals provisional");
+      }
+      if (!flex.exact && !unresolved) {
+        lines.push(`⚠️ Flex total provisional · ${flex.unresolved.length} unresolved`);
+      }
     }
   } else if (presentation.status === "needs_context") {
     lines.push(`🤔 ${presentation.question ?? "I need context before counting this."}`);

@@ -17,6 +17,7 @@ import { sendMessage, recordTransactionMessage, getMessageIdForTransaction } fro
 import { formatV2Transaction } from "../telegram/formatter";
 import {
   aggregateSpendMonth,
+  getFlexBudgetStatus,
   getSpendMonthForEntry,
   insertRawTransaction,
   listEnvelopeEntries,
@@ -496,11 +497,19 @@ async function finalizeTransaction(
 
   const spendMonth = inference.entry ? getSpendMonthForEntry(inference.entry) : null;
   const summary = spendMonth ? aggregateSpendMonth(db, { spend_month: spendMonth }) : undefined;
+  const transactionDateIst = new Date(
+    new Date(transaction.datetime ?? Date.now()).getTime() + 5.5 * 60 * 60 * 1000
+  )
+    .toISOString()
+    .slice(0, 10);
+  const flexResult = getFlexBudgetStatus(db, { as_of: transactionDateIst });
+  const flexBudget = "plan" in flexResult ? flexResult : undefined;
   const messageText = formatV2Transaction(transaction, {
     status: inference.status,
     entry: inference.entry,
     spend_month: spendMonth ?? undefined,
     spend_month_remaining: summary?.personal_remaining,
+    flex_budget: flexBudget,
     question: inference.question,
   });
 

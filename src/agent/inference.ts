@@ -5,6 +5,7 @@ import { getCreditCard, getTransaction } from "../db/queries";
 import {
   createEnvelopeEntry,
   createReceivable,
+  getActiveFlexBudgetPlan,
   getActiveSalaryProfile,
   getRawTransaction,
   listCommitments,
@@ -13,7 +14,9 @@ import {
   listReceivables,
   listUninterpretedTransactions,
   setContextFact,
+  setFlexBudgetClassification,
   type EnvelopeEntry,
+  type FlexBudgetClassification,
   type RawTransactionV2,
   type Receivable,
 } from "../db/v2-queries";
@@ -57,6 +60,8 @@ export interface TransactionInferenceProposal {
   question: string | null;
   receivable: InferenceReceivableProposal | null;
   credit_allocations: InferenceCreditAllocationProposal[];
+  flex_classification: FlexBudgetClassification | null;
+  flex_reason: string | null;
 }
 
 export interface InferenceContext {
@@ -76,6 +81,7 @@ export interface InferenceContext {
   open_receivables: ReturnType<typeof listReceivables>;
   context_facts: ReturnType<typeof listContextFacts>;
   recent_interpretations: EnvelopeEntry[];
+  flex_budget_plan: ReturnType<typeof getActiveFlexBudgetPlan>;
 }
 
 export interface InferenceOutcome {
@@ -125,6 +131,9 @@ function buildInferenceContext(db: Database.Database, raw: RawTransactionV2): In
     ? cardCycle.funding_month
     : getSalaryFundingMonthForDate(occurredAt, salaryProfile?.salary_day ?? 1);
   const enriched = getTransaction(db, raw.id);
+  const occurredAtIstDate = new Date(occurredAt.getTime() + 5.5 * 60 * 60 * 1000)
+    .toISOString()
+    .slice(0, 10);
 
   return {
     raw,
@@ -147,6 +156,7 @@ function buildInferenceContext(db: Database.Database, raw: RawTransactionV2): In
       .filter((fact) => fact.key !== "automatic_inference")
       .slice(0, 150),
     recent_interpretations: listEnvelopeEntries(db, { limit: 30 }),
+    flex_budget_plan: getActiveFlexBudgetPlan(db, occurredAtIstDate),
   };
 }
 
@@ -173,6 +183,9 @@ Important rules:
 - If a credit plausibly settles open receivables, do not close them automatically. Return needs_context with a concise confirmation question and proposed credit_allocations covering the full credit.
 - Matching is AI judgment: use counterparty text, amount, timing, open receivables, and context. Exact equality is not required; explicitly handle partial, combined, and surplus amounts.
 - A proposed surplus may use a semantic kind such as unallocated_surplus with receivable_id=null. Repayments and confirmed surplus do not become personal spending or extra envelope allowance.
+- When flex_budget_plan is present, classify the transaction for that plan. "flex" means discretionary spending that consumes the challenge using its stored personal share; "fixed" means a planned/committed cost outside the challenge; "excluded" means reimbursements, bookkeeping, pass-throughs, or other activity that does not consume the challenge. This is semantic AI judgment—use the supplied plan policy and context, never merchant-name rules.
+- Split spending can be flex: its flex impact will come from personal_impact, not the gross charge.
+- If there is no flex_budget_plan, return flex_classification and flex_reason as null.
 
 Return exactly:
 {
@@ -199,7 +212,9 @@ Return exactly:
     "kind": string,
     "amount_inr": number,
     "notes": string | null
-  }>
+  }>,
+  "flex_classification": "flex" | "fixed" | "excluded" | null,
+  "flex_reason": string | null
 }
 
 For debit events, credit_allocations must be []. For a proposed incoming-credit match, populate the proposed treatment and impact fields even though decision is needs_context; user confirmation is still required before persistence.
@@ -294,6 +309,18 @@ export function parseInferenceResponse(raw: string): TransactionInferenceProposa
     });
   }
 
+  const flexClassification = o.flex_classification ?? null;
+  if (
+    flexClassification !== null &&
+    flexClassification !== "flex" &&
+    flexClassification !== "fixed" &&
+    flexClassification !== "excluded"
+  ) {
+    return null;
+  }
+  const flexReason = o.flex_reason ?? null;
+  if (flexReason !== null && typeof flexReason !== "string") return null;
+
   return {
     decision: o.decision,
     merchant_clean: o.merchant_clean as string | null,
@@ -308,6 +335,8 @@ export function parseInferenceResponse(raw: string): TransactionInferenceProposa
     question: o.question as string | null,
     receivable,
     credit_allocations: creditAllocations,
+    flex_classification: flexClassification,
+    flex_reason: flexReason,
   };
 }
 
@@ -466,6 +495,16 @@ export async function inferRawTransaction(
             created_by: "automatic_inference",
           })
         : undefined;
+      if (context.flex_budget_plan && proposal.flex_classification) {
+        setFlexBudgetClassification(db, {
+          plan_id: context.flex_budget_plan.id,
+          raw_transaction_id: raw.id,
+          classification: proposal.flex_classification,
+          rationale: proposal.flex_reason ?? undefined,
+          confidence: proposal.confidence,
+          created_by: "automatic_inference",
+        });
+      }
       recordInferenceState(db, raw.id, {
         status: "completed",
         confidence: proposal.confidence,
