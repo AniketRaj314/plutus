@@ -9,6 +9,7 @@ import {
   createReceivable,
   getActiveFlexBudgetPlan,
   getActiveSalaryProfile,
+  getCounterpartyBalance,
   getFlexBudgetStatus,
   getRawTransaction,
   insertRawTransaction,
@@ -689,9 +690,34 @@ export const v2Tools: V2ToolDefinition[] = [
       }),
   },
   {
+    name: "get_counterparty_balance",
+    description:
+      "Canonical deterministic source for questions about what one person owes the user, what the user owes them, and the net balance. Returns original shared expenses, standalone payments, manual off-account obligations, uncertain items, both subtotals, and the net without allocating payments across invoices.",
+    parameters: {
+      type: "object",
+      properties: {
+        counterparty: { type: "string" },
+        since: {
+          type: "string",
+          description: "Optional inclusive YYYY-MM-DD start date.",
+        },
+        until: {
+          type: "string",
+          description: "Optional inclusive YYYY-MM-DD end date.",
+        },
+      },
+      required: ["counterparty"],
+    },
+    handler: (db, args) =>
+      getCounterpartyBalance(db, args.counterparty as string, {
+        since: args.since as string | undefined,
+        until: args.until as string | undefined,
+      }),
+  },
+  {
     name: "record_confirmed_credit_allocation",
     description:
-      "After the user explicitly confirms how an incoming credit should be understood, atomically allocate it, update any referenced receivables, store a zero/nonzero personal impact chosen by the agent, and retain the allocation as shared transaction context. Never call before confirmation.",
+      "After the user explicitly confirms an invoice-level allocation for a company/business reimbursement or specifically requests itemized personal matching, atomically allocate an incoming credit and update referenced receivables. Do not use this by default for friends or family; record their payment as a standalone counterparty_transfer context fact instead.",
     parameters: {
       type: "object",
       properties: {

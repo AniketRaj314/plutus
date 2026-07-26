@@ -145,6 +145,51 @@ export interface Receivable {
   updated_at: string;
 }
 
+export type CounterpartyBalanceItemKind =
+  | "expense_you_covered"
+  | "money_you_sent"
+  | "expense_they_covered"
+  | "money_they_sent";
+
+export interface CounterpartyBalanceItem {
+  kind: CounterpartyBalanceItemKind;
+  label: string;
+  amount_inr: number;
+  occurred_at: string | null;
+  raw_transaction_id: string | null;
+  source_id: string;
+  notes: string | null;
+}
+
+export interface CounterpartyBalanceUncertainItem {
+  label: string;
+  amount_inr: number;
+  occurred_at: string | null;
+  raw_transaction_id: string | null;
+  source_id: string;
+  reason: string;
+}
+
+export interface CounterpartyBalanceSummary {
+  counterparty: string;
+  since: string | null;
+  until: string | null;
+  value_from_user: CounterpartyBalanceItem[];
+  value_from_counterparty: CounterpartyBalanceItem[];
+  uncertain: CounterpartyBalanceUncertainItem[];
+  total_from_user_inr: number;
+  total_from_counterparty_inr: number;
+  net_balance_inr: number;
+  result: "counterparty_owes_user" | "user_owes_counterparty" | "settled";
+  definition: {
+    positive_balance: string;
+    receivables: string;
+    transfers: string;
+    manual_obligations: string;
+    uncertain: string;
+  };
+}
+
 export interface CreditAllocation {
   receivable_id?: string | null;
   kind: string;
@@ -976,6 +1021,286 @@ export function listReceivables(
   }
   const where = clauses.length ? `WHERE ${clauses.join(" AND ")}` : "";
   return db.prepare(`SELECT * FROM receivables ${where} ORDER BY created_at DESC`).all(params) as Receivable[];
+}
+
+function normalizedCounterparty(value: string | null | undefined): string {
+  return (value ?? "").trim().toLocaleLowerCase("en-IN");
+}
+
+function roundedMoney(value: number): number {
+  return Math.round((value + Number.EPSILON) * 100) / 100;
+}
+
+function parseJsonObject(value: string | null | undefined): Record<string, unknown> | undefined {
+  if (!value) return undefined;
+  try {
+    const parsed = JSON.parse(value);
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed)
+      ? (parsed as Record<string, unknown>)
+      : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function inCounterpartyWindow(
+  occurredAt: string | null,
+  filters: { since?: string; until?: string }
+): boolean {
+  if (!occurredAt) return true;
+  const date = occurredAt.slice(0, 10);
+  if (filters.since && date < filters.since) return false;
+  if (filters.until && date > filters.until) return false;
+  return true;
+}
+
+function validateCounterpartyWindow(filters: { since?: string; until?: string }): void {
+  const dateOnly = /^\d{4}-\d{2}-\d{2}$/;
+  if (filters.since && !dateOnly.test(filters.since)) throw new Error("since must be YYYY-MM-DD");
+  if (filters.until && !dateOnly.test(filters.until)) throw new Error("until must be YYYY-MM-DD");
+  if (filters.since && filters.until && filters.since > filters.until) {
+    throw new Error("since must be on or before until");
+  }
+}
+
+function rawDirectionFromEvidence(raw: RawTransactionV2): TransactionDirection {
+  const payloadDirection = parseJsonObject(raw.raw_payload)?.direction;
+  if (payloadDirection === "credit" || payloadDirection === "debit") return payloadDirection;
+  if (raw.amount < 0) return "credit";
+  return raw.direction;
+}
+
+function rawAmountInr(raw: RawTransactionV2): number {
+  return Math.abs(raw.is_international ? raw.amount_inr ?? raw.amount : raw.amount);
+}
+
+/**
+ * Deterministic two-sided balance view for a person.
+ *
+ * Financial meaning remains AI/user-authored in existing receivables and
+ * context facts. This query deliberately ignores receivable received/partial
+ * mutations: original shared expenses stay visible, while confirmed personal
+ * transfers appear as independent events on the opposite side.
+ */
+export function getCounterpartyBalance(
+  db: Database.Database,
+  counterparty: string,
+  filters: { since?: string; until?: string } = {}
+): CounterpartyBalanceSummary {
+  if (!counterparty.trim()) throw new Error("counterparty is required");
+  validateCounterpartyWindow(filters);
+
+  const counterpartyKey = normalizedCounterparty(counterparty);
+  const facts = listContextFacts(db);
+  const personFacts = facts.filter(
+    (fact) =>
+      fact.scope_type === "person" &&
+      normalizedCounterparty(fact.scope_id) === counterpartyKey
+  );
+  const exclusions = new Set<string>();
+  for (const fact of personFacts.filter((row) => row.key === "counterparty_balance_exclusion")) {
+    const value = parseJsonObject(fact.value);
+    for (const key of ["source_id", "receivable_id", "raw_transaction_id"]) {
+      if (typeof value?.[key] === "string") exclusions.add(value[key] as string);
+    }
+  }
+
+  const valueFromUser: CounterpartyBalanceItem[] = [];
+  const valueFromCounterparty: CounterpartyBalanceItem[] = [];
+  const uncertain: CounterpartyBalanceUncertainItem[] = [];
+  const accountedRawTransactions = new Set<string>();
+
+  const receivables = listReceivables(db, { include_closed: true }).filter(
+    (receivable) => normalizedCounterparty(receivable.counterparty) === counterpartyKey
+  );
+  for (const receivable of receivables) {
+    if (receivable.status === "written_off" || exclusions.has(receivable.id)) continue;
+    const entry = receivable.envelope_entry_id
+      ? getEnvelopeEntry(db, receivable.envelope_entry_id)
+      : undefined;
+    const occurredAt = entry?.occurred_at ?? receivable.created_at;
+    if (!inCounterpartyWindow(occurredAt, filters)) continue;
+    const rawTransactionId = entry?.raw_transaction_id ?? null;
+    if (rawTransactionId) accountedRawTransactions.add(rawTransactionId);
+
+    const userConfirmed =
+      rawTransactionId !== null &&
+      facts.some(
+        (fact) =>
+          fact.scope_type === "transaction" &&
+          fact.scope_id === rawTransactionId &&
+          fact.source !== "automatic_inference"
+      );
+    if (receivable.created_by === "automatic_inference" && !userConfirmed) {
+      uncertain.push({
+        label: receivable.label,
+        amount_inr: roundedMoney(receivable.amount_inr),
+        occurred_at: occurredAt,
+        raw_transaction_id: rawTransactionId,
+        source_id: receivable.id,
+        reason: "Created by automatic inference without user-confirmed context.",
+      });
+      continue;
+    }
+
+    valueFromUser.push({
+      kind: "expense_you_covered",
+      label: receivable.label,
+      amount_inr: roundedMoney(receivable.amount_inr),
+      occurred_at: occurredAt,
+      raw_transaction_id: rawTransactionId,
+      source_id: receivable.id,
+      notes: receivable.notes,
+    });
+  }
+
+  for (const fact of personFacts) {
+    if (
+      !fact.key.startsWith("counterparty_payable_") &&
+      !fact.key.startsWith("outstanding_payable_")
+    ) {
+      continue;
+    }
+    if (exclusions.has(fact.id)) continue;
+    const value = parseJsonObject(fact.value);
+    if (!value) continue;
+    const status = typeof value.status === "string" ? value.status : "outstanding";
+    if (["cancelled", "ignored", "written_off"].includes(status)) continue;
+    const amount = Number(value.amount_owed_inr ?? value.amount_inr);
+    if (!Number.isFinite(amount) || amount <= 0) continue;
+    const occurredAt =
+      (typeof value.occurred_at === "string" && value.occurred_at) ||
+      (typeof value.recorded_on === "string" && value.recorded_on) ||
+      fact.created_at;
+    if (!inCounterpartyWindow(occurredAt, filters)) continue;
+    valueFromCounterparty.push({
+      kind: "expense_they_covered",
+      label:
+        (typeof value.label === "string" && value.label) ||
+        fact.key.replace(/^(counterparty|outstanding)_payable_/, "").replaceAll("_", " "),
+      amount_inr: roundedMoney(amount),
+      occurred_at: occurredAt,
+      raw_transaction_id: null,
+      source_id: fact.id,
+      notes: typeof value.notes === "string" ? value.notes : null,
+    });
+  }
+
+  const transferFacts = facts.filter(
+    (fact) => fact.scope_type === "transaction" && fact.key === "counterparty_transfer"
+  );
+  for (const fact of transferFacts) {
+    if (exclusions.has(fact.id) || exclusions.has(fact.scope_id)) continue;
+    const value = parseJsonObject(fact.value);
+    if (!value || value.status !== "confirmed") continue;
+    const raw = getRawTransaction(db, fact.scope_id);
+    const factCounterparty =
+      typeof value.counterparty === "string" ? value.counterparty : raw?.merchant_raw;
+    if (normalizedCounterparty(factCounterparty) !== counterpartyKey) continue;
+    const direction = value.direction;
+    if (direction !== "from_counterparty" && direction !== "to_counterparty") continue;
+    const amount = Number(value.amount_inr ?? (raw ? rawAmountInr(raw) : NaN));
+    if (!Number.isFinite(amount) || amount <= 0) continue;
+    const occurredAt =
+      (typeof value.occurred_at === "string" && value.occurred_at) ||
+      raw?.occurred_at ||
+      fact.created_at;
+    if (!inCounterpartyWindow(occurredAt, filters)) continue;
+    const item: CounterpartyBalanceItem = {
+      kind: direction === "from_counterparty" ? "money_they_sent" : "money_you_sent",
+      label:
+        (typeof value.label === "string" && value.label) ||
+        (direction === "from_counterparty" ? "Money received" : "Money sent"),
+      amount_inr: roundedMoney(amount),
+      occurred_at: occurredAt,
+      raw_transaction_id: raw?.id ?? fact.scope_id,
+      source_id: fact.id,
+      notes: typeof value.notes === "string" ? value.notes : null,
+    };
+    if (direction === "from_counterparty") valueFromCounterparty.push(item);
+    else valueFromUser.push(item);
+    accountedRawTransactions.add(fact.scope_id);
+  }
+
+  // Legacy confirmed allocations identify a personal payment, but their
+  // invoice-level splits are intentionally ignored here. The original bank
+  // credit is shown once as a standalone human payment.
+  const legacyPaymentFacts = facts.filter(
+    (fact) => fact.scope_type === "transaction" && fact.key === "credit_allocation"
+  );
+  for (const fact of legacyPaymentFacts) {
+    if (
+      accountedRawTransactions.has(fact.scope_id) ||
+      exclusions.has(fact.id) ||
+      exclusions.has(fact.scope_id)
+    ) {
+      continue;
+    }
+    const value = parseJsonObject(fact.value);
+    if (!value || value.status !== "confirmed") continue;
+    const raw = getRawTransaction(db, fact.scope_id);
+    if (!raw || normalizedCounterparty(raw.merchant_raw) !== counterpartyKey) continue;
+    if (rawDirectionFromEvidence(raw) !== "credit") continue;
+    if (!inCounterpartyWindow(raw.occurred_at, filters)) continue;
+    const amount = Number(value.amount_inr ?? rawAmountInr(raw));
+    if (!Number.isFinite(amount) || amount <= 0) continue;
+    valueFromCounterparty.push({
+      kind: "money_they_sent",
+      label:
+        (typeof value.label === "string" && value.label) ||
+        `Money received from ${counterparty}`,
+      amount_inr: roundedMoney(amount),
+      occurred_at: raw.occurred_at,
+      raw_transaction_id: raw.id,
+      source_id: fact.id,
+      notes: typeof value.notes === "string" ? value.notes : null,
+    });
+    accountedRawTransactions.add(raw.id);
+  }
+
+  const totalFromUser = roundedMoney(
+    valueFromUser.reduce((total, item) => total + item.amount_inr, 0)
+  );
+  const totalFromCounterparty = roundedMoney(
+    valueFromCounterparty.reduce((total, item) => total + item.amount_inr, 0)
+  );
+  const netBalance = roundedMoney(totalFromUser - totalFromCounterparty);
+
+  const byDate = (
+    a: CounterpartyBalanceItem | CounterpartyBalanceUncertainItem,
+    b: CounterpartyBalanceItem | CounterpartyBalanceUncertainItem
+  ) => (a.occurred_at ?? "").localeCompare(b.occurred_at ?? "");
+  valueFromUser.sort(byDate);
+  valueFromCounterparty.sort(byDate);
+  uncertain.sort(byDate);
+
+  return {
+    counterparty,
+    since: filters.since ?? null,
+    until: filters.until ?? null,
+    value_from_user: valueFromUser,
+    value_from_counterparty: valueFromCounterparty,
+    uncertain,
+    total_from_user_inr: totalFromUser,
+    total_from_counterparty_inr: totalFromCounterparty,
+    net_balance_inr: netBalance,
+    result:
+      netBalance > 0
+        ? "counterparty_owes_user"
+        : netBalance < 0
+        ? "user_owes_counterparty"
+        : "settled",
+    definition: {
+      positive_balance: "A positive net means the counterparty owes the user.",
+      receivables:
+        "Original personal receivable amounts remain visible regardless of partial/received status.",
+      transfers:
+        "Confirmed person-to-person transfers are independent opposite-side events; invoice allocations are ignored.",
+      manual_obligations:
+        "Person-scoped payable facts represent expenses the counterparty covered outside tracked accounts.",
+      uncertain: "Unconfirmed automatic inferences are listed separately and excluded from the net.",
+    },
+  };
 }
 
 /**

@@ -13,6 +13,7 @@ const {
   createEnvelopeEntry,
   createFlexBudgetPlan,
   createReceivable,
+  getCounterpartyBalance,
   getFlexBudgetStatus,
   getActiveSalaryProfile,
   insertRawTransaction,
@@ -766,6 +767,169 @@ test("AI-proposed combined repayment and surplus waits for Telegram approval, th
   assert.equal(JSON.parse(stored.value).status, "confirmed");
   assert.equal(JSON.parse(stored.value).allocations[2].kind, "unallocated_surplus");
   assert.equal(aggregateSpendMonth(db, { spend_month: "2026-07" }).personal_impact, 468.5);
+  db.close();
+});
+
+test("counterparty balance keeps original expenses and standalone payments visible", () => {
+  const db = makeDb();
+
+  function addReceivable(label, amount, received = 0, createdBy = "telegram_user") {
+    const raw = insertRawTransaction(db, {
+      source: "amex",
+      amount,
+      amount_inr: amount,
+      merchant_raw: label,
+      occurred_at: "2026-07-24T12:00:00+05:30",
+      direction: "debit",
+      raw_email_id: `expense-${label}`,
+    });
+    const entry = createEnvelopeEntry(db, {
+      raw_transaction_id: raw.id,
+      funding_month: "2026-08",
+      occurred_at: raw.occurred_at,
+      source: raw.source,
+      merchant_clean: label,
+      treatment: "split",
+      gross_amount_inr: amount * 2,
+      personal_impact: amount,
+      cashflow_impact: amount * 2,
+      receivable_amount: amount,
+      created_by: createdBy,
+    });
+    return createReceivable(db, {
+      envelope_entry_id: entry.id,
+      counterparty: "Nishidha",
+      label,
+      amount_inr: amount,
+      received_inr: received,
+      created_by: createdBy,
+    });
+  }
+
+  addReceivable("BookMyShow tickets", 3294.92, 1271.67);
+  addReceivable("Bloom Hotel", 1908.43);
+  addReceivable("Toscano", 1228.33, 1228.33);
+  addReceivable("Paper & Pie", 550, 550);
+  addReceivable("Instamart", 211, 211);
+  addReceivable("Mr Chan", 51, 51);
+  const inferred = addReceivable("Unexplained ₹214", 214, 0, "automatic_inference");
+
+  const payments = [
+    ["2026-07-14", 550],
+    ["2026-07-14", 211],
+    ["2026-07-24", 2500],
+    ["2026-07-25", 51],
+  ];
+  for (const [date, amount] of payments) {
+    const raw = insertRawTransaction(db, {
+      source: "idfc_upi",
+      amount,
+      amount_inr: amount,
+      merchant_raw: "NISHIDHA",
+      occurred_at: `${date}T12:00:00+05:30`,
+      direction: "credit",
+      raw_email_id: `nishidha-${date}-${amount}`,
+    });
+    setContextFact(db, {
+      scope_type: "transaction",
+      scope_id: raw.id,
+      key: "credit_allocation",
+      value: JSON.stringify({
+        status: "confirmed",
+        amount_inr: amount,
+        allocations: [{ receivable_id: null, kind: "legacy", amount_inr: amount }],
+        notes: "Legacy allocation details must not affect the personal balance view.",
+      }),
+      source: "telegram_user",
+      confidence: 1,
+    });
+  }
+
+  setContextFact(db, {
+    scope_type: "person",
+    scope_id: "Nishidha",
+    key: "counterparty_payable_the_odyssey_2026-07-26",
+    value: JSON.stringify({
+      status: "outstanding",
+      label: "The Odyssey tickets",
+      amount_owed_inr: 3791.33,
+      recorded_on: "2026-07-26",
+    }),
+    source: "telegram_user",
+    confidence: 1,
+  });
+
+  const summary = getCounterpartyBalance(db, "nishidha");
+  assert.equal(summary.total_from_user_inr, 7243.68);
+  assert.equal(summary.total_from_counterparty_inr, 7103.33);
+  assert.equal(summary.net_balance_inr, 140.35);
+  assert.equal(summary.result, "counterparty_owes_user");
+  assert.equal(summary.value_from_user.find((item) => item.label === "Toscano").amount_inr, 1228.33);
+  assert.equal(
+    summary.value_from_user.find((item) => item.label === "BookMyShow tickets").amount_inr,
+    3294.92
+  );
+  assert.equal(
+    summary.value_from_counterparty.filter((item) => item.amount_inr === 2500).length,
+    1
+  );
+  assert.equal(summary.uncertain.length, 1);
+  assert.equal(summary.uncertain[0].source_id, inferred.id);
+  assert.match(summary.uncertain[0].reason, /automatic inference/i);
+  db.close();
+});
+
+test("counterparty transfers are standalone facts and never mutate personal receivables", () => {
+  const db = makeDb();
+  const expenseEntry = createEnvelopeEntry(db, {
+    funding_month: "2026-08",
+    occurred_at: "2026-07-24T12:00:00+05:30",
+    source: "amex",
+    merchant_clean: "Dinner",
+    treatment: "split",
+    gross_amount_inr: 2000,
+    personal_impact: 1000,
+    cashflow_impact: 2000,
+    receivable_amount: 1000,
+    created_by: "telegram_user",
+  });
+  const receivable = createReceivable(db, {
+    envelope_entry_id: expenseEntry.id,
+    counterparty: "Nishidha",
+    label: "Dinner share",
+    amount_inr: 1000,
+    created_by: "telegram_user",
+  });
+  const raw = insertRawTransaction(db, {
+    source: "idfc_upi",
+    amount: 800,
+    amount_inr: 800,
+    merchant_raw: "Nishidha",
+    occurred_at: "2026-07-25T12:00:00+05:30",
+    direction: "credit",
+    raw_email_id: "standalone-nishidha-payment",
+  });
+  setContextFact(db, {
+    scope_type: "transaction",
+    scope_id: raw.id,
+    key: "counterparty_transfer",
+    value: JSON.stringify({
+      status: "confirmed",
+      counterparty: "Nishidha",
+      direction: "from_counterparty",
+      amount_inr: 800,
+      label: "Money received",
+    }),
+    source: "telegram_user",
+    confidence: 1,
+  });
+
+  const summary = getCounterpartyBalance(db, "Nishidha");
+  assert.equal(summary.total_from_user_inr, 1000);
+  assert.equal(summary.total_from_counterparty_inr, 800);
+  assert.equal(summary.net_balance_inr, 200);
+  assert.equal(listReceivables(db, { counterparty: "Nishidha" })[0].received_inr, 0);
+  assert.equal(listReceivables(db, { counterparty: "Nishidha" })[0].id, receivable.id);
   db.close();
 });
 
@@ -1652,6 +1816,7 @@ test("all v2 MCP tools are registered for external agents", () => {
     "create_receivable",
     "update_receivable",
     "list_receivables",
+    "get_counterparty_balance",
     "record_confirmed_credit_allocation",
     "create_commitment",
     "update_commitment",
@@ -1671,6 +1836,7 @@ test("all v2 MCP tools are registered for external agents", () => {
 test("production MCP surface exposes v2 finance tools and no legacy envelope mutators", () => {
   const names = buildMcpToolSpecs().map((spec) => spec.name);
   assert.equal(names.includes("interpret_pending_transactions"), true);
+  assert.equal(names.includes("get_counterparty_balance"), true);
   assert.equal(names.includes("search_transaction_emails"), true);
   assert.equal(names.includes("post_agent_message"), true);
   assert.equal(names.includes("get_envelope"), false);
@@ -1795,6 +1961,10 @@ test("Violet is required to query raw storage for recent transaction questions",
     prompt,
     /daily allowance, weekly\/period allowance, flex spend, challenge progress, or remaining flex budget, call get_flex_budget_status/
   );
+  assert.match(prompt, /call get_counterparty_balance immediately before answering/);
+  assert.match(prompt, /person-to-person payment is a standalone event, not an invoice allocation/);
+  assert.match(prompt, /Never blame the user's phrasing/);
+  assert.doesNotMatch(prompt, /slightly witty/);
   db.close();
 });
 
