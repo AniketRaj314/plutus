@@ -11,7 +11,9 @@ const {
   aggregateEnvelopeEntries,
   createCommitment,
   createEnvelopeEntry,
+  createFlexBudgetPlan,
   createReceivable,
+  getFlexBudgetStatus,
   getActiveSalaryProfile,
   insertRawTransaction,
   listCommitments,
@@ -21,6 +23,7 @@ const {
   listUninterpretedTransactions,
   recordConfirmedCreditAllocation,
   setContextFact,
+  setFlexBudgetClassification,
   updateCommitment,
   updateReceivable,
 } = require("../src/db/v2-queries");
@@ -795,6 +798,16 @@ test("non-card activity routes to the salary period mechanically", () => {
 
 test("automatic inference persists a deterministic card cycle and is idempotent", async () => {
   const db = makeDb();
+  const plan = createFlexBudgetPlan(db, {
+    label: "Inference flex plan",
+    start_date: "2026-07-21",
+    end_date: "2026-08-20",
+    total_target_inr: 10000,
+    created_by: "test",
+    periods: [
+      { label: "Cycle", start_date: "2026-07-21", end_date: "2026-08-20", target_inr: 10000 },
+    ],
+  });
   const raw = insertTestTransaction(db, {
     source: "amex",
     amount: 1000,
@@ -805,7 +818,10 @@ test("automatic inference persists a deterministic card cycle and is idempotent"
   let calls = 0;
   const generate = async () => {
     calls++;
-    return inferenceProposal();
+    return inferenceProposal({
+      flex_classification: "flex",
+      flex_reason: "Discretionary personal purchase",
+    });
   };
 
   const first = await inferRawTransaction(db, raw.id, { generate });
@@ -820,6 +836,10 @@ test("automatic inference persists a deterministic card cycle and is idempotent"
   assert.equal(second.entry.id, first.entry.id);
   assert.equal(calls, 1);
   assert.equal(aggregateEnvelopeEntries(db, { funding_month: "2026-09" }).personal_impact, 1000);
+  const flex = getFlexBudgetStatus(db, { plan_id: plan.id, as_of: "2026-07-21" });
+  assert.equal(flex.exact, true);
+  assert.equal(flex.plan_spent_inr, 1000);
+  assert.equal(flex.transactions[0].classification, "flex");
   db.close();
 });
 
@@ -1370,6 +1390,243 @@ test("Telegram reply linkage remains stable because raw and legacy ids are ident
   db.close();
 });
 
+test("flex budget status reproduces daily slices, split shares, and period rollover deterministically", () => {
+  const db = makeDb();
+  const plan = createFlexBudgetPlan(db, {
+    label: "₹45k flex challenge",
+    start_date: "2026-07-23",
+    end_date: "2026-08-20",
+    total_target_inr: 45000,
+    daily_mode: "equal_slice",
+    release_balance_on_last_day: true,
+    policy_notes: "Fixed commitments stay outside flex. Discretionary splits count at personal share.",
+    created_by: "telegram_user",
+    periods: [
+      { label: "23–26 Jul stub", start_date: "2026-07-23", end_date: "2026-07-26", target_inr: 6000 },
+      { label: "27 Jul–2 Aug", start_date: "2026-07-27", end_date: "2026-08-02", target_inr: 11000 },
+      { label: "3–9 Aug", start_date: "2026-08-03", end_date: "2026-08-09", target_inr: 11000 },
+      { label: "10–16 Aug", start_date: "2026-08-10", end_date: "2026-08-16", target_inr: 11000 },
+      { label: "17–20 Aug stub", start_date: "2026-08-17", end_date: "2026-08-20", target_inr: 6000 },
+    ],
+  });
+
+  function add(data) {
+    const transaction = insertTestTransaction(db, {
+      source: data.source || "amex",
+      amount: data.gross,
+      merchant_raw: data.merchant,
+      datetime: `${data.date}T12:00:00+05:30`,
+      currency: "INR",
+    });
+    const entry = createEnvelopeEntry(db, {
+      raw_transaction_id: transaction.id,
+      funding_month: "2026-09",
+      occurred_at: transaction.datetime,
+      source: transaction.source,
+      merchant_clean: data.merchant,
+      category: data.category || "Other",
+      treatment: data.treatment || "normal",
+      state: "actual",
+      gross_amount_inr: data.gross,
+      personal_impact: data.personal,
+      cashflow_impact: data.gross,
+      receivable_amount: Math.max(0, data.gross - data.personal),
+      created_by: "test",
+    });
+    setFlexBudgetClassification(db, {
+      plan_id: plan.id,
+      raw_transaction_id: transaction.id,
+      classification: data.classification,
+      rationale: data.reason || "test decision",
+      confidence: 1,
+      created_by: "test",
+    });
+    return { transaction, entry };
+  }
+
+  add({ date: "2026-07-23", merchant: "Instamart", gross: 765, personal: 765, classification: "flex" });
+  add({
+    date: "2026-07-23",
+    merchant: "Anthropic",
+    gross: 2277,
+    personal: 2277,
+    treatment: "committed",
+    classification: "fixed",
+  });
+  add({ date: "2026-07-24", merchant: "Bistro", gross: 326, personal: 326, classification: "flex" });
+  add({ date: "2026-07-24", merchant: "Swiggy lunch", gross: 634, personal: 634, classification: "flex" });
+  const grocery = add({
+    date: "2026-07-24",
+    merchant: "Instamart groceries",
+    gross: 335,
+    personal: 335,
+    classification: "flex",
+  });
+
+  const friday = getFlexBudgetStatus(db, { plan_id: plan.id, as_of: "2026-07-24" });
+  assert.equal(friday.exact, true);
+  assert.equal(friday.plan_spent_inr, 2060);
+  assert.equal(friday.current_period.spent_inr, 2060);
+  assert.equal(friday.current_period.remaining_inr, 3940);
+  assert.equal(friday.today.nominal_target_inr, 1500);
+  assert.equal(friday.today.spent_inr, 1295);
+  assert.equal(friday.today.remaining_inr, 205);
+
+  const fridayAlert = formatV2Transaction(grocery.transaction, {
+    status: "interpreted",
+    entry: grocery.entry,
+    flex_budget: friday,
+  });
+  assert.match(fridayAlert, /Flex left: ₹205 today · ₹3,940 23–26 Jul stub/);
+
+  const sundayBeforeMoreSpend = getFlexBudgetStatus(db, {
+    plan_id: plan.id,
+    as_of: "2026-07-26",
+  });
+  assert.equal(sundayBeforeMoreSpend.today.is_period_last_day, true);
+  assert.equal(sundayBeforeMoreSpend.today.remaining_inr, 3940);
+
+  add({
+    date: "2026-07-24",
+    merchant: "Bloom Hotels",
+    gross: 3816.87,
+    personal: 1908.44,
+    treatment: "split",
+    classification: "flex",
+  });
+  add({
+    date: "2026-07-24",
+    merchant: "BookMyShow",
+    gross: 6589.84,
+    personal: 3294.92,
+    treatment: "split",
+    classification: "flex",
+  });
+  add({
+    date: "2026-07-25",
+    merchant: "New Topin Town",
+    gross: 199,
+    personal: 199,
+    source: "bobcard",
+    classification: "flex",
+  });
+
+  const sunday = getFlexBudgetStatus(db, { plan_id: plan.id, as_of: "2026-07-26" });
+  assert.equal(sunday.plan_spent_inr, 7462.36);
+  assert.equal(sunday.current_period.remaining_inr, -1462.36);
+  assert.equal(sunday.current_period.available_inr, 0);
+  assert.equal(sunday.today.remaining_inr, 0);
+  assert.equal(sunday.periods[1].adjusted_target_inr, 9537.64);
+  assert.equal(sunday.periods[2].adjusted_target_inr, 11000);
+  assert.equal(sunday.plan_remaining_inr, 37537.64);
+
+  insertTestTransaction(db, {
+    source: "amex",
+    amount: 599,
+    merchant_raw: "HAMLEYS",
+    datetime: "2026-07-25T14:40:00+05:30",
+    currency: "INR",
+  });
+  const incomplete = getFlexBudgetStatus(db, { plan_id: plan.id, as_of: "2026-07-26" });
+  assert.equal(incomplete.exact, false);
+  assert.equal(incomplete.unresolved.length, 1);
+  assert.equal(incomplete.unresolved[0].reason, "awaiting_interpretation");
+  db.close();
+});
+
+test("flex budget plans reject gaps and target drift", () => {
+  const db = makeDb();
+  assert.throws(
+    () =>
+      createFlexBudgetPlan(db, {
+        label: "Broken plan",
+        start_date: "2026-07-23",
+        end_date: "2026-07-26",
+        total_target_inr: 6000,
+        created_by: "test",
+        periods: [
+          { label: "Gap", start_date: "2026-07-24", end_date: "2026-07-26", target_inr: 5000 },
+        ],
+      }),
+    /ordered, contiguous/
+  );
+  assert.throws(
+    () =>
+      createFlexBudgetPlan(db, {
+        label: "Bad total",
+        start_date: "2026-07-23",
+        end_date: "2026-07-26",
+        total_target_inr: 6000,
+        created_by: "test",
+        periods: [
+          { label: "Stub", start_date: "2026-07-23", end_date: "2026-07-26", target_inr: 5999 },
+        ],
+      }),
+    /add up/
+  );
+  db.close();
+});
+
+test("revising a flex budget preserves existing AI classifications", () => {
+  const db = makeDb();
+  const original = createFlexBudgetPlan(db, {
+    label: "₹40k plan",
+    start_date: "2026-07-23",
+    end_date: "2026-07-26",
+    total_target_inr: 40000,
+    created_by: "telegram_user",
+    periods: [
+      { label: "Stub", start_date: "2026-07-23", end_date: "2026-07-26", target_inr: 40000 },
+    ],
+  });
+  const raw = insertTestTransaction(db, {
+    source: "amex",
+    amount: 765,
+    merchant_raw: "INSTAMART",
+    datetime: "2026-07-23T12:00:00+05:30",
+    currency: "INR",
+  });
+  createEnvelopeEntry(db, {
+    raw_transaction_id: raw.id,
+    funding_month: "2026-09",
+    occurred_at: raw.datetime,
+    source: raw.source,
+    treatment: "normal",
+    gross_amount_inr: 765,
+    personal_impact: 765,
+    cashflow_impact: 765,
+    created_by: "test",
+  });
+  setFlexBudgetClassification(db, {
+    plan_id: original.id,
+    raw_transaction_id: raw.id,
+    classification: "flex",
+    rationale: "Groceries belong to this challenge",
+    created_by: "test",
+  });
+
+  const revised = createFlexBudgetPlan(db, {
+    label: "₹45k plan",
+    start_date: "2026-07-23",
+    end_date: "2026-07-26",
+    total_target_inr: 45000,
+    created_by: "telegram_user",
+    supersedes_id: original.id,
+    periods: [
+      { label: "Stub", start_date: "2026-07-23", end_date: "2026-07-26", target_inr: 45000 },
+    ],
+  });
+  const status = getFlexBudgetStatus(db, { plan_id: revised.id, as_of: "2026-07-23" });
+  assert.equal(status.exact, true);
+  assert.equal(status.plan_spent_inr, 765);
+  assert.equal(status.transactions[0].classification, "flex");
+  assert.equal(
+    db.prepare("SELECT status, replaced_by_id FROM flex_budget_plans WHERE id = ?").get(original.id).status,
+    "superseded"
+  );
+  db.close();
+});
+
 test("all v2 MCP tools are registered for external agents", () => {
   const expected = [
     "create_raw_transaction",
@@ -1385,6 +1642,11 @@ test("all v2 MCP tools are registered for external agents", () => {
     "list_envelope_entries",
     "get_spend_month_summary",
     "get_funding_summary",
+    "create_flex_budget_plan",
+    "list_flex_budget_plans",
+    "get_active_flex_budget_plan",
+    "set_flex_budget_classification",
+    "get_flex_budget_status",
     "set_context_fact",
     "list_context_facts",
     "create_receivable",
@@ -1529,6 +1791,10 @@ test("Violet is required to query raw storage for recent transaction questions",
   const db = makeDb();
   const prompt = buildSystemPrompt(db);
   assert.match(prompt, /latest, newest, recent, or missing transaction, always call get_raw_transactions/);
+  assert.match(
+    prompt,
+    /daily allowance, weekly\/period allowance, flex spend, challenge progress, or remaining flex budget, call get_flex_budget_status/
+  );
   db.close();
 });
 

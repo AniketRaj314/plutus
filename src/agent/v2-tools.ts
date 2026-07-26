@@ -5,17 +5,22 @@ import {
   aggregateEnvelopeEntries,
   createCommitment,
   createEnvelopeEntry,
+  createFlexBudgetPlan,
   createReceivable,
+  getActiveFlexBudgetPlan,
   getActiveSalaryProfile,
+  getFlexBudgetStatus,
   getRawTransaction,
   insertRawTransaction,
   listCommitments,
   listContextFacts,
   listEnvelopeEntries,
+  listFlexBudgetPlans,
   listReceivables,
   listRawTransactions,
   listUninterpretedTransactions,
   recordConfirmedCreditAllocation,
+  setFlexBudgetClassification,
   setContextFact,
   updateCommitment,
   updateReceivable,
@@ -23,6 +28,9 @@ import {
   type CommitmentStatus,
   type ContextScope,
   type EnvelopeEntryState,
+  type FlexBudgetClassification,
+  type FlexBudgetDailyMode,
+  type FlexBudgetPlanStatus,
   type LedgerGroupBy,
   type ReceivableStatus,
   type TransactionDirection,
@@ -44,6 +52,9 @@ const CONTEXT_SCOPES: ContextScope[] = ["global", "merchant", "transaction", "ca
 const RECEIVABLE_STATES: ReceivableStatus[] = ["pending", "partial", "received", "written_off"];
 const COMMITMENT_STATES: CommitmentStatus[] = ["active", "paused", "completed", "cancelled"];
 const TRANSACTION_DIRECTIONS: TransactionDirection[] = ["debit", "credit"];
+const FLEX_BUDGET_CLASSIFICATIONS: FlexBudgetClassification[] = ["flex", "fixed", "excluded"];
+const FLEX_BUDGET_PLAN_STATES: FlexBudgetPlanStatus[] = ["active", "completed", "cancelled", "superseded"];
+const FLEX_BUDGET_DAILY_MODES: FlexBudgetDailyMode[] = ["equal_slice", "period_pool"];
 
 function resolvedInrAmount(transaction: NonNullable<ReturnType<typeof getRawTransaction>>): number {
   if (transaction.is_international) return transaction.amount_inr ?? 0;
@@ -414,6 +425,150 @@ export const v2Tools: V2ToolDefinition[] = [
         funding_month: args.funding_month as string,
         source: args.source as string | undefined,
         group_by: args.group_by as LedgerGroupBy | undefined,
+      }),
+  },
+  {
+    name: "create_flex_budget_plan",
+    description:
+      "Persist an AI/user-chosen flex-spending challenge and its exact date buckets. The service validates the schedule and target sum but does not decide the budget or which spending is discretionary. Use supersedes_id to revise a plan without losing history.",
+    parameters: {
+      type: "object",
+      properties: {
+        label: { type: "string" },
+        start_date: { type: "string", description: "YYYY-MM-DD in Asia/Kolkata" },
+        end_date: { type: "string", description: "YYYY-MM-DD in Asia/Kolkata" },
+        total_target_inr: { type: "number" },
+        timezone: { type: "string", enum: ["Asia/Kolkata"] },
+        daily_mode: {
+          type: "string",
+          enum: FLEX_BUDGET_DAILY_MODES,
+          description:
+            "equal_slice gives each ordinary day an equal nominal slice; period_pool makes the whole current period balance available daily.",
+        },
+        release_balance_on_last_day: {
+          type: "boolean",
+          description: "When true, the final day can use all money still left in its period.",
+        },
+        policy_notes: {
+          type: "string",
+          description: "Natural-language policy chosen with the user; agents use it when classifying transactions.",
+        },
+        created_by: { type: "string" },
+        supersedes_id: { type: "string" },
+        periods: {
+          type: "array",
+          items: {
+            type: "object",
+            properties: {
+              label: { type: "string" },
+              start_date: { type: "string" },
+              end_date: { type: "string" },
+              target_inr: { type: "number" },
+            },
+            required: ["label", "start_date", "end_date", "target_inr"],
+          },
+        },
+      },
+      required: ["label", "start_date", "end_date", "total_target_inr", "periods", "created_by"],
+    },
+    handler: (db, args) =>
+      createFlexBudgetPlan(db, {
+        label: args.label as string,
+        start_date: args.start_date as string,
+        end_date: args.end_date as string,
+        total_target_inr: args.total_target_inr as number,
+        timezone: args.timezone as string | undefined,
+        daily_mode: args.daily_mode as FlexBudgetDailyMode | undefined,
+        release_balance_on_last_day: args.release_balance_on_last_day as boolean | undefined,
+        policy_notes: args.policy_notes as string | undefined,
+        created_by: args.created_by as string,
+        supersedes_id: args.supersedes_id as string | undefined,
+        periods: args.periods as Array<{
+          label: string;
+          start_date: string;
+          end_date: string;
+          target_inr: number;
+        }>,
+      }),
+  },
+  {
+    name: "list_flex_budget_plans",
+    description:
+      "List persisted flex-spending plans and their exact periods. Use on_date to find plans covering a date.",
+    parameters: {
+      type: "object",
+      properties: {
+        status: { type: "string", enum: FLEX_BUDGET_PLAN_STATES },
+        on_date: { type: "string", description: "YYYY-MM-DD in Asia/Kolkata" },
+      },
+      required: [],
+    },
+    handler: (db, args) =>
+      listFlexBudgetPlans(db, {
+        status: args.status as FlexBudgetPlanStatus | undefined,
+        on_date: args.on_date as string | undefined,
+      }),
+  },
+  {
+    name: "get_active_flex_budget_plan",
+    description:
+      "Return the active flex-spending plan covering a date, including its AI/user-authored policy and period schedule.",
+    parameters: {
+      type: "object",
+      properties: {
+        on_date: { type: "string", description: "YYYY-MM-DD in Asia/Kolkata; defaults to today" },
+      },
+      required: [],
+    },
+    handler: (db, args) =>
+      getActiveFlexBudgetPlan(db, args.on_date as string | undefined) ?? {
+        error: "no active flex budget plan found for this date",
+      },
+  },
+  {
+    name: "set_flex_budget_classification",
+    description:
+      "Persist the AI/user decision for how one interpreted transaction affects a flex plan: flex spends its personal share, fixed stays outside the flex challenge, and excluded has no flex impact. Use impact_override_inr only when the flex amount intentionally differs from stored personal_impact.",
+    parameters: {
+      type: "object",
+      properties: {
+        plan_id: { type: "string" },
+        raw_transaction_id: { type: "string" },
+        classification: { type: "string", enum: FLEX_BUDGET_CLASSIFICATIONS },
+        impact_override_inr: { type: ["number", "null"] },
+        rationale: { type: "string" },
+        confidence: { type: "number" },
+        created_by: { type: "string" },
+      },
+      required: ["plan_id", "raw_transaction_id", "classification", "created_by"],
+    },
+    handler: (db, args) =>
+      setFlexBudgetClassification(db, {
+        plan_id: args.plan_id as string,
+        raw_transaction_id: args.raw_transaction_id as string,
+        classification: args.classification as FlexBudgetClassification,
+        impact_override_inr: args.impact_override_inr as number | null | undefined,
+        rationale: args.rationale as string | undefined,
+        confidence: args.confidence as number | undefined,
+        created_by: args.created_by as string,
+      }),
+  },
+  {
+    name: "get_flex_budget_status",
+    description:
+      "Canonical deterministic source for daily, weekly/period, and total flex-budget questions. It sums only AI/user-classified flex transactions using their active personal impact, exposes unresolved rows, carries completed-period variance forward, and applies the stored daily policy.",
+    parameters: {
+      type: "object",
+      properties: {
+        plan_id: { type: "string" },
+        as_of: { type: "string", description: "YYYY-MM-DD in Asia/Kolkata; defaults to today" },
+      },
+      required: [],
+    },
+    handler: (db, args) =>
+      getFlexBudgetStatus(db, {
+        plan_id: args.plan_id as string | undefined,
+        as_of: args.as_of as string | undefined,
       }),
   },
   {

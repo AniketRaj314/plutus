@@ -10,6 +10,8 @@ import {
 } from "../db/queries";
 import {
   getActiveSalaryProfile,
+  getActiveFlexBudgetPlan,
+  getFlexBudgetStatus,
   listCommitments,
   listContextFacts,
   listReceivables,
@@ -76,6 +78,26 @@ export function buildSystemPrompt(db: Database.Database): string {
     }
   });
   const uninterpreted = listUninterpretedTransactions(db, { limit: 20 });
+  const todayDate = todayIst().toISOString().slice(0, 10);
+  const activeFlexPlan = getActiveFlexBudgetPlan(db, todayDate);
+  const flexStatus = activeFlexPlan
+    ? getFlexBudgetStatus(db, { plan_id: activeFlexPlan.id, as_of: todayDate })
+    : undefined;
+  const flexStatusSummary =
+    flexStatus && "plan" in flexStatus
+      ? {
+          plan_id: flexStatus.plan.id,
+          label: flexStatus.plan.label,
+          window: `${flexStatus.plan.start_date} → ${flexStatus.plan.end_date}`,
+          total_target_inr: flexStatus.plan.total_target_inr,
+          policy_notes: flexStatus.plan.policy_notes,
+          current_period: flexStatus.current_period,
+          today: flexStatus.today,
+          plan_spent_inr: flexStatus.plan_spent_inr,
+          plan_remaining_inr: flexStatus.plan_remaining_inr,
+          unresolved: flexStatus.unresolved,
+        }
+      : null;
 
   const weekRemaining = (envelope?.current_week_budget ?? 0) - (envelope?.current_week_spent ?? 0);
 
@@ -176,6 +198,9 @@ ${pendingCreditProposalLines}
 V2 SHARED CONTEXT:
 ${v2ContextLines}
 
+ACTIVE FLEX BUDGET (deterministic snapshot; use the tool again before answering):
+${flexStatusSummary ? JSON.stringify(flexStatusSummary) : "(none)"}
+
 LEGACY ENVELOPE STATE (migration-only; do not use for new recommendations when v2 entries exist):
 - Monthly spendable: ₹${envelope?.monthly_spendable ?? 0}
 - Committed this month: ₹${envelope?.committed_total ?? 0}
@@ -220,7 +245,13 @@ RULES:
 - For questions such as "how much did I spend in July?", "July spend", or the monthly ₹1,20,000 envelope, always call get_spend_month_summary. Its canonical definition is: card entries belong to the month their statement cycle ends; IDFC savings/UPI entries belong to their IST occurrence month; stored personal_impact supplies the financial treatment. Do not substitute get_funding_summary for this question.
 - For questions about the latest, newest, recent, or missing transaction, always call get_raw_transactions with the relevant source/date filters before answering. Never infer transaction freshness from chat history or previously sent Telegram notifications.
 - Use get_funding_summary only when the user asks which salary funds an obligation, what a salary must settle, or another cash-funding question.
-- Weekly budget recommendations are your responsibility: query get_spend_month_summary for the current spending month plus relevant entries/commitments, then reason in the response. The backend only stores facts and returns deterministic sums.
+- A flex budget is a separate user-authored discretionary challenge, not the ₹1,20,000 monthly spending envelope. Create/revise its exact schedule with create_flex_budget_plan.
+- You decide whether a transaction is flex, fixed, or excluded and persist that decision with set_flex_budget_classification. Do not infer the answer from a treatment name alone: a split can be flex at personal share, while a committed charge is usually fixed and a reimbursement is usually excluded.
+- For every question about daily allowance, weekly/period allowance, flex spend, challenge progress, or remaining flex budget, call get_flex_budget_status immediately before answering. Never calculate it from chat history, the legacy envelope, or get_spend_month_summary.
+- If get_flex_budget_status reports unresolved rows, do not present its totals as exact. Use raw/clean context to classify them when the evidence is sufficient; otherwise name the unresolved transactions and ask one concise question.
+- When an active flex plan covers a newly discussed transaction, persist its flex classification after interpreting or correcting the transaction, then query get_flex_budget_status. User corrections can change this classification later.
+- Respect the plan's stored daily_mode and final-day release policy. Do not relabel a daily average as today's remaining allowance.
+- Transaction alerts under an active flex plan should report the canonical today and current-period remaining amounts returned by get_flex_budget_status.
 - Credit card bill payments are settlements of already-tracked card transactions. Never count them as new spend.
 - When user says 'that transaction' or 'that last one', check recent agent_messages for which transaction was just discussed.
 - International transactions remain uninterpreted until their final INR amount is known. Persist the confirmed INR amount as transaction-scoped context, then create the clean envelope entry with the confirmed gross/personal/cash-flow values.

@@ -7,6 +7,9 @@ export type ContextScope = "global" | "merchant" | "transaction" | "card" | "per
 export type ReceivableStatus = "pending" | "partial" | "received" | "written_off";
 export type CommitmentStatus = "active" | "paused" | "completed" | "cancelled";
 export type TransactionDirection = "debit" | "credit";
+export type FlexBudgetPlanStatus = "active" | "completed" | "cancelled" | "superseded";
+export type FlexBudgetClassification = "flex" | "fixed" | "excluded";
+export type FlexBudgetDailyMode = "equal_slice" | "period_pool";
 
 export interface SalaryProfile {
   id: string;
@@ -174,6 +177,85 @@ export interface Commitment {
   created_by: string;
   created_at: string;
   updated_at: string;
+}
+
+export interface FlexBudgetPlan {
+  id: string;
+  label: string;
+  start_date: string;
+  end_date: string;
+  total_target_inr: number;
+  timezone: string;
+  daily_mode: FlexBudgetDailyMode;
+  release_balance_on_last_day: number;
+  policy_notes: string | null;
+  status: FlexBudgetPlanStatus;
+  created_by: string;
+  supersedes_id: string | null;
+  superseded_at: string | null;
+  replaced_by_id: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface FlexBudgetPeriod {
+  id: string;
+  plan_id: string;
+  sequence: number;
+  label: string;
+  start_date: string;
+  end_date: string;
+  target_inr: number;
+  created_at: string;
+}
+
+export interface FlexBudgetClassificationRecord {
+  id: string;
+  plan_id: string;
+  raw_transaction_id: string;
+  classification: FlexBudgetClassification;
+  impact_override_inr: number | null;
+  rationale: string | null;
+  confidence: number | null;
+  created_by: string;
+  supersedes_id: string | null;
+  superseded_at: string | null;
+  replaced_by_id: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface FlexBudgetPlanWithPeriods extends FlexBudgetPlan {
+  periods: FlexBudgetPeriod[];
+}
+
+export interface CreateFlexBudgetPlanInput {
+  label: string;
+  start_date: string;
+  end_date: string;
+  total_target_inr: number;
+  timezone?: string;
+  daily_mode?: FlexBudgetDailyMode;
+  release_balance_on_last_day?: boolean;
+  policy_notes?: string;
+  created_by: string;
+  supersedes_id?: string;
+  periods: Array<{
+    label: string;
+    start_date: string;
+    end_date: string;
+    target_inr: number;
+  }>;
+}
+
+export interface SetFlexBudgetClassificationInput {
+  plan_id: string;
+  raw_transaction_id: string;
+  classification: FlexBudgetClassification;
+  impact_override_inr?: number | null;
+  rationale?: string;
+  confidence?: number;
+  created_by: string;
 }
 
 function assertFundingMonth(value: string): void {
@@ -1094,4 +1176,533 @@ export function listCommitments(
   }
   const where = clauses.length ? `WHERE ${clauses.join(" AND ")}` : "";
   return db.prepare(`SELECT * FROM commitments ${where} ORDER BY label ASC`).all(params) as Commitment[];
+}
+
+function assertDateOnly(label: string, value: string): void {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(value) || Number.isNaN(new Date(`${value}T00:00:00Z`).getTime())) {
+    throw new Error(`${label} must be YYYY-MM-DD`);
+  }
+}
+
+function addDays(dateOnly: string, days: number): string {
+  const date = new Date(`${dateOnly}T00:00:00Z`);
+  date.setUTCDate(date.getUTCDate() + days);
+  return date.toISOString().slice(0, 10);
+}
+
+function daysInclusive(startDate: string, endDate: string): number {
+  return Math.round(
+    (new Date(`${endDate}T00:00:00Z`).getTime() - new Date(`${startDate}T00:00:00Z`).getTime()) /
+      (24 * 60 * 60 * 1000)
+  ) + 1;
+}
+
+function roundMoney(value: number): number {
+  return Math.round((value + Number.EPSILON) * 100) / 100;
+}
+
+function todayDateInIst(now = new Date()): string {
+  return new Date(now.getTime() + 5.5 * 60 * 60 * 1000).toISOString().slice(0, 10);
+}
+
+export function getFlexBudgetPlan(
+  db: Database.Database,
+  id: string
+): FlexBudgetPlanWithPeriods | undefined {
+  const plan = db.prepare("SELECT * FROM flex_budget_plans WHERE id = ?").get(id) as
+    | FlexBudgetPlan
+    | undefined;
+  if (!plan) return undefined;
+  const periods = db
+    .prepare("SELECT * FROM flex_budget_periods WHERE plan_id = ? ORDER BY sequence ASC")
+    .all(id) as FlexBudgetPeriod[];
+  return { ...plan, periods };
+}
+
+export function listFlexBudgetPlans(
+  db: Database.Database,
+  filters: { status?: FlexBudgetPlanStatus; on_date?: string } = {}
+): FlexBudgetPlanWithPeriods[] {
+  const clauses: string[] = [];
+  const params: Record<string, unknown> = {};
+  if (filters.status) {
+    clauses.push("status = @status");
+    params.status = filters.status;
+  }
+  if (filters.on_date) {
+    assertDateOnly("on_date", filters.on_date);
+    clauses.push("start_date <= @on_date AND end_date >= @on_date");
+    params.on_date = filters.on_date;
+  }
+  const where = clauses.length ? `WHERE ${clauses.join(" AND ")}` : "";
+  const plans = db
+    .prepare(`SELECT * FROM flex_budget_plans ${where} ORDER BY created_at DESC`)
+    .all(params) as FlexBudgetPlan[];
+  return plans.map((plan) => getFlexBudgetPlan(db, plan.id) as FlexBudgetPlanWithPeriods);
+}
+
+export function getActiveFlexBudgetPlan(
+  db: Database.Database,
+  onDate = todayDateInIst()
+): FlexBudgetPlanWithPeriods | undefined {
+  return listFlexBudgetPlans(db, { status: "active", on_date: onDate })[0];
+}
+
+export function createFlexBudgetPlan(
+  db: Database.Database,
+  input: CreateFlexBudgetPlanInput
+): FlexBudgetPlanWithPeriods {
+  assertDateOnly("start_date", input.start_date);
+  assertDateOnly("end_date", input.end_date);
+  if (input.end_date < input.start_date) throw new Error("end_date must be on or after start_date");
+  if (!Number.isFinite(input.total_target_inr) || input.total_target_inr < 0) {
+    throw new Error("total_target_inr must be non-negative");
+  }
+  if ((input.timezone ?? "Asia/Kolkata") !== "Asia/Kolkata") {
+    throw new Error("only Asia/Kolkata is currently supported");
+  }
+  if (input.periods.length === 0) throw new Error("at least one flex budget period is required");
+  const overlapping = db
+    .prepare(
+      `SELECT id FROM flex_budget_plans
+       WHERE status = 'active'
+         AND start_date <= @end_date
+         AND end_date >= @start_date
+       ORDER BY created_at DESC
+       LIMIT 1`
+    )
+    .get({ start_date: input.start_date, end_date: input.end_date }) as { id: string } | undefined;
+  if (overlapping && overlapping.id !== input.supersedes_id) {
+    throw new Error(
+      `active flex budget plan ${overlapping.id} overlaps this window; revise it with supersedes_id`
+    );
+  }
+
+  const periods = input.periods.map((period) => ({ ...period }));
+  let expectedStart = input.start_date;
+  let targetSum = 0;
+  for (const [index, period] of periods.entries()) {
+    assertDateOnly(`periods[${index}].start_date`, period.start_date);
+    assertDateOnly(`periods[${index}].end_date`, period.end_date);
+    if (period.start_date !== expectedStart) {
+      throw new Error("flex budget periods must be ordered, contiguous, and cover the plan");
+    }
+    if (period.end_date < period.start_date || period.end_date > input.end_date) {
+      throw new Error("flex budget period dates must fall within the plan");
+    }
+    if (!Number.isFinite(period.target_inr) || period.target_inr < 0) {
+      throw new Error("period target_inr must be non-negative");
+    }
+    targetSum += period.target_inr;
+    expectedStart = addDays(period.end_date, 1);
+  }
+  if (periods[periods.length - 1].end_date !== input.end_date) {
+    throw new Error("flex budget periods must cover the plan end date");
+  }
+  if (Math.abs(targetSum - input.total_target_inr) > 0.01) {
+    throw new Error("period targets must add up to total_target_inr");
+  }
+
+  return db.transaction(() => {
+    const id = newId();
+    let replaced: FlexBudgetPlan | undefined;
+    if (input.supersedes_id) {
+      replaced = db.prepare("SELECT * FROM flex_budget_plans WHERE id = ?").get(input.supersedes_id) as
+        | FlexBudgetPlan
+        | undefined;
+      if (!replaced) throw new Error(`flex budget plan ${input.supersedes_id} not found`);
+      if (replaced.status !== "active") throw new Error("only an active flex budget plan can be superseded");
+      db.prepare(
+        `UPDATE flex_budget_plans
+         SET status = 'superseded', superseded_at = datetime('now'), updated_at = datetime('now')
+         WHERE id = ?`
+      ).run(replaced.id);
+    }
+
+    db.prepare(
+      `INSERT INTO flex_budget_plans (
+        id, label, start_date, end_date, total_target_inr, timezone, daily_mode,
+        release_balance_on_last_day, policy_notes, status, created_by, supersedes_id
+      ) VALUES (
+        @id, @label, @start_date, @end_date, @total_target_inr, @timezone, @daily_mode,
+        @release_balance_on_last_day, @policy_notes, 'active', @created_by, @supersedes_id
+      )`
+    ).run({
+      id,
+      label: input.label,
+      start_date: input.start_date,
+      end_date: input.end_date,
+      total_target_inr: input.total_target_inr,
+      timezone: input.timezone ?? "Asia/Kolkata",
+      daily_mode: input.daily_mode ?? "equal_slice",
+      release_balance_on_last_day: input.release_balance_on_last_day === false ? 0 : 1,
+      policy_notes: input.policy_notes ?? null,
+      created_by: input.created_by,
+      supersedes_id: input.supersedes_id ?? null,
+    });
+
+    const insertPeriod = db.prepare(
+      `INSERT INTO flex_budget_periods (
+        id, plan_id, sequence, label, start_date, end_date, target_inr
+      ) VALUES (
+        @id, @plan_id, @sequence, @label, @start_date, @end_date, @target_inr
+      )`
+    );
+    periods.forEach((period, sequence) => {
+      insertPeriod.run({ id: newId(), plan_id: id, sequence, ...period });
+    });
+    if (replaced) {
+      const inherited = db
+        .prepare(
+          `SELECT c.*
+           FROM flex_budget_classifications c
+           JOIN raw_transactions r ON r.id = c.raw_transaction_id
+           WHERE c.plan_id = @replaced_plan_id
+             AND c.superseded_at IS NULL
+             AND date(datetime(r.occurred_at, '+5 hours', '+30 minutes'))
+               BETWEEN @start_date AND @end_date`
+        )
+        .all({
+          replaced_plan_id: replaced.id,
+          start_date: input.start_date,
+          end_date: input.end_date,
+        }) as FlexBudgetClassificationRecord[];
+      const insertClassification = db.prepare(
+        `INSERT INTO flex_budget_classifications (
+          id, plan_id, raw_transaction_id, classification, impact_override_inr,
+          rationale, confidence, created_by
+        ) VALUES (
+          @id, @plan_id, @raw_transaction_id, @classification, @impact_override_inr,
+          @rationale, @confidence, @created_by
+        )`
+      );
+      inherited.forEach((classification) => {
+        insertClassification.run({
+          id: newId(),
+          plan_id: id,
+          raw_transaction_id: classification.raw_transaction_id,
+          classification: classification.classification,
+          impact_override_inr: classification.impact_override_inr,
+          rationale: classification.rationale,
+          confidence: classification.confidence,
+          created_by: classification.created_by,
+        });
+      });
+      db.prepare("UPDATE flex_budget_plans SET replaced_by_id = ? WHERE id = ?").run(id, replaced.id);
+    }
+    return getFlexBudgetPlan(db, id) as FlexBudgetPlanWithPeriods;
+  })();
+}
+
+export function setFlexBudgetClassification(
+  db: Database.Database,
+  input: SetFlexBudgetClassificationInput
+): FlexBudgetClassificationRecord {
+  assertConfidence(input.confidence);
+  assertFiniteMoney("impact_override_inr", input.impact_override_inr ?? undefined);
+  const plan = getFlexBudgetPlan(db, input.plan_id);
+  if (!plan) throw new Error(`flex budget plan ${input.plan_id} not found`);
+  const raw = getRawTransaction(db, input.raw_transaction_id);
+  if (!raw) throw new Error(`raw transaction ${input.raw_transaction_id} not found`);
+  const rawDate = db
+    .prepare(
+      `SELECT date(datetime(occurred_at, '+5 hours', '+30 minutes')) AS occurred_date
+       FROM raw_transactions WHERE id = ?`
+    )
+    .get(input.raw_transaction_id) as { occurred_date: string };
+  if (rawDate.occurred_date < plan.start_date || rawDate.occurred_date > plan.end_date) {
+    throw new Error("transaction falls outside the flex budget plan");
+  }
+
+  return db.transaction(() => {
+    const existing = db
+      .prepare(
+        `SELECT * FROM flex_budget_classifications
+         WHERE plan_id = ? AND raw_transaction_id = ? AND superseded_at IS NULL`
+      )
+      .get(input.plan_id, input.raw_transaction_id) as FlexBudgetClassificationRecord | undefined;
+    const id = newId();
+    if (existing) {
+      db.prepare(
+        `UPDATE flex_budget_classifications
+         SET superseded_at = datetime('now'), updated_at = datetime('now')
+         WHERE id = ?`
+      ).run(existing.id);
+    }
+    db.prepare(
+      `INSERT INTO flex_budget_classifications (
+        id, plan_id, raw_transaction_id, classification, impact_override_inr,
+        rationale, confidence, created_by, supersedes_id
+      ) VALUES (
+        @id, @plan_id, @raw_transaction_id, @classification, @impact_override_inr,
+        @rationale, @confidence, @created_by, @supersedes_id
+      )`
+    ).run({
+      id,
+      plan_id: input.plan_id,
+      raw_transaction_id: input.raw_transaction_id,
+      classification: input.classification,
+      impact_override_inr: input.impact_override_inr ?? null,
+      rationale: input.rationale ?? null,
+      confidence: input.confidence ?? null,
+      created_by: input.created_by,
+      supersedes_id: existing?.id ?? null,
+    });
+    if (existing) {
+      db.prepare("UPDATE flex_budget_classifications SET replaced_by_id = ? WHERE id = ?").run(id, existing.id);
+    }
+    return db.prepare("SELECT * FROM flex_budget_classifications WHERE id = ?").get(id) as
+      FlexBudgetClassificationRecord;
+  })();
+}
+
+interface FlexBudgetLedgerRow {
+  raw_transaction_id: string;
+  occurred_at: string;
+  occurred_date: string;
+  source: string;
+  merchant_raw: string | null;
+  direction: TransactionDirection;
+  envelope_entry_id: string | null;
+  merchant_clean: string | null;
+  category: string | null;
+  treatment: string | null;
+  state: EnvelopeEntryState | null;
+  personal_impact: number | null;
+  classification_id: string | null;
+  classification: FlexBudgetClassification | null;
+  impact_override_inr: number | null;
+  rationale: string | null;
+}
+
+export interface FlexBudgetStatus {
+  as_of: string;
+  exact: boolean;
+  plan: FlexBudgetPlanWithPeriods;
+  plan_spent_inr: number;
+  plan_remaining_inr: number;
+  current_period: null | {
+    id: string;
+    label: string;
+    start_date: string;
+    end_date: string;
+    nominal_target_inr: number;
+    carry_in_inr: number;
+    effective_target_inr: number;
+    spent_inr: number;
+    remaining_inr: number;
+    available_inr: number;
+  };
+  today: null | {
+    date: string;
+    nominal_target_inr: number;
+    spent_inr: number;
+    remaining_inr: number;
+    is_period_last_day: boolean;
+  };
+  periods: Array<{
+    id: string;
+    label: string;
+    start_date: string;
+    end_date: string;
+    nominal_target_inr: number;
+    adjusted_target_inr: number;
+    spent_inr: number;
+    remaining_inr: number;
+  }>;
+  transactions: Array<{
+    raw_transaction_id: string;
+    occurred_at: string;
+    occurred_date: string;
+    source: string;
+    merchant: string;
+    treatment: string | null;
+    classification: FlexBudgetClassification;
+    personal_impact_inr: number;
+    flex_impact_inr: number;
+    rationale: string | null;
+  }>;
+  unresolved: Array<{
+    raw_transaction_id: string;
+    occurred_at: string;
+    source: string;
+    merchant: string;
+    reason: "awaiting_interpretation" | "awaiting_flex_classification";
+  }>;
+}
+
+export function getFlexBudgetStatus(
+  db: Database.Database,
+  input: { plan_id?: string; as_of?: string } = {}
+): FlexBudgetStatus | { error: string } {
+  const asOf = input.as_of ?? todayDateInIst();
+  assertDateOnly("as_of", asOf);
+  const plan = input.plan_id
+    ? getFlexBudgetPlan(db, input.plan_id)
+    : getActiveFlexBudgetPlan(db, asOf);
+  if (!plan) return { error: "no flex budget plan found for this date" };
+
+  const rows = db
+    .prepare(
+      `SELECT
+        r.id AS raw_transaction_id,
+        r.occurred_at,
+        date(datetime(r.occurred_at, '+5 hours', '+30 minutes')) AS occurred_date,
+        r.source,
+        r.merchant_raw,
+        r.direction,
+        e.id AS envelope_entry_id,
+        e.merchant_clean,
+        e.category,
+        e.treatment,
+        e.state,
+        e.personal_impact,
+        c.id AS classification_id,
+        c.classification,
+        c.impact_override_inr,
+        c.rationale
+       FROM raw_transactions r
+       LEFT JOIN envelope_entries e
+         ON e.raw_transaction_id = r.id AND e.superseded_at IS NULL
+       LEFT JOIN flex_budget_classifications c
+         ON c.plan_id = @plan_id
+        AND c.raw_transaction_id = r.id
+        AND c.superseded_at IS NULL
+       WHERE date(datetime(r.occurred_at, '+5 hours', '+30 minutes'))
+         BETWEEN @start_date AND @end_date
+       ORDER BY r.occurred_at ASC`
+    )
+    .all({ plan_id: plan.id, start_date: plan.start_date, end_date: plan.end_date }) as FlexBudgetLedgerRow[];
+
+  const consideredRows = rows.filter((row) => row.occurred_date <= asOf);
+  const resolvedRows = consideredRows.filter(
+    (row) => row.envelope_entry_id && row.classification_id && row.state !== "cancelled"
+  );
+  const transactions = resolvedRows.map((row) => {
+    const personalImpact = row.personal_impact ?? 0;
+    const flexImpact = roundMoney(
+      row.classification === "flex"
+        ? row.impact_override_inr ?? personalImpact
+        : 0
+    );
+    return {
+      raw_transaction_id: row.raw_transaction_id,
+      occurred_at: row.occurred_at,
+      occurred_date: row.occurred_date,
+      source: row.source,
+      merchant: row.merchant_clean ?? row.merchant_raw ?? "Unknown",
+      treatment: row.treatment,
+      classification: row.classification as FlexBudgetClassification,
+      personal_impact_inr: personalImpact,
+      flex_impact_inr: flexImpact,
+      rationale: row.rationale,
+    };
+  });
+  const unresolved = consideredRows
+    .filter((row) => !row.envelope_entry_id || !row.classification_id)
+    .map((row) => ({
+      raw_transaction_id: row.raw_transaction_id,
+      occurred_at: row.occurred_at,
+      source: row.source,
+      merchant: row.merchant_clean ?? row.merchant_raw ?? "Unknown",
+      reason: (row.envelope_entry_id
+        ? "awaiting_flex_classification"
+        : "awaiting_interpretation") as "awaiting_interpretation" | "awaiting_flex_classification",
+    }));
+
+  const spentForRange = (startDate: string, endDate: string): number =>
+    roundMoney(
+      transactions
+        .filter((row) => row.occurred_date >= startDate && row.occurred_date <= endDate)
+        .reduce((sum, row) => sum + row.flex_impact_inr, 0)
+    );
+
+  let completedCarry = 0;
+  const periodStatuses = plan.periods.map((period) => {
+    const spent = spentForRange(period.start_date, period.end_date < asOf ? period.end_date : asOf);
+    const isPast = period.end_date < asOf;
+    const isCurrent = period.start_date <= asOf && period.end_date >= asOf;
+    const adjustedTarget = roundMoney(period.target_inr + completedCarry);
+    const remaining = roundMoney(adjustedTarget - spent);
+    if (isPast) {
+      completedCarry = remaining;
+    } else if (isCurrent && remaining < 0) {
+      completedCarry = remaining;
+    } else if (!isCurrent) {
+      completedCarry = 0;
+    }
+    return {
+      id: period.id,
+      label: period.label,
+      start_date: period.start_date,
+      end_date: period.end_date,
+      nominal_target_inr: period.target_inr,
+      adjusted_target_inr: adjustedTarget,
+      spent_inr: spent,
+      remaining_inr: remaining,
+    };
+  });
+
+  const currentIndex = plan.periods.findIndex(
+    (period) => period.start_date <= asOf && period.end_date >= asOf
+  );
+  const currentPeriod = currentIndex >= 0 ? plan.periods[currentIndex] : undefined;
+  const currentPeriodStatus = currentIndex >= 0 ? periodStatuses[currentIndex] : undefined;
+  const priorNominal = currentIndex > 0
+    ? plan.periods.slice(0, currentIndex).reduce((sum, period) => sum + period.target_inr, 0)
+    : 0;
+  const priorSpent = currentIndex > 0
+    ? spentForRange(plan.start_date, addDays(currentPeriod?.start_date ?? plan.start_date, -1))
+    : 0;
+  const carryIn = roundMoney(priorNominal - priorSpent);
+  const effectiveTarget = currentPeriod ? roundMoney(currentPeriod.target_inr + carryIn) : 0;
+  const currentSpent = currentPeriod
+    ? spentForRange(currentPeriod.start_date, asOf)
+    : 0;
+  const currentRemaining = roundMoney(effectiveTarget - currentSpent);
+  const todaySpent = spentForRange(asOf, asOf);
+  const isLastDay = currentPeriod?.end_date === asOf;
+  const nominalDailyTarget = currentPeriod
+    ? roundMoney(currentPeriod.target_inr / daysInclusive(currentPeriod.start_date, currentPeriod.end_date))
+    : 0;
+  const dailyAvailable =
+    plan.daily_mode === "period_pool" || (plan.release_balance_on_last_day && isLastDay)
+      ? Math.max(0, currentRemaining)
+      : Math.max(0, roundMoney(nominalDailyTarget - todaySpent));
+  const planSpent = spentForRange(plan.start_date, asOf);
+
+  return {
+    as_of: asOf,
+    exact: unresolved.length === 0,
+    plan,
+    plan_spent_inr: planSpent,
+    plan_remaining_inr: roundMoney(plan.total_target_inr - planSpent),
+    current_period:
+      currentPeriod && currentPeriodStatus
+        ? {
+            id: currentPeriod.id,
+            label: currentPeriod.label,
+            start_date: currentPeriod.start_date,
+            end_date: currentPeriod.end_date,
+            nominal_target_inr: currentPeriod.target_inr,
+            carry_in_inr: carryIn,
+            effective_target_inr: effectiveTarget,
+            spent_inr: currentSpent,
+            remaining_inr: currentRemaining,
+            available_inr: Math.max(0, currentRemaining),
+          }
+        : null,
+    today: currentPeriod
+      ? {
+          date: asOf,
+          nominal_target_inr: nominalDailyTarget,
+          spent_inr: todaySpent,
+          remaining_inr: dailyAvailable,
+          is_period_last_day: Boolean(isLastDay),
+        }
+      : null,
+    periods: periodStatuses,
+    transactions,
+    unresolved,
+  };
 }

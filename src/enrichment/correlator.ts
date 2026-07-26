@@ -12,7 +12,11 @@ import { editMessage, getMessageIdForTransaction } from "../telegram/bot";
 import { formatV2Transaction } from "../telegram/formatter";
 import { getProcessedIds, saveProcessedIds } from "../gmail/poller";
 import { CATEGORIES } from "./gpt";
-import { aggregateSpendMonth, getSpendMonthForEntry } from "../db/v2-queries";
+import {
+  aggregateSpendMonth,
+  getFlexBudgetStatus,
+  getSpendMonthForEntry,
+} from "../db/v2-queries";
 import {
   inferRawTransaction,
   isAutoInferenceEnabled,
@@ -276,11 +280,19 @@ async function updateTelegramMessage(
 
   const spendMonth = inference.entry ? getSpendMonthForEntry(inference.entry) : null;
   const summary = spendMonth ? aggregateSpendMonth(db, { spend_month: spendMonth }) : undefined;
+  const transactionDateIst = new Date(
+    new Date(transaction.datetime ?? Date.now()).getTime() + 5.5 * 60 * 60 * 1000
+  )
+    .toISOString()
+    .slice(0, 10);
+  const flexResult = getFlexBudgetStatus(db, { as_of: transactionDateIst });
+  const flexBudget = "plan" in flexResult ? flexResult : undefined;
   const text = formatV2Transaction(transaction, {
     status: inference.status,
     entry: inference.entry,
     spend_month: spendMonth ?? undefined,
     spend_month_remaining: summary?.personal_remaining,
+    flex_budget: flexBudget,
     question: inference.question,
   });
   await editMessage(messageId, text);
