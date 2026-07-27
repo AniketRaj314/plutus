@@ -557,7 +557,7 @@ export const v2Tools: V2ToolDefinition[] = [
   {
     name: "get_flex_budget_status",
     description:
-      "Canonical deterministic source for daily, weekly/period, and total flex-budget questions. It sums only AI/user-classified flex transactions using their active personal impact, exposes unresolved rows, carries completed-period variance forward, and applies the stored daily policy.",
+      "Canonical deterministic source for daily, weekly/period, and total flex-budget questions. It sums only AI/user-classified flex transactions using their active personal impact, exposes unresolved rows, carries completed-period variance forward, and applies the stored daily policy. In equal_slice mode, today's effective target evenly divides the effective pool remaining before today across all remaining days.",
     parameters: {
       type: "object",
       properties: {
