@@ -6,6 +6,7 @@ import { registerWebhook } from "./telegram/bot";
 import { registerRoutes, registerApiRoutes } from "./api/routes";
 import { startCorrelator } from "./enrichment/correlator";
 import { startInferenceCron } from "./agent/inference";
+import { registerFrontendRoutes } from "./frontend";
 
 async function main() {
   console.log("Plutus starting...");
@@ -22,6 +23,7 @@ async function main() {
   startInferenceCron(db);
 
   const app = Fastify();
+  registerFrontendRoutes(app);
   registerRoutes(app, db);
   registerApiRoutes(app, db);
 
