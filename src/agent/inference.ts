@@ -179,10 +179,12 @@ Important rules:
 - Commitments are context, not automatic spend. This transaction is an actual event.
 - If context is insufficient to distinguish materially different financial treatments, choose needs_context and ask one short specific question.
 - Never invent a counterparty, reimbursement policy, split share, EMI amount, or settlement state.
+- A direct debit to a named person is not evidence that the person owes the user. Never create a receivable from the counterparty name or open-receivable history alone; ask for context unless persisted evidence establishes that the user covered a specific expense for them.
 - raw.direction is immutable evidence. For an incoming credit, reason whether it could be a receivable repayment, refund, salary, self-transfer, gift, surplus, or something else.
-- If a credit plausibly settles open receivables, do not close them automatically. Return needs_context with a concise confirmation question and proposed credit_allocations covering the full credit.
+- If a non-personal credit plausibly settles company/business receivables, do not close them automatically. Return needs_context with a concise confirmation question and proposed credit_allocations covering the full credit.
 - Matching is AI judgment: use counterparty text, amount, timing, open receivables, and context. Exact equality is not required; explicitly handle partial, combined, and surplus amounts.
 - A proposed surplus may use a semantic kind such as unallocated_surplus with receivable_id=null. Repayments and confirmed surplus do not become personal spending or extra envelope allowance.
+- For an incoming credit from a named friend or family member, do not propose invoice-level allocations among personal receivables. Ask only whether the transfer belongs on the balance with that person, and return credit_allocations as []. The Telegram agent will record a standalone counterparty_transfer fact after confirmation. Invoice-level credit_allocations are reserved for company/business reimbursements or an explicit user request to match particular items.
 - When flex_budget_plan is present, classify the transaction for that plan. "flex" means discretionary spending that consumes the challenge using its stored personal share; "fixed" means a planned/committed cost outside the challenge; "excluded" means reimbursements, bookkeeping, pass-throughs, or other activity that does not consume the challenge. This is semantic AI judgment—use the supplied plan policy and context, never merchant-name rules.
 - Split spending can be flex: its flex impact will come from personal_impact, not the gross charge.
 - If there is no flex_budget_plan, return flex_classification and flex_reason as null.

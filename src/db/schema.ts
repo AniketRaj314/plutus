@@ -418,10 +418,12 @@ function backfillContextFacts(db: Database.Database): void {
 
 function seedCanonicalContextFacts(db: Database.Database): void {
   const monthlySpendingDefinition = JSON.stringify({
-    definition_version: 1,
+    definition_version: 2,
     metric: "monthly_spending_envelope",
     card_rule: "include active entries whose card_cycle_end month equals the requested spend month",
     idfc_upi_rule: "include active entries whose occurred_at month in Asia/Kolkata equals the requested spend month",
+    manual_rule:
+      "include explicit user-reported purchase events whose occurred_at month in Asia/Kolkata equals the requested spend month",
     impact_field: "personal_impact",
     monthly_limit_source: "active salary profile",
     excludes_via_zero_impact: ["settlement", "bookkeeping", "pass-through"],
@@ -434,6 +436,11 @@ function seedCanonicalContextFacts(db: Database.Database): void {
       'system_monthly_spending_definition_v1', 'global', '',
       'monthly_spending_envelope_definition', ?, 'system', 1
     )`
+  ).run(monthlySpendingDefinition);
+  db.prepare(
+    `UPDATE context_facts
+     SET value = ?
+     WHERE id = 'system_monthly_spending_definition_v1' AND source = 'system'`
   ).run(monthlySpendingDefinition);
 }
 

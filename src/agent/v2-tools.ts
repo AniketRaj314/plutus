@@ -9,6 +9,7 @@ import {
   createReceivable,
   getActiveFlexBudgetPlan,
   getActiveSalaryProfile,
+  getCounterpartyBalance,
   getFlexBudgetStatus,
   getRawTransaction,
   insertRawTransaction,
@@ -46,7 +47,7 @@ interface V2ToolDefinition {
 }
 
 const CARD_SOURCES = ["amex", "bobcard", "idfc_cc", "icici_cc"];
-const ALL_SOURCES = [...CARD_SOURCES, "idfc_upi"];
+const ALL_SOURCES = [...CARD_SOURCES, "idfc_upi", "manual"];
 const ENTRY_STATES: EnvelopeEntryState[] = ["forecast", "actual", "settled", "cancelled"];
 const CONTEXT_SCOPES: ContextScope[] = ["global", "merchant", "transaction", "card", "person"];
 const RECEIVABLE_STATES: ReceivableStatus[] = ["pending", "partial", "received", "written_off"];
@@ -95,7 +96,7 @@ export const v2Tools: V2ToolDefinition[] = [
   {
     name: "create_raw_transaction",
     description:
-      "Store one immutable bank/card fact without applying financial meaning. Duplicate raw_email_id values are idempotent.",
+      "Store one immutable transaction event without applying financial meaning. Sources may be bank/card evidence or an explicit user-reported manual event. Duplicate raw_email_id values are idempotent.",
     parameters: {
       type: "object",
       properties: {
@@ -137,7 +138,7 @@ export const v2Tools: V2ToolDefinition[] = [
   {
     name: "bulk_create_raw_transactions",
     description:
-      "Store immutable raw statement facts in one call. Rows are independent; one failure does not abort the rest and no envelope logic runs.",
+      "Store immutable transaction evidence in one call, including statement facts or explicit user-reported manual events. Rows are independent; one failure does not abort the rest and no envelope logic runs.",
     parameters: {
       type: "object",
       properties: {
@@ -202,7 +203,7 @@ export const v2Tools: V2ToolDefinition[] = [
   },
   {
     name: "get_raw_transactions",
-    description: "Read immutable bank/card evidence without financial interpretation.",
+    description: "Read immutable transaction evidence without financial interpretation.",
     parameters: {
       type: "object",
       properties: {
@@ -689,9 +690,34 @@ export const v2Tools: V2ToolDefinition[] = [
       }),
   },
   {
+    name: "get_counterparty_balance",
+    description:
+      "Canonical deterministic source for questions about what one person owes the user, what the user owes them, and the net balance. Returns original shared expenses, standalone payments, manual off-account obligations, uncertain items, both subtotals, and the net without allocating payments across invoices.",
+    parameters: {
+      type: "object",
+      properties: {
+        counterparty: { type: "string" },
+        since: {
+          type: "string",
+          description: "Optional inclusive YYYY-MM-DD start date.",
+        },
+        until: {
+          type: "string",
+          description: "Optional inclusive YYYY-MM-DD end date.",
+        },
+      },
+      required: ["counterparty"],
+    },
+    handler: (db, args) =>
+      getCounterpartyBalance(db, args.counterparty as string, {
+        since: args.since as string | undefined,
+        until: args.until as string | undefined,
+      }),
+  },
+  {
     name: "record_confirmed_credit_allocation",
     description:
-      "After the user explicitly confirms how an incoming credit should be understood, atomically allocate it, update any referenced receivables, store a zero/nonzero personal impact chosen by the agent, and retain the allocation as shared transaction context. Never call before confirmation.",
+      "After the user explicitly confirms an invoice-level allocation for a company/business reimbursement or specifically requests itemized personal matching, atomically allocate an incoming credit and update referenced receivables. Do not use this by default for friends or family; record their payment as a standalone counterparty_transfer context fact instead.",
     parameters: {
       type: "object",
       properties: {
