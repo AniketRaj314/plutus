@@ -1827,6 +1827,8 @@ export interface FlexBudgetStatus {
   today: null | {
     date: string;
     nominal_target_inr: number;
+    effective_target_inr: number;
+    days_remaining_in_period: number;
     spent_inr: number;
     remaining_inr: number;
     is_period_last_day: boolean;
@@ -1996,10 +1998,24 @@ export function getFlexBudgetStatus(
   const nominalDailyTarget = currentPeriod
     ? roundMoney(currentPeriod.target_inr / daysInclusive(currentPeriod.start_date, currentPeriod.end_date))
     : 0;
+  const periodSpentBeforeToday = currentPeriod
+    ? spentForRange(currentPeriod.start_date, addDays(asOf, -1))
+    : 0;
+  const periodAvailableBeforeToday = roundMoney(effectiveTarget - periodSpentBeforeToday);
+  const daysRemainingInPeriod = currentPeriod
+    ? daysInclusive(asOf, currentPeriod.end_date)
+    : 0;
+  const effectiveDailyTarget =
+    currentPeriod && daysRemainingInPeriod > 0
+      ? roundMoney(Math.max(0, periodAvailableBeforeToday) / daysRemainingInPeriod)
+      : 0;
   const dailyAvailable =
     plan.daily_mode === "period_pool" || (plan.release_balance_on_last_day && isLastDay)
       ? Math.max(0, currentRemaining)
-      : Math.max(0, roundMoney(nominalDailyTarget - todaySpent));
+      : Math.max(
+          0,
+          Math.min(currentRemaining, roundMoney(effectiveDailyTarget - todaySpent))
+        );
   const planSpent = spentForRange(plan.start_date, asOf);
 
   return {
@@ -2027,6 +2043,8 @@ export function getFlexBudgetStatus(
       ? {
           date: asOf,
           nominal_target_inr: nominalDailyTarget,
+          effective_target_inr: effectiveDailyTarget,
+          days_remaining_in_period: daysRemainingInPeriod,
           spent_inr: todaySpent,
           remaining_inr: dailyAvailable,
           is_period_last_day: Boolean(isLastDay),

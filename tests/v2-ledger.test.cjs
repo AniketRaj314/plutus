@@ -1774,15 +1774,17 @@ test("flex budget status reproduces daily slices, split shares, and period rollo
   assert.equal(friday.current_period.spent_inr, 2060);
   assert.equal(friday.current_period.remaining_inr, 3940);
   assert.equal(friday.today.nominal_target_inr, 1500);
+  assert.equal(friday.today.effective_target_inr, 1745);
+  assert.equal(friday.today.days_remaining_in_period, 3);
   assert.equal(friday.today.spent_inr, 1295);
-  assert.equal(friday.today.remaining_inr, 205);
+  assert.equal(friday.today.remaining_inr, 450);
 
   const fridayAlert = formatV2Transaction(grocery.transaction, {
     status: "interpreted",
     entry: grocery.entry,
     flex_budget: friday,
   });
-  assert.match(fridayAlert, /Flex left: ₹205 today · ₹3,940 23–26 Jul stub/);
+  assert.match(fridayAlert, /Flex left: ₹450 today · ₹3,940 23–26 Jul stub/);
 
   const sundayBeforeMoreSpend = getFlexBudgetStatus(db, {
     plan_id: plan.id,
@@ -1836,6 +1838,99 @@ test("flex budget status reproduces daily slices, split shares, and period rollo
   assert.equal(incomplete.exact, false);
   assert.equal(incomplete.unresolved.length, 1);
   assert.equal(incomplete.unresolved[0].reason, "awaiting_interpretation");
+  db.close();
+});
+
+test("equal-slice daily allowance uses the carry-adjusted pool and rebalances each day", () => {
+  const db = makeDb();
+  const plan = createFlexBudgetPlan(db, {
+    label: "Carry-adjusted flex challenge",
+    start_date: "2026-07-23",
+    end_date: "2026-08-02",
+    total_target_inr: 17000,
+    daily_mode: "equal_slice",
+    release_balance_on_last_day: true,
+    created_by: "test",
+    periods: [
+      {
+        label: "23–26 Jul stub",
+        start_date: "2026-07-23",
+        end_date: "2026-07-26",
+        target_inr: 6000,
+      },
+      {
+        label: "27 Jul–2 Aug",
+        start_date: "2026-07-27",
+        end_date: "2026-08-02",
+        target_inr: 11000,
+      },
+    ],
+  });
+
+  function addFlexSpend(date, amount, merchant) {
+    const raw = insertTestTransaction(db, {
+      source: "amex",
+      amount,
+      merchant_raw: merchant,
+      datetime: `${date}T12:00:00+05:30`,
+      currency: "INR",
+    });
+    createEnvelopeEntry(db, {
+      raw_transaction_id: raw.id,
+      funding_month: "2026-09",
+      occurred_at: raw.datetime,
+      source: raw.source,
+      merchant_clean: merchant,
+      treatment: "normal",
+      gross_amount_inr: amount,
+      personal_impact: amount,
+      cashflow_impact: amount,
+      created_by: "test",
+    });
+    setFlexBudgetClassification(db, {
+      plan_id: plan.id,
+      raw_transaction_id: raw.id,
+      classification: "flex",
+      rationale: "test spend",
+      created_by: "test",
+    });
+  }
+
+  addFlexSpend("2026-07-26", 12665.03, "Prior-period overspend");
+
+  const mondayOpening = getFlexBudgetStatus(db, {
+    plan_id: plan.id,
+    as_of: "2026-07-27",
+  });
+  assert.equal(mondayOpening.current_period.nominal_target_inr, 11000);
+  assert.equal(mondayOpening.current_period.carry_in_inr, -6665.03);
+  assert.equal(mondayOpening.current_period.effective_target_inr, 4334.97);
+  assert.equal(mondayOpening.current_period.available_inr, 4334.97);
+  assert.equal(mondayOpening.today.nominal_target_inr, 1571.43);
+  assert.equal(mondayOpening.today.effective_target_inr, 619.28);
+  assert.equal(mondayOpening.today.days_remaining_in_period, 7);
+  assert.equal(mondayOpening.today.spent_inr, 0);
+  assert.equal(mondayOpening.today.remaining_inr, 619.28);
+
+  addFlexSpend("2026-07-27", 300, "Monday spend");
+  const mondayAfterSpend = getFlexBudgetStatus(db, {
+    plan_id: plan.id,
+    as_of: "2026-07-27",
+  });
+  assert.equal(mondayAfterSpend.today.effective_target_inr, 619.28);
+  assert.equal(mondayAfterSpend.today.spent_inr, 300);
+  assert.equal(mondayAfterSpend.today.remaining_inr, 319.28);
+  assert.equal(mondayAfterSpend.current_period.available_inr, 4034.97);
+
+  const tuesdayOpening = getFlexBudgetStatus(db, {
+    plan_id: plan.id,
+    as_of: "2026-07-28",
+  });
+  assert.equal(tuesdayOpening.today.days_remaining_in_period, 6);
+  assert.equal(tuesdayOpening.today.effective_target_inr, 672.5);
+  assert.equal(tuesdayOpening.today.spent_inr, 0);
+  assert.equal(tuesdayOpening.today.remaining_inr, 672.5);
+  assert.equal(tuesdayOpening.current_period.available_inr, 4034.97);
   db.close();
 });
 
@@ -2106,6 +2201,8 @@ test("Violet is required to query raw storage for recent transaction questions",
     prompt,
     /daily allowance, weekly\/period allowance, flex spend, challenge progress, or remaining flex budget, call get_flex_budget_status/
   );
+  assert.match(prompt, /today\.effective_target_inr is the dynamically rebalanced allowance/);
+  assert.match(prompt, /today\.nominal_target_inr is only the plan's original pace/);
   assert.match(prompt, /call get_counterparty_balance immediately before answering/);
   assert.match(prompt, /person-to-person payment is a standalone event, not an invoice allocation/);
   assert.match(prompt, /source=manual raw transaction for the reported purchase event/);
