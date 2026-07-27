@@ -445,6 +445,7 @@ export function isLikelyTransactionAlert(message: gmail_v1.Schema$Message): bool
     return subject.includes("payment update on your bobcard one credit card");
   }
   if (from.includes("noreply@idfcfirstbank.com")) {
+    if (subject.includes("payment due reminder")) return false;
     return (
       subject.includes("idfc first credit card") ||
       subject.includes("transaction reversal") ||

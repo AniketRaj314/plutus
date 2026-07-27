@@ -1909,12 +1909,16 @@ export function getFlexBudgetStatus(
 
   const consideredRows = rows.filter((row) => row.occurred_date <= asOf);
   const resolvedRows = consideredRows.filter(
-    (row) => row.envelope_entry_id && row.classification_id && row.state !== "cancelled"
+    (row) =>
+      row.envelope_entry_id &&
+      (row.classification_id || row.personal_impact === 0) &&
+      row.state !== "cancelled"
   );
   const transactions = resolvedRows.map((row) => {
     const personalImpact = row.personal_impact ?? 0;
+    const classification = row.classification ?? "excluded";
     const flexImpact = roundMoney(
-      row.classification === "flex"
+      classification === "flex"
         ? row.impact_override_inr ?? personalImpact
         : 0
     );
@@ -1925,14 +1929,22 @@ export function getFlexBudgetStatus(
       source: row.source,
       merchant: row.merchant_clean ?? row.merchant_raw ?? "Unknown",
       treatment: row.treatment,
-      classification: row.classification as FlexBudgetClassification,
+      classification,
       personal_impact_inr: personalImpact,
       flex_impact_inr: flexImpact,
-      rationale: row.rationale,
+      rationale:
+        row.rationale ??
+        (row.classification_id
+          ? null
+          : "Automatically excluded because the transaction has zero personal impact."),
     };
   });
   const unresolved = consideredRows
-    .filter((row) => !row.envelope_entry_id || !row.classification_id)
+    .filter(
+      (row) =>
+        !row.envelope_entry_id ||
+        (!row.classification_id && row.personal_impact !== 0)
+    )
     .map((row) => ({
       raw_transaction_id: row.raw_transaction_id,
       occurred_at: row.occurred_at,
