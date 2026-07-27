@@ -435,11 +435,22 @@ test("Gmail distinguishes ignored mail from an unparseable likely transaction al
       ],
     },
   };
+  const idfcPaymentReminder = {
+    id: "idfc-payment-due-reminder",
+    payload: {
+      headers: [
+        { name: "From", value: "<noreply@idfcfirstbank.com>" },
+        { name: "Subject", value: "IDFC FIRST Credit Card - Payment due reminder" },
+      ],
+    },
+  };
 
   assert.equal(isLikelyTransactionAlert(unparseable), true);
   assert.equal(await processMessage(db, unparseable), "unparseable");
   assert.equal(isLikelyTransactionAlert(informational), false);
   assert.equal(await processMessage(db, informational), "ignored");
+  assert.equal(isLikelyTransactionAlert(idfcPaymentReminder), false);
+  assert.equal(await processMessage(db, idfcPaymentReminder), "ignored");
   db.close();
 });
 
@@ -1931,6 +1942,55 @@ test("equal-slice daily allowance uses the carry-adjusted pool and rebalances ea
   assert.equal(tuesdayOpening.today.spent_inr, 0);
   assert.equal(tuesdayOpening.today.remaining_inr, 672.5);
   assert.equal(tuesdayOpening.current_period.available_inr, 4034.97);
+  db.close();
+});
+
+test("zero-impact interpreted transactions do not make flex status inexact", () => {
+  const db = makeDb();
+  const plan = createFlexBudgetPlan(db, {
+    label: "Zero-impact settlement plan",
+    start_date: "2026-07-24",
+    end_date: "2026-07-25",
+    total_target_inr: 2000,
+    created_by: "test",
+    periods: [
+      {
+        label: "Current period",
+        start_date: "2026-07-24",
+        end_date: "2026-07-25",
+        target_inr: 2000,
+      },
+    ],
+  });
+  const settlement = insertRawTransaction(db, {
+    source: "idfc_upi",
+    amount: 2500,
+    amount_inr: 2500,
+    merchant_raw: "NISHIDHA",
+    occurred_at: "2026-07-24T12:00:00+05:30",
+    direction: "credit",
+  });
+  createEnvelopeEntry(db, {
+    raw_transaction_id: settlement.id,
+    funding_month: "2026-07",
+    occurred_at: settlement.occurred_at,
+    source: "idfc_upi",
+    merchant_clean: "Nishidha",
+    treatment: "settlement",
+    gross_amount_inr: 2500,
+    personal_impact: 0,
+    cashflow_impact: -2500,
+    created_by: "telegram_user",
+  });
+
+  const status = getFlexBudgetStatus(db, { plan_id: plan.id, as_of: "2026-07-24" });
+  assert.equal(status.exact, true);
+  assert.equal(status.unresolved.length, 0);
+  assert.equal(status.plan_spent_inr, 0);
+  assert.equal(status.transactions.length, 1);
+  assert.equal(status.transactions[0].classification, "excluded");
+  assert.equal(status.transactions[0].flex_impact_inr, 0);
+  assert.match(status.transactions[0].rationale, /zero personal impact/i);
   db.close();
 });
 
