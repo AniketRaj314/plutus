@@ -29,7 +29,7 @@ html {
 
 body {
   margin: 0;
-  min-width: 320px;
+  min-width: 0;
   color: var(--ink);
   background: var(--ivory);
   font-family: var(--sans);
@@ -680,7 +680,8 @@ button {
 }
 
 .origin-byline {
-  display: flex;
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
   align-items: center;
   gap: 14px;
   max-width: 850px;
@@ -713,7 +714,7 @@ button {
   object-fit: cover;
 }
 
-.origin-byline > div:nth-child(2) {
+.origin-byline > div {
   display: flex;
   flex-direction: column;
   gap: 4px;
@@ -728,8 +729,7 @@ button {
   font-size: 0.73rem;
 }
 
-.origin-byline a {
-  margin-left: auto;
+.origin-byline .builder-link {
   color: var(--violet);
   font-size: 0.78rem;
   font-weight: 750;
@@ -1987,12 +1987,13 @@ button {
   }
 
   .origin-byline {
-    flex-wrap: wrap;
+    grid-template-columns: auto minmax(0, 1fr);
   }
 
-  .origin-byline a {
-    width: 100%;
-    margin: 10px 0 0 59px;
+  .origin-byline .builder-link {
+    grid-column: 2;
+    width: fit-content;
+    margin-top: 4px;
   }
 
   .flow-grid,
