@@ -1,0 +1,577 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta
+      name="description"
+      content="Plutus is Aniket Raj's personal finance system: an automatic email-to-ledger engine, adaptive spending envelope, and Telegram companion named Violet."
+    />
+    <meta name="theme-color" content="#fff9f3" />
+    <meta property="og:type" content="website" />
+    <meta property="og:title" content="Plutus | Your money. Your rules." />
+    <meta
+      property="og:description"
+      content="Automatic transaction capture, a flexible spending system, and a warm finance companion named Violet."
+    />
+    <meta property="og:url" content="https://plutus.aniketraj.me/" />
+    <meta property="og:image" content="https://plutus.aniketraj.me/assets/plutus-og.png" />
+    <meta property="og:image:width" content="1659" />
+    <meta property="og:image:height" content="948" />
+    <meta property="og:image:alt" content="Plutus | Your money. Your rules. Violet keeps it in check." />
+    <meta name="twitter:card" content="summary_large_image" />
+    <meta name="twitter:title" content="Plutus | Your money. Your rules." />
+    <meta
+      name="twitter:description"
+      content="Automatic transaction capture, a flexible spending system, and a warm finance companion named Violet."
+    />
+    <meta name="twitter:image" content="https://plutus.aniketraj.me/assets/plutus-og.png" />
+    <link rel="canonical" href="https://plutus.aniketraj.me/" />
+    <link rel="preload" href="/assets/violet.jpg" as="image" />
+    <link rel="stylesheet" href="/assets/plutus.css" />
+    <script src="/assets/plutus.js" defer></script>
+    <title>Plutus | Your money. Your rules.</title>
+  </head>
+  <body>
+    <a class="skip-link" href="#main">Skip to content</a>
+
+    <header class="site-header" data-header>
+      <div class="shell nav-wrap">
+        <a class="brand" href="#top" aria-label="Plutus home">
+          <span class="brand-mark" aria-hidden="true">P</span>
+          <span>plutus</span>
+          <span class="brand-dot" aria-hidden="true"></span>
+        </a>
+
+        <button class="nav-toggle" type="button" aria-expanded="false" aria-controls="site-nav" data-nav-toggle>
+          <span></span>
+          <span></span>
+          <span class="sr-only">Toggle navigation</span>
+        </button>
+
+        <nav class="site-nav" id="site-nav" aria-label="Primary navigation" data-nav>
+          <a href="#story">The story</a>
+          <a href="#flow">How it works</a>
+          <a href="#demo">Chat demo</a>
+          <a href="#features">Features</a>
+          <a
+            class="nav-github"
+            href="https://github.com/AniketRaj314/plutus"
+            target="_blank"
+            rel="noreferrer"
+          >
+            GitHub <span aria-hidden="true">↗</span>
+          </a>
+        </nav>
+      </div>
+    </header>
+
+    <main id="main">
+      <section class="hero" id="top">
+        <div class="hero-glow hero-glow-one" aria-hidden="true"></div>
+        <div class="hero-glow hero-glow-two" aria-hidden="true"></div>
+        <div class="petal petal-one" aria-hidden="true"></div>
+        <div class="petal petal-two" aria-hidden="true"></div>
+        <div class="petal petal-three" aria-hidden="true"></div>
+
+        <div class="shell hero-grid">
+          <div class="hero-copy" data-reveal>
+            <p class="eyebrow"><span></span> A personal finance side project</p>
+            <h1>Your money.<br />Your rules.</h1>
+            <p class="hero-tagline">Violet keeps it in check.</p>
+            <p class="hero-description">
+              Plutus turns transaction alerts into a living ledger, shapes spending around your real life,
+              and talks it through with you on Telegram, without forcing you into someone else’s system.
+            </p>
+
+            <div class="hero-actions">
+              <a
+                class="button button-primary"
+                href="https://github.com/AniketRaj314/plutus"
+                target="_blank"
+                rel="noreferrer"
+              >
+                <span aria-hidden="true">⌘</span> View on GitHub
+              </a>
+              <a class="button button-quiet" href="#demo">
+                See Violet in action <span aria-hidden="true">↓</span>
+              </a>
+            </div>
+
+            <div class="hero-proof" aria-label="Plutus capabilities">
+              <div><strong>Automatic</strong><span>email → ledger</span></div>
+              <div><strong>Context-aware</strong><span>not category-only</span></div>
+              <div><strong>Conversational</strong><span>right inside Telegram</span></div>
+            </div>
+          </div>
+
+          <div class="hero-visual" data-reveal>
+            <div class="orbit orbit-one" aria-hidden="true"></div>
+            <div class="orbit orbit-two" aria-hidden="true"></div>
+
+            <figure class="violet-card">
+              <div class="violet-card-bar">
+                <div class="window-dots" aria-hidden="true"><i></i><i></i><i></i></div>
+                <span><b></b> Violet is online</span>
+              </div>
+              <img
+                src="/assets/violet.jpg"
+                alt="Violet, the purple-haired personal finance companion, standing outside VioletHQ"
+                width="640"
+                height="640"
+              />
+              <figcaption>
+                <span>Meet Violet</span>
+                <small>Part bookkeeper, part budget buddy.</small>
+              </figcaption>
+            </figure>
+
+            <div class="floating-card float-spend">
+              <span class="float-icon" aria-hidden="true">✦</span>
+              <div>
+                <small>Today’s flex</small>
+                <strong>₹1,284 left</strong>
+              </div>
+              <span class="float-good">on track</span>
+            </div>
+
+            <div class="floating-card float-capture">
+              <span class="capture-check" aria-hidden="true">✓</span>
+              <div>
+                <strong>Transaction understood</strong>
+                <small>Instamart · personal share saved</small>
+              </div>
+            </div>
+
+            <div class="coin coin-one" aria-hidden="true">₹</div>
+            <div class="coin coin-two" aria-hidden="true">P</div>
+          </div>
+        </div>
+      </section>
+
+      <section class="origin-section" id="story">
+        <div class="shell origin-grid">
+          <div class="section-label" data-reveal>
+            <span>01</span>
+            <p>Why Plutus exists</p>
+          </div>
+          <div class="origin-copy" data-reveal>
+            <blockquote>
+              “There are great finance apps out there. But I’m bad at finances, and instead of adopting
+              someone else’s system, I wanted to understand the problem by building my own.”
+            </blockquote>
+            <div class="origin-byline">
+              <a
+                class="aniket-avatar"
+                href="https://github.com/AniketRaj314"
+                target="_blank"
+                rel="noreferrer"
+                aria-label="Aniket Raj on GitHub"
+              >
+                <img
+                  src="https://avatars.githubusercontent.com/u/32848400?v=4"
+                  alt="Aniket Raj"
+                  width="48"
+                  height="48"
+                />
+              </a>
+              <div>
+                <strong>Aniket Raj</strong>
+                <span>Builder, learner, occasionally responsible adult</span>
+              </div>
+              <a href="https://aniketraj.me/" target="_blank" rel="noreferrer">
+                Meet the builder <span aria-hidden="true">↗</span>
+              </a>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <section class="flow-section" id="flow">
+        <div class="shell">
+          <div class="section-heading" data-reveal>
+            <p class="eyebrow"><span></span> One quiet loop</p>
+            <h2>From alert to actual understanding.</h2>
+            <p>
+              Plutus does more than collect expenses. It preserves the evidence, adds context, and keeps
+              the conversation open when real life refuses to fit a neat category.
+            </p>
+          </div>
+
+          <div class="flow-grid">
+            <article class="flow-card flow-inbox" data-reveal>
+              <div class="flow-number">01</div>
+              <div class="mini-mail" aria-hidden="true">
+                <span class="mail-sender">Transaction alert</span>
+                <strong>₹765.00 at INSTAMART</strong>
+                <span>Today · 8:41 PM</span>
+              </div>
+              <h3>Plutus notices.</h3>
+              <p>Transaction emails arrive automatically. Raw details stay intact as evidence.</p>
+            </article>
+
+            <article class="flow-card flow-brain" data-reveal>
+              <div class="flow-number">02</div>
+              <div class="meaning-stack" aria-hidden="true">
+                <span>Food &amp; home</span>
+                <span>Flex spend</span>
+                <span>₹383 personal</span>
+              </div>
+              <h3>Plutus understands.</h3>
+              <p>AI adds financial meaning: your share, funding month, commitments, refunds, and money owed.</p>
+            </article>
+
+            <article class="flow-card flow-chat" data-reveal>
+              <div class="flow-number">03</div>
+              <div class="mini-bubbles" aria-hidden="true">
+                <span>Half was for Riya.</span>
+                <span>Got it, your share is ₹383.</span>
+              </div>
+              <h3>Violet talks it through.</h3>
+              <p>Ask, correct, or add context in Telegram. Violet remembers the decision next time.</p>
+            </article>
+          </div>
+        </div>
+      </section>
+
+      <section class="demo-section" id="demo">
+        <div class="shell demo-grid">
+          <div class="demo-copy" data-reveal>
+            <p class="eyebrow eyebrow-light"><span></span> A chat, not a spreadsheet</p>
+            <h2>Money makes more sense when you can talk back.</h2>
+            <p>
+              These fictional conversations mirror real Plutus flows, from understanding a new purchase to
+              recalculating a flexible budget and untangling shared expenses.
+            </p>
+
+            <div class="demo-tabs" role="tablist" aria-label="Choose a Plutus conversation">
+              <button
+                class="demo-tab is-active"
+                type="button"
+                role="tab"
+                aria-selected="true"
+                aria-controls="demo-capture"
+                id="tab-capture"
+                data-demo-target="demo-capture"
+              >
+                <span>01</span> Capture
+              </button>
+              <button
+                class="demo-tab"
+                type="button"
+                role="tab"
+                aria-selected="false"
+                aria-controls="demo-flex"
+                id="tab-flex"
+                data-demo-target="demo-flex"
+              >
+                <span>02</span> Flex plan
+              </button>
+              <button
+                class="demo-tab"
+                type="button"
+                role="tab"
+                aria-selected="false"
+                aria-controls="demo-balance"
+                id="tab-balance"
+                data-demo-target="demo-balance"
+              >
+                <span>03</span> Shared balance
+              </button>
+            </div>
+          </div>
+
+          <div class="phone-wrap" data-reveal>
+            <div class="phone-halo" aria-hidden="true"></div>
+            <div class="phone">
+              <div class="phone-top">
+                <span class="phone-back" aria-hidden="true">‹</span>
+                <img src="/assets/violet.jpg" alt="" width="42" height="42" />
+                <div>
+                  <strong>Violet</strong>
+                  <span>your Plutus companion</span>
+                </div>
+                <span class="phone-menu" aria-hidden="true">•••</span>
+              </div>
+
+              <div
+                class="conversation is-active"
+                id="demo-capture"
+                role="tabpanel"
+                aria-labelledby="tab-capture"
+                data-demo-panel
+              >
+                <p class="chat-day">Today</p>
+                <div class="message message-violet">
+                  <span class="message-label">New transaction</span>
+                  <strong>₹765 · Instamart</strong>
+                  <span>Food &amp; home · Flex spend</span>
+                  <small>8:41 PM</small>
+                </div>
+                <div class="message message-violet">
+                  I counted ₹765 against today’s flex budget. You have <strong>₹1,284 left</strong>.
+                  <small>8:41 PM</small>
+                </div>
+                <div class="message message-user">
+                  Half was for Riya
+                  <small>8:43 PM</small>
+                </div>
+                <div class="message message-violet">
+                  Got it, your share is <strong>₹383</strong>. Riya owes you ₹382, and today’s flex is back
+                  to <strong>₹1,666</strong>.
+                  <small>8:43 PM</small>
+                </div>
+                <div class="context-pill"><span>✓</span> Context saved for this transaction</div>
+              </div>
+
+              <div
+                class="conversation"
+                id="demo-flex"
+                role="tabpanel"
+                aria-labelledby="tab-flex"
+                data-demo-panel
+                hidden
+              >
+                <p class="chat-day">Friday</p>
+                <div class="message message-user">
+                  Can I spend ₹2,000 tonight?
+                  <small>6:12 PM</small>
+                </div>
+                <div class="message message-violet">
+                  You have <strong>₹1,940</strong> left in this period’s flex pool.
+                  <small>6:12 PM</small>
+                </div>
+                <div class="budget-card">
+                  <div>
+                    <span>Tonight’s room</span>
+                    <strong>₹1,940</strong>
+                  </div>
+                  <div class="budget-track"><i></i></div>
+                  <p>₹3,060 spent of ₹5,000</p>
+                </div>
+                <div class="message message-violet">
+                  ₹2,000 is close. Go for it if it matters. Tomorrow’s allowance would simply start ₹60
+                  lighter.
+                  <small>6:13 PM</small>
+                </div>
+                <div class="context-pill"><span>↻</span> Daily allowance rebalances automatically</div>
+              </div>
+
+              <div
+                class="conversation"
+                id="demo-balance"
+                role="tabpanel"
+                aria-labelledby="tab-balance"
+                data-demo-panel
+                hidden
+              >
+                <p class="chat-day">Sunday</p>
+                <div class="message message-user">
+                  What do I owe Nishidha?
+                  <small>11:04 AM</small>
+                </div>
+                <div class="message message-violet">
+                  You owe Nishidha <strong>₹791.33 net</strong>. Here’s both sides:
+                  <small>11:04 AM</small>
+                </div>
+                <div class="balance-card">
+                  <div><span>She covered for you</span><strong>₹3,791.33</strong></div>
+                  <div><span>You covered for her</span><strong>₹3,000.00</strong></div>
+                  <hr />
+                  <div class="balance-total"><span>Net</span><strong>₹791.33 → Nishidha</strong></div>
+                </div>
+                <div class="message message-violet">
+                  I kept the original expenses visible, so you can always ask where the number came from.
+                  <small>11:05 AM</small>
+                </div>
+              </div>
+
+              <div class="phone-compose">
+                <span>Message Violet…</span>
+                <i aria-hidden="true">➤</i>
+              </div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <section class="features-section" id="features">
+        <div class="shell">
+          <div class="section-heading section-heading-center" data-reveal>
+            <p class="eyebrow"><span></span> Built for messy real life</p>
+            <h2>A ledger with memory and manners.</h2>
+            <p>
+              The useful part isn’t another pie chart. It’s a system that can preserve facts, admit
+              uncertainty, and change its mind without losing history.
+            </p>
+          </div>
+
+          <div class="feature-bento">
+            <article class="feature-card feature-wide feature-ledger" data-reveal>
+              <div class="feature-icon" aria-hidden="true">↳</div>
+              <div>
+                <span class="feature-kicker">Automatic capture</span>
+                <h3>Your inbox becomes a ledger.</h3>
+                <p>
+                  Plutus watches transaction alerts from your financial accounts and turns them into
+                  structured evidence without exposing provider names on the public page.
+                </p>
+              </div>
+              <div class="ledger-list" aria-hidden="true">
+                <div><i class="merchant-dot violet"></i><span>City Market</span><small>Food</small><strong>−₹1,240</strong></div>
+                <div><i class="merchant-dot coral"></i><span>Metro Card</span><small>Travel</small><strong>−₹600</strong></div>
+                <div><i class="merchant-dot mint"></i><span>Office repay</span><small>Received</small><strong class="positive">+₹2,800</strong></div>
+              </div>
+            </article>
+
+            <article class="feature-card feature-flex" data-reveal>
+              <div class="feature-icon" aria-hidden="true">⌁</div>
+              <span class="feature-kicker">Adaptive plans</span>
+              <h3>A budget that moves with the day.</h3>
+              <p>Flex challenges carry underspend and overspend forward instead of pretending every day is identical.</p>
+              <div class="week-bars" aria-hidden="true">
+                <span><i class="h-58"></i><b>M</b></span>
+                <span><i class="h-82"></i><b>T</b></span>
+                <span><i class="h-43"></i><b>W</b></span>
+                <span><i class="h-68"></i><b>T</b></span>
+                <span class="today"><i class="h-34"></i><b>F</b></span>
+                <span><i class="h-12"></i><b>S</b></span>
+                <span><i class="h-12"></i><b>S</b></span>
+              </div>
+            </article>
+
+            <article class="feature-card feature-context" data-reveal>
+              <div class="feature-icon" aria-hidden="true">✦</div>
+              <span class="feature-kicker">Shared context</span>
+              <h3>Correct it once. Violet remembers.</h3>
+              <div class="memory-lines">
+                <span><i></i> “This merchant is usually groceries.”</span>
+                <span><i></i> “My share was only half.”</span>
+                <span><i></i> “That credit was a reimbursement.”</span>
+              </div>
+            </article>
+
+            <article class="feature-card feature-audit" data-reveal>
+              <div class="feature-icon" aria-hidden="true">◎</div>
+              <span class="feature-kicker">Evidence first</span>
+              <h3>Corrections don’t erase history.</h3>
+              <p>Raw alerts stay immutable. New interpretations supersede old ones, so every number has a trail.</p>
+              <div class="audit-trail" aria-hidden="true">
+                <span>Raw alert</span><i></i><span>AI read</span><i></i><span>User correction</span>
+              </div>
+            </article>
+
+            <article class="feature-card feature-wide feature-people" data-reveal>
+              <div>
+                <div class="feature-icon" aria-hidden="true">⇄</div>
+                <span class="feature-kicker">Shared money</span>
+                <h3>Splits, repayments, and both sides of the story.</h3>
+                <p>
+                  Plutus keeps the original expenses, standalone payments, reimbursements, and net balance
+                  visible without quietly rewriting one into another.
+                </p>
+              </div>
+              <div class="people-orbit" aria-hidden="true">
+                <div class="person person-one">R</div>
+                <div class="person person-two">N</div>
+                <div class="person person-three">A</div>
+                <div class="person-center">₹</div>
+                <span class="orbit-line line-one"></span>
+                <span class="orbit-line line-two"></span>
+                <span class="orbit-line line-three"></span>
+              </div>
+            </article>
+          </div>
+        </div>
+      </section>
+
+      <section class="under-section">
+        <div class="shell under-grid">
+          <div data-reveal>
+            <p class="eyebrow"><span></span> Under the hood</p>
+            <h2>A side project with serious receipts.</h2>
+            <p>
+              Plutus is intentionally personal, but the engineering is built to be inspectable: deterministic
+              ledger math, AI only where judgment is needed, and interfaces for Telegram, REST, and MCP clients.
+            </p>
+            <a
+              class="text-link"
+              href="https://github.com/AniketRaj314/plutus"
+              target="_blank"
+              rel="noreferrer"
+            >
+              Explore the source <span aria-hidden="true">↗</span>
+            </a>
+          </div>
+
+          <div class="system-map" aria-label="Plutus system flow" data-reveal>
+            <div class="system-node node-input">
+              <span>01</span>
+              <strong>Transaction alerts</strong>
+              <small>immutable evidence</small>
+            </div>
+            <div class="system-arrow" aria-hidden="true">→</div>
+            <div class="system-node node-core">
+              <span>02</span>
+              <strong>Plutus ledger</strong>
+              <small>context + deterministic math</small>
+            </div>
+            <div class="system-arrow" aria-hidden="true">→</div>
+            <div class="system-node node-violet">
+              <span>03</span>
+              <strong>Violet</strong>
+              <small>conversation + judgment</small>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <section class="cta-section">
+        <div class="shell">
+          <div class="cta-card" data-reveal>
+            <div class="cta-petal cta-petal-one" aria-hidden="true"></div>
+            <div class="cta-petal cta-petal-two" aria-hidden="true"></div>
+            <p class="eyebrow eyebrow-light"><span></span> Built in public, used in private</p>
+            <h2>Not the perfect finance system.<br />Just one that finally feels personal.</h2>
+            <p>
+              Follow the experiments, read the ledger design, or borrow an idea for a system of your own.
+            </p>
+            <div class="cta-actions">
+              <a
+                class="button button-coral"
+                href="https://github.com/AniketRaj314/plutus"
+                target="_blank"
+                rel="noreferrer"
+              >
+                View Plutus on GitHub <span aria-hidden="true">↗</span>
+              </a>
+              <a
+                class="button button-outline-light"
+                href="https://aniketraj.me/"
+                target="_blank"
+                rel="noreferrer"
+              >
+                More by Aniket
+              </a>
+            </div>
+          </div>
+        </div>
+      </section>
+    </main>
+
+    <footer class="site-footer">
+      <div class="shell footer-grid">
+        <a class="brand footer-brand" href="#top">
+          <span class="brand-mark" aria-hidden="true">P</span>
+          <span>plutus</span>
+          <span class="brand-dot" aria-hidden="true"></span>
+        </a>
+        <p>Built by <a href="https://aniketraj.me/" target="_blank" rel="noreferrer">Aniket Raj</a> to make sense of his own money.</p>
+        <div class="footer-links">
+          <a href="https://github.com/AniketRaj314/plutus" target="_blank" rel="noreferrer">GitHub</a>
+          <a href="/health">System health</a>
+        </div>
+      </div>
+    </footer>
+  </body>
+</html>
