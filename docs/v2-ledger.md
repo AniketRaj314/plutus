@@ -25,6 +25,22 @@ judgment and weekly-budget recommendations belong to the MCP client/agent.
    the spend-month summary for the ₹1,20,000 envelope and funding summaries for
    cash-flow questions.
 
+## AI receipt enrichment
+
+Every live debit is eligible for asynchronous receipt enrichment. Plutus keeps
+the immediate card notification and searches Gmail for candidate emails
+received during the one-hour window on either side of the transaction alert.
+Candidate bodies are treated as untrusted evidence and interpreted by AI; no
+merchant-specific receipt parser or sender allow-list decides the result.
+
+A match must name one candidate email, exceed the confidence threshold, and
+reconcile its extracted total with the transaction amount. Plutus stores only
+compact evidence—email id, sender, order id, total, item summary, confidence,
+and reasoning—not the full receipt body. One email cannot enrich multiple
+transactions. If an automatic interpretation already exists, enrichment
+supersedes it while preserving treatment and all impact fields, so the expense
+is never counted twice. Human-created corrections remain authoritative.
+
 ## Impact fields
 
 - `gross_amount_inr`: INR value visible in the interpreted event.

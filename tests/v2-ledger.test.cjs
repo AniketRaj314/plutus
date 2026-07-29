@@ -5,7 +5,14 @@ const assert = require("node:assert/strict");
 const Database = require("better-sqlite3");
 
 const { runMigrations } = require("../src/db/schema");
-const { getContext, getCreditCard, insertTransaction, queryTransactions, setContext } = require("../src/db/queries");
+const {
+  getContext,
+  getCreditCard,
+  getTransaction,
+  insertTransaction,
+  queryTransactions,
+  setContext,
+} = require("../src/db/queries");
 const {
   aggregateSpendMonth,
   aggregateEnvelopeEntries,
@@ -39,12 +46,20 @@ const { getSalaryFundingMonthForDate } = require("../src/envelope/engine");
 const { buildMcpToolSpecs, PACKAGE_VERSION, registerRoutes } = require("../src/api/routes");
 const {
   isLikelyTransactionAlert,
+  getInitialCorrelationStatus,
   notifyPendingCreditInferences,
   pollOnce,
   processMessage,
   runGmailPollCycle,
   selectMessageIdsForPoll,
 } = require("../src/gmail/poller");
+const {
+  RECEIPT_WINDOW_MS,
+  attemptCorrelation,
+  checkPendingCorrelations,
+  isSafeReceiptMatch,
+  parseCorrelationResponse,
+} = require("../src/enrichment/correlator");
 const { parseGmailMessage } = require("../src/gmail/parsers");
 const {
   describeGmailDiagnosticError,
@@ -675,6 +690,375 @@ test("IDFC UPI parser preserves incoming-credit direction, sender, and exact tim
   assert.equal(parsed.amount, 800);
   assert.equal(parsed.merchant_raw, "Nishidha");
   assert.equal(parsed.datetime, "2026-07-15T07:35:00.000Z");
+});
+
+test("live debit alerts enter receipt enrichment without delaying credits or reversals", () => {
+  assert.equal(
+    getInitialCorrelationStatus({
+      direction: "debit",
+      is_reversal: false,
+      correlation_status: "none",
+    }),
+    "pending"
+  );
+  assert.equal(
+    getInitialCorrelationStatus({
+      direction: "credit",
+      is_reversal: false,
+      correlation_status: "pending",
+    }),
+    "none"
+  );
+  assert.equal(
+    getInitialCorrelationStatus({
+      direction: "debit",
+      is_reversal: true,
+      correlation_status: undefined,
+    }),
+    "none"
+  );
+});
+
+test("AI receipt enrichment searches every sender within one hour and revises the same card expense", async () => {
+  const db = makeDb();
+  const transaction = insertTestTransaction(db, {
+    source: "amex",
+    amount: 419,
+    merchant_raw: "PAYU SWIGGY",
+    datetime: "2026-07-28T14:25:40.000Z",
+    currency: "INR",
+    raw_email_id: "amex-alert-419",
+    correlation_status: "pending",
+  });
+  const originalEntry = createEnvelopeEntry(db, {
+    raw_transaction_id: transaction.id,
+    funding_month: "2026-09",
+    occurred_at: transaction.datetime,
+    source: "amex",
+    card_cycle_start: "2026-07-21",
+    card_cycle_end: "2026-08-20",
+    due_date: "2026-09-08",
+    merchant_clean: "Swiggy",
+    category: "Food & Dining",
+    treatment: "normal",
+    state: "actual",
+    gross_amount_inr: 419,
+    personal_impact: 419,
+    cashflow_impact: 419,
+    receivable_amount: 0,
+    notes: "Initial gateway-only interpretation",
+    confidence: 0.95,
+    created_by: "automatic_inference",
+  });
+
+  let gmailQuery = "";
+  const messages = {
+    "amex-alert-419": {
+      id: "amex-alert-419",
+      internalDate: String(Date.parse("2026-07-28T14:25:40.000Z")),
+      snippet: "American Express transaction update",
+      payload: {
+        headers: [
+          { name: "From", value: "American Express <AmericanExpress@welcome.americanexpress.com>" },
+          { name: "Subject", value: "Your transaction update" },
+        ],
+      },
+    },
+    "instamart-receipt-419": {
+      id: "instamart-receipt-419",
+      internalDate: String(Date.parse("2026-07-28T14:40:00.000Z")),
+      snippet: "Your Instamart order was successfully delivered",
+      payload: {
+        headers: [
+          { name: "From", value: "noreply@instamart.in" },
+          { name: "Subject", value: "Your Instamart order was delivered" },
+        ],
+        mimeType: "text/html",
+        body: {
+          data: Buffer.from(
+            "<h1>Instamart</h1><p>Order 244218301183685</p><p>2 x Indian Tomato</p>" +
+              "<p>1 x Cabbage</p><p>1 x Floor Cleaner</p><p>Total ₹419.00</p>"
+          ).toString("base64url"),
+        },
+      },
+    },
+  };
+  const gmail = {
+    users: {
+      messages: {
+        list: async (args) => {
+          gmailQuery = args.q;
+          return { data: { messages: [{ id: "amex-alert-419" }, { id: "instamart-receipt-419" }] } };
+        },
+        get: async ({ id }) => ({ data: messages[id] }),
+      },
+    },
+  };
+
+  const matched = await attemptCorrelation(db, transaction, {
+    gmail,
+    updateTelegram: false,
+    generate: async (_transaction, candidates) => {
+      assert.equal(candidates.length, 1);
+      assert.equal(candidates[0].id, "instamart-receipt-419");
+      assert.match(candidates[0].body, /Indian Tomato/);
+      return {
+        matched: true,
+        matched_email_id: "instamart-receipt-419",
+        merchant_clean: "Swiggy Instamart",
+        category: "Groceries",
+        order_id: "244218301183685",
+        receipt_total: 419,
+        receipt_currency: "INR",
+        item_summary: ["2 × Indian Tomato", "Cabbage", "Floor Cleaner"],
+        confidence: 0.99,
+        reasoning: "Exact amount and receipt arrived 15 minutes after the AmEx alert.",
+      };
+    },
+  });
+
+  const transactionEpoch = Date.parse(transaction.datetime);
+  assert.equal(
+    gmailQuery,
+    `after:${Math.floor((transactionEpoch - RECEIPT_WINDOW_MS) / 1000)} ` +
+      `before:${Math.ceil((transactionEpoch + RECEIPT_WINDOW_MS) / 1000)}`
+  );
+  assert.equal(matched, true);
+  const enriched = getTransaction(db, transaction.id);
+  assert.equal(enriched.correlation_status, "matched");
+  assert.equal(enriched.correlated_with, "gmail:instamart-receipt-419");
+  assert.equal(enriched.merchant_clean, "Swiggy Instamart");
+  assert.equal(enriched.category, "Groceries");
+
+  const active = listEnvelopeEntries(db, { raw_transaction_id: transaction.id })[0];
+  assert.equal(active.merchant_clean, "Swiggy Instamart");
+  assert.equal(active.category, "Groceries");
+  assert.equal(active.personal_impact, 419);
+  assert.equal(active.cashflow_impact, 419);
+  assert.equal(active.treatment, "normal");
+  assert.equal(active.created_by, "receipt_enrichment");
+  assert.equal(active.supersedes_id, originalEntry.id);
+  const history = listEnvelopeEntries(db, {
+    raw_transaction_id: transaction.id,
+    include_superseded: true,
+  });
+  assert.equal(history.length, 2);
+
+  const fact = listContextFacts(db, {
+    scope_type: "transaction",
+    scope_id: transaction.id,
+    key: "receipt_enrichment",
+  })[0];
+  const evidence = JSON.parse(fact.value);
+  assert.equal(evidence.email_id, "instamart-receipt-419");
+  assert.deepEqual(evidence.item_summary, ["2 × Indian Tomato", "Cabbage", "Floor Cleaner"]);
+  assert.equal(Object.hasOwn(evidence, "body"), false);
+  const immutableRaw = db.prepare("SELECT * FROM raw_transactions WHERE id = ?").get(transaction.id);
+  assert.equal(immutableRaw.merchant_raw, "PAYU SWIGGY");
+
+  const second = insertTestTransaction(db, {
+    source: "amex",
+    amount: 419,
+    merchant_raw: "PAYU SWIGGY",
+    datetime: "2026-07-28T14:50:00.000Z",
+    currency: "INR",
+    raw_email_id: "amex-alert-second",
+    correlation_status: "pending",
+  });
+  let secondGenerationCalls = 0;
+  const reused = await attemptCorrelation(db, second, {
+    gmail,
+    updateTelegram: false,
+    generate: async () => {
+      secondGenerationCalls++;
+      return null;
+    },
+  });
+  assert.equal(reused, false);
+  assert.equal(secondGenerationCalls, 0);
+  assert.equal(getTransaction(db, second.id).correlation_status, "pending");
+  db.close();
+});
+
+test("receipt correlation rejects uncertain, unknown, and amount-mismatched AI output", () => {
+  const transaction = {
+    id: "tx",
+    amount: 419,
+    amount_inr: null,
+    currency: "INR",
+  };
+  const candidates = [
+    {
+      id: "receipt",
+      sender: "noreply@instamart.in",
+      subject: "Order delivered",
+      snippet: "",
+      body: "Total ₹499",
+      datetime: "2026-07-28T14:40:00.000Z",
+    },
+  ];
+  const base = {
+    matched: true,
+    matched_email_id: "receipt",
+    merchant_clean: "Swiggy Instamart",
+    category: "Groceries",
+    order_id: null,
+    receipt_total: 499,
+    receipt_currency: "INR",
+    item_summary: [],
+    confidence: 0.99,
+    reasoning: "Possible receipt",
+  };
+  assert.equal(isSafeReceiptMatch(transaction, candidates, base), false);
+  assert.equal(
+    isSafeReceiptMatch(transaction, candidates, {
+      ...base,
+      receipt_total: 419,
+      confidence: 0.7,
+    }),
+    false
+  );
+  assert.equal(
+    isSafeReceiptMatch(transaction, candidates, {
+      ...base,
+      matched_email_id: "not-a-candidate",
+      receipt_total: 419,
+    }),
+    false
+  );
+
+  assert.equal(parseCorrelationResponse("not-json"), null);
+  assert.equal(
+    parseCorrelationResponse(
+      JSON.stringify({
+        ...base,
+        receipt_total: 419,
+        category: "Invented Category",
+      })
+    ),
+    null
+  );
+});
+
+test("receipt enrichment does not resend an unchanged candidate set to the AI", async () => {
+  const db = makeDb();
+  const transaction = insertTestTransaction(db, {
+    source: "amex",
+    amount: 419,
+    merchant_raw: "PAYU SWIGGY",
+    datetime: "2026-07-28T14:25:40.000Z",
+    currency: "INR",
+    raw_email_id: "cache-alert",
+    correlation_status: "pending",
+  });
+  const receipt = {
+    id: "unrelated-email",
+    internalDate: String(Date.parse("2026-07-28T14:40:00.000Z")),
+    snippet: "An unrelated email",
+    payload: {
+      headers: [
+        { name: "From", value: "friend@example.com" },
+        { name: "Subject", value: "Hello" },
+      ],
+      mimeType: "text/plain",
+      body: { data: Buffer.from("No merchant receipt here").toString("base64url") },
+    },
+  };
+  const gmail = {
+    users: {
+      messages: {
+        list: async () => ({ data: { messages: [{ id: receipt.id }] } }),
+        get: async () => ({ data: receipt }),
+      },
+    },
+  };
+  let generationCalls = 0;
+  const generate = async () => {
+    generationCalls++;
+    return {
+      matched: false,
+      matched_email_id: null,
+      merchant_clean: null,
+      category: null,
+      order_id: null,
+      receipt_total: null,
+      receipt_currency: null,
+      item_summary: [],
+      confidence: 0.99,
+      reasoning: "The email is unrelated.",
+    };
+  };
+
+  assert.equal(await attemptCorrelation(db, transaction, { gmail, generate, updateTelegram: false }), false);
+  assert.equal(await attemptCorrelation(db, transaction, { gmail, generate, updateTelegram: false }), false);
+  assert.equal(generationCalls, 1);
+  db.close();
+});
+
+test("receipt enrichment keeps the transaction open for the full one-hour future window", async () => {
+  const db = makeDb();
+  const transaction = insertTestTransaction(db, {
+    source: "amex",
+    amount: 419,
+    merchant_raw: "PAYU SWIGGY",
+    datetime: "2026-07-28T14:25:40.000Z",
+    currency: "INR",
+    raw_email_id: "window-alert",
+    correlation_status: "pending",
+  });
+  const gmail = {
+    users: {
+      messages: {
+        list: async () => ({ data: { messages: [] } }),
+      },
+    },
+  };
+
+  await checkPendingCorrelations(db, {
+    gmail,
+    now: new Date("2026-07-28T14:55:40.000Z"),
+    updateTelegram: false,
+  });
+  assert.equal(getTransaction(db, transaction.id).correlation_status, "pending");
+
+  await checkPendingCorrelations(db, {
+    gmail,
+    now: new Date("2026-07-28T15:26:41.000Z"),
+    updateTelegram: false,
+  });
+  assert.equal(getTransaction(db, transaction.id).correlation_status, "unmatched");
+  db.close();
+});
+
+test("receipt summaries appear on the edited Telegram transaction without changing its impact", () => {
+  const text = formatV2Transaction(
+    {
+      id: "receipt-summary",
+      source: "amex",
+      amount: 419,
+      merchant_clean: "Swiggy Instamart",
+      merchant_raw: "PAYU SWIGGY",
+      datetime: "2026-07-28T14:25:40.000Z",
+      is_reversal: 0,
+      is_international: 0,
+      amount_inr: null,
+      currency: "INR",
+      direction: "debit",
+    },
+    {
+      status: "already_interpreted",
+      entry: {
+        treatment: "normal",
+        personal_impact: 419,
+        cashflow_impact: 419,
+        receivable_amount: 0,
+      },
+      receipt_summary: "2 × Indian Tomato, Cabbage, Floor Cleaner",
+    }
+  );
+  assert.match(text, /Swiggy Instamart/);
+  assert.match(text, /Receipt: 2 × Indian Tomato, Cabbage, Floor Cleaner/);
+  assert.match(text, /Personal ₹419/);
 });
 
 test("AI-proposed combined repayment and surplus waits for Telegram approval, then reconciles atomically", async () => {

@@ -1,4 +1,4 @@
-export type SchedulerName = "gmail_poll" | "upi_correlation" | "automatic_inference";
+export type SchedulerName = "gmail_poll" | "receipt_enrichment" | "automatic_inference";
 
 interface SchedulerState {
   name: SchedulerName;

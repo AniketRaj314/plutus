@@ -129,6 +129,7 @@ export interface V2TransactionPresentation {
   spend_month_remaining?: number;
   flex_budget?: FlexBudgetStatus;
   question?: string;
+  receipt_summary?: string;
 }
 
 function spendMonthLabel(spendMonth: string): string {
@@ -169,6 +170,9 @@ export function formatV2Transaction(
   if (presentation.entry) {
     const entry = presentation.entry;
     lines.push(`🧾 ${entry.treatment} · Personal ${formatINR(entry.personal_impact)}`);
+    if (presentation.receipt_summary) {
+      lines.push(`🛍️ Receipt: ${presentation.receipt_summary}`);
+    }
     if (entry.cashflow_impact !== entry.personal_impact) {
       lines.push(`💵 Cash needed ${formatINR(entry.cashflow_impact)}`);
     }
