@@ -11,7 +11,7 @@ import {
   insertTransaction,
   type Transaction,
 } from "../db/queries";
-import { getGmailReceivedAt, parseGmailMessage } from "./parsers";
+import { getGmailReceivedAt, parseGmailMessage, type ParsedTransaction } from "./parsers";
 import { enrichTransaction } from "../enrichment/gpt";
 import { sendMessage, recordTransactionMessage, getMessageIdForTransaction } from "../telegram/bot";
 import { formatV2Transaction } from "../telegram/formatter";
@@ -60,6 +60,13 @@ export type ProcessMessageOutcome = "recorded" | "duplicate" | "ignored" | "unpa
 export interface PollOnceOptions {
   gmail?: gmail_v1.Gmail;
   processMessageOptions?: ProcessMessageOptions;
+}
+
+export function getInitialCorrelationStatus(
+  parsed: Pick<ParsedTransaction, "direction" | "is_reversal" | "correlation_status">
+): string {
+  if (parsed.direction === "debit" && !parsed.is_reversal) return "pending";
+  return "none";
 }
 
 export function startPoller(db: Database.Database): void {
@@ -374,6 +381,7 @@ export async function processMessage(
     return "duplicate";
   }
 
+  const correlationStatus = getInitialCorrelationStatus(parsed);
   const transaction = insertTransaction(db, {
     source: parsed.source,
     amount: parsed.amount,
@@ -389,7 +397,7 @@ export async function processMessage(
     notes: parsed.notes,
     is_preauth: parsed.is_preauth ? 1 : 0,
     direction: parsed.direction,
-    correlation_status: parsed.correlation_status ?? "none",
+    correlation_status: correlationStatus,
   });
 
   insertRawTransaction(db, {

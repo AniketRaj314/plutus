@@ -59,7 +59,12 @@ INFERENCE_MODEL=gpt-4o
 1. Set `AUTO_INFERENCE_ENABLED=true` and restart/redeploy the service.
 2. The Gmail poller runs every `POLL_INTERVAL_MINS` (default ten). Each new
    normal transaction is stored, interpreted, and sent to Telegram in that
-   poll. UPI rows wait for the five-minute receipt correlator before inference.
+   poll. IDFC UPI debits wait for the five-minute receipt-enrichment worker
+   before inference; card alerts are interpreted and notified immediately.
+   For every live debit, the worker uses AI to inspect candidate receipt emails
+   received within one hour before or after the transaction alert. A confident
+   amount/time match enriches the same transaction and edits its Telegram
+   message; it never creates a second expense.
 3. The inference queue retries transient model failures every five minutes up
    to three times. Ambiguous rows stay pending with a Telegram question.
 4. Make one small real transaction and verify raw evidence, one active clean
