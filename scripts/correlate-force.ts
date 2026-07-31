@@ -21,7 +21,7 @@ async function main() {
   }
 
   console.log("before:", transaction);
-  await attemptCorrelation(db, transaction);
+  await attemptCorrelation(db, transaction, { force: true });
   console.log("after:", getTransaction(db, id));
 }
 

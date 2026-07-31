@@ -811,6 +811,15 @@ test("AI receipt enrichment searches every sender within one hour and revises th
         receipt_total: 419,
         receipt_currency: "INR",
         item_summary: ["2 × Indian Tomato", "Cabbage", "Floor Cleaner"],
+        signal_scores: {
+          merchant_match: 1,
+          timing_match: 0.98,
+          amount_match: 1,
+          receipt_quality: 1,
+          uniqueness: 1,
+        },
+        amount_gap_kind: "none",
+        amount_match_explanation: null,
         confidence: 0.99,
         reasoning: "Exact amount and receipt arrived 15 minutes after the AmEx alert.",
       };
@@ -880,7 +889,7 @@ test("AI receipt enrichment searches every sender within one hour and revises th
   db.close();
 });
 
-test("receipt correlation rejects uncertain, unknown, and amount-mismatched AI output", () => {
+test("receipt correlation uses auditable multi-signal confidence for amount mismatches", () => {
   const transaction = {
     id: "tx",
     amount: 419,
@@ -906,10 +915,63 @@ test("receipt correlation rejects uncertain, unknown, and amount-mismatched AI o
     receipt_total: 499,
     receipt_currency: "INR",
     item_summary: [],
+    signal_scores: {
+      merchant_match: 0.6,
+      timing_match: 0.9,
+      amount_match: 0.2,
+      receipt_quality: 0.95,
+      uniqueness: 0.9,
+    },
+    amount_gap_kind: "unknown",
+    amount_match_explanation: "The receipt may include an unexplained discount.",
     confidence: 0.99,
     reasoning: "Possible receipt",
   };
   assert.equal(isSafeReceiptMatch(transaction, candidates, base), false);
+  assert.equal(
+    isSafeReceiptMatch(transaction, candidates, {
+      ...base,
+      receipt_total: 419,
+      amount_gap_kind: "none",
+      amount_match_explanation: null,
+    }),
+    false
+  );
+  assert.equal(
+    isSafeReceiptMatch({ ...transaction, amount: 354 }, candidates, {
+      ...base,
+      receipt_total: 402,
+      signal_scores: {
+        merchant_match: 0.99,
+        timing_match: 0.98,
+        amount_match: 0.7,
+        receipt_quality: 0.99,
+        uniqueness: 0.99,
+      },
+      amount_gap_kind: "coupon_or_credit",
+      amount_match_explanation:
+        "The unique Instamart receipt arrived 13 minutes later; ₹48 was plausibly paid with credits.",
+      confidence: 0.97,
+    }),
+    true
+  );
+  assert.equal(
+    isSafeReceiptMatch({ ...transaction, amount: 354 }, candidates, {
+      ...base,
+      receipt_total: 402,
+      signal_scores: {
+        merchant_match: 0.99,
+        timing_match: 0.98,
+        amount_match: 0.7,
+        receipt_quality: 0.99,
+        uniqueness: 0.99,
+      },
+      amount_gap_kind: "coupon_or_credit",
+      amount_match_explanation: null,
+      confidence: 0.97,
+    }),
+    false
+  );
   assert.equal(
     isSafeReceiptMatch(transaction, candidates, {
       ...base,
@@ -968,11 +1030,15 @@ test("receipt enrichment does not resend an unchanged candidate set to the AI", 
     users: {
       messages: {
         list: async () => ({ data: { messages: [{ id: receipt.id }] } }),
-        get: async () => ({ data: receipt }),
+        get: async () => {
+          gmailGetCalls++;
+          return { data: receipt };
+        },
       },
     },
   };
   let generationCalls = 0;
+  let gmailGetCalls = 0;
   const generate = async () => {
     generationCalls++;
     return {
@@ -984,6 +1050,15 @@ test("receipt enrichment does not resend an unchanged candidate set to the AI", 
       receipt_total: null,
       receipt_currency: null,
       item_summary: [],
+      signal_scores: {
+        merchant_match: 0,
+        timing_match: 0,
+        amount_match: 0,
+        receipt_quality: 0,
+        uniqueness: 1,
+      },
+      amount_gap_kind: "none",
+      amount_match_explanation: null,
       confidence: 0.99,
       reasoning: "The email is unrelated.",
     };
@@ -992,6 +1067,7 @@ test("receipt enrichment does not resend an unchanged candidate set to the AI", 
   assert.equal(await attemptCorrelation(db, transaction, { gmail, generate, updateTelegram: false }), false);
   assert.equal(await attemptCorrelation(db, transaction, { gmail, generate, updateTelegram: false }), false);
   assert.equal(generationCalls, 1);
+  assert.equal(gmailGetCalls, 1);
   db.close();
 });
 
