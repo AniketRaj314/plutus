@@ -17,6 +17,7 @@ const {
   aggregateSpendMonth,
   aggregateEnvelopeEntries,
   createCommitment,
+  createCounterpartyBalanceCheckpoint,
   createEnvelopeEntry,
   createFlexBudgetPlan,
   createReceivable,
@@ -1418,6 +1419,131 @@ test("counterparty transfers are standalone facts and never mutate personal rece
   db.close();
 });
 
+test("counterparty checkpoints collapse old activity without mutating full history", () => {
+  const db = makeDb();
+  createReceivable(db, {
+    counterparty: "Nishidha",
+    label: "Dinner share",
+    amount_inr: 1000,
+    created_by: "telegram_user",
+  });
+  createReceivable(db, {
+    counterparty: "Nishidha",
+    label: "Unconfirmed old guess",
+    amount_inr: 214,
+    created_by: "automatic_inference",
+  });
+  setContextFact(db, {
+    scope_type: "person",
+    scope_id: "Nishidha",
+    key: "counterparty_payable_tickets",
+    value: JSON.stringify({
+      status: "outstanding",
+      label: "Tickets",
+      amount_owed_inr: 800,
+      recorded_on: "2026-07-26",
+    }),
+    source: "telegram_user",
+    confidence: 1,
+  });
+
+  const created = createCounterpartyBalanceCheckpoint(db, {
+    counterparty: "nishidha",
+    reason: "Old activity is near square",
+    created_by: "telegram_user",
+  });
+  assert.equal(created.balance.view, "current");
+  assert.equal(created.balance.opening_balance_inr, 200);
+  assert.equal(created.balance.net_balance_inr, 200);
+  assert.equal(created.balance.value_from_user.length, 0);
+  assert.equal(created.balance.value_from_counterparty.length, 0);
+  assert.equal(created.balance.uncertain.length, 0);
+  assert.equal(created.balance.checkpoint.original_opening_balance_inr, 200);
+  assert.equal(created.balance.checkpoint.archived_item_count, 2);
+  assert.equal(created.balance.checkpoint.archived_uncertain_count, 1);
+
+  const full = getCounterpartyBalance(db, "Nishidha", { view: "full" });
+  assert.equal(full.view, "full");
+  assert.equal(full.opening_balance_inr, 0);
+  assert.equal(full.checkpoint, null);
+  assert.equal(full.value_from_user.length, 1);
+  assert.equal(full.value_from_counterparty.length, 1);
+  assert.equal(full.uncertain.length, 1);
+  assert.equal(full.net_balance_inr, 200);
+  assert.equal(listReceivables(db, { counterparty: "Nishidha" })[0].status, "pending");
+  db.close();
+});
+
+test("post-checkpoint and older-dated backfills stay visible in the current tab", () => {
+  const db = makeDb();
+  createReceivable(db, {
+    counterparty: "Nishidha",
+    label: "Old dinner",
+    amount_inr: 700,
+    created_by: "telegram_user",
+  });
+  setContextFact(db, {
+    scope_type: "person",
+    scope_id: "Nishidha",
+    key: "counterparty_payable_old_tickets",
+    value: JSON.stringify({
+      status: "outstanding",
+      label: "Old tickets",
+      amount_owed_inr: 600,
+      recorded_on: "2026-07-20",
+    }),
+    source: "telegram_user",
+    confidence: 1,
+  });
+  createCounterpartyBalanceCheckpoint(db, {
+    counterparty: "Nishidha",
+    reason: "Roll forward",
+    created_by: "telegram_user",
+  });
+
+  const backfilledEntry = createEnvelopeEntry(db, {
+    funding_month: "2026-07",
+    occurred_at: "2026-07-01T12:00:00+05:30",
+    source: "manual",
+    merchant_clean: "Backfilled coffee",
+    treatment: "split",
+    gross_amount_inr: 500,
+    personal_impact: 250,
+    cashflow_impact: 500,
+    receivable_amount: 250,
+    created_by: "telegram_user",
+  });
+  createReceivable(db, {
+    envelope_entry_id: backfilledEntry.id,
+    counterparty: "Nishidha",
+    label: "Backfilled coffee",
+    amount_inr: 250,
+    created_by: "telegram_user",
+  });
+  setContextFact(db, {
+    scope_type: "person",
+    scope_id: "Nishidha",
+    key: "counterparty_payable_new_lunch",
+    value: JSON.stringify({
+      status: "outstanding",
+      label: "New lunch",
+      amount_owed_inr: 40,
+      recorded_on: "2026-08-01",
+    }),
+    source: "telegram_user",
+    confidence: 1,
+  });
+
+  const current = getCounterpartyBalance(db, "nishidha");
+  assert.equal(current.opening_balance_inr, 100);
+  assert.deepEqual(current.value_from_user.map((item) => item.label), ["Backfilled coffee"]);
+  assert.deepEqual(current.value_from_counterparty.map((item) => item.label), ["New lunch"]);
+  assert.equal(current.total_from_user_inr, 250);
+  assert.equal(current.total_from_counterparty_inr, 40);
+  assert.equal(current.net_balance_inr, 310);
+  db.close();
+});
+
 test("off-account purchases affect the envelope while later covered expenses only offset the counterparty net", () => {
   const db = makeDb();
   const plan = createFlexBudgetPlan(db, {
@@ -2573,6 +2699,7 @@ test("all v2 MCP tools are registered for external agents", () => {
     "update_receivable",
     "list_receivables",
     "get_counterparty_balance",
+    "create_counterparty_balance_checkpoint",
     "record_confirmed_credit_allocation",
     "create_commitment",
     "update_commitment",
@@ -2597,6 +2724,7 @@ test("production MCP surface exposes v2 finance tools and no legacy envelope mut
   const names = buildMcpToolSpecs().map((spec) => spec.name);
   assert.equal(names.includes("interpret_pending_transactions"), true);
   assert.equal(names.includes("get_counterparty_balance"), true);
+  assert.equal(names.includes("create_counterparty_balance_checkpoint"), true);
   assert.equal(names.includes("search_transaction_emails"), true);
   assert.equal(names.includes("post_agent_message"), true);
   assert.equal(names.includes("get_envelope"), false);
@@ -2724,6 +2852,9 @@ test("Violet is required to query raw storage for recent transaction questions",
   assert.match(prompt, /today\.effective_target_inr is the dynamically rebalanced allowance/);
   assert.match(prompt, /today\.nominal_target_inr is only the plan's original pace/);
   assert.match(prompt, /call get_counterparty_balance immediately before answering/);
+  assert.match(prompt, /include one short net-balance line/);
+  assert.match(prompt, /create_counterparty_balance_checkpoint/);
+  assert.match(prompt, /roughly 2-6 short lines/);
   assert.match(prompt, /person-to-person payment is a standalone event, not an invoice allocation/);
   assert.match(prompt, /source=manual raw transaction for the reported purchase event/);
   assert.match(prompt, /cashflow_impact=0/);

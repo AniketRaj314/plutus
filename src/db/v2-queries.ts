@@ -170,10 +170,24 @@ export interface CounterpartyBalanceUncertainItem {
   reason: string;
 }
 
+export type CounterpartyBalanceView = "current" | "full";
+
+export interface CounterpartyBalanceCheckpoint {
+  id: string;
+  created_at: string;
+  reason: string | null;
+  original_opening_balance_inr: number;
+  archived_item_count: number;
+  archived_uncertain_count: number;
+}
+
 export interface CounterpartyBalanceSummary {
   counterparty: string;
   since: string | null;
   until: string | null;
+  view: CounterpartyBalanceView;
+  opening_balance_inr: number;
+  checkpoint: CounterpartyBalanceCheckpoint | null;
   value_from_user: CounterpartyBalanceItem[];
   value_from_counterparty: CounterpartyBalanceItem[];
   uncertain: CounterpartyBalanceUncertainItem[];
@@ -187,7 +201,14 @@ export interface CounterpartyBalanceSummary {
     transfers: string;
     manual_obligations: string;
     uncertain: string;
+    checkpoints: string;
   };
+}
+
+export interface CreateCounterpartyBalanceCheckpointInput {
+  counterparty: string;
+  reason?: string | null;
+  created_by: string;
 }
 
 export interface CreditAllocation {
@@ -1090,10 +1111,13 @@ function rawAmountInr(raw: RawTransactionV2): number {
 export function getCounterpartyBalance(
   db: Database.Database,
   counterparty: string,
-  filters: { since?: string; until?: string } = {}
+  filters: { since?: string; until?: string; view?: CounterpartyBalanceView } = {}
 ): CounterpartyBalanceSummary {
   if (!counterparty.trim()) throw new Error("counterparty is required");
   validateCounterpartyWindow(filters);
+  if (filters.view && filters.view !== "current" && filters.view !== "full") {
+    throw new Error("view must be current or full");
+  }
 
   const counterpartyKey = normalizedCounterparty(counterparty);
   const facts = listContextFacts(db);
@@ -1101,6 +1125,36 @@ export function getCounterpartyBalance(
     (fact) =>
       fact.scope_type === "person" &&
       normalizedCounterparty(fact.scope_id) === counterpartyKey
+  );
+  const view = filters.view ?? "current";
+  const checkpointFact = personFacts
+    .filter((fact) => fact.key === "counterparty_balance_checkpoint")
+    .map((fact) => ({ fact, value: parseJsonObject(fact.value) }))
+    .filter(
+      (candidate) =>
+        Array.isArray(candidate.value?.archived_source_ids) &&
+        Number.isFinite(Number(candidate.value?.opening_balance_inr))
+    )
+    .sort((a, b) => {
+      const aCreated =
+        typeof a.value?.created_at === "string" ? a.value.created_at : a.fact.created_at;
+      const bCreated =
+        typeof b.value?.created_at === "string" ? b.value.created_at : b.fact.created_at;
+      return bCreated.localeCompare(aCreated);
+    })[0];
+  const archivedSourceIds = new Set<string>(
+    view === "current" && checkpointFact
+      ? (checkpointFact.value?.archived_source_ids as unknown[]).filter(
+          (sourceId): sourceId is string => typeof sourceId === "string"
+        )
+      : []
+  );
+  const archivedUncertainSourceIds = new Set<string>(
+    view === "current" && checkpointFact && Array.isArray(checkpointFact.value?.archived_uncertain_source_ids)
+      ? (checkpointFact.value?.archived_uncertain_source_ids as unknown[]).filter(
+          (sourceId): sourceId is string => typeof sourceId === "string"
+        )
+      : []
   );
   const exclusions = new Set<string>();
   for (const fact of personFacts.filter((row) => row.key === "counterparty_balance_exclusion")) {
@@ -1264,13 +1318,13 @@ export function getCounterpartyBalance(
     accountedRawTransactions.add(raw.id);
   }
 
-  const totalFromUser = roundedMoney(
+  const fullTotalFromUser = roundedMoney(
     valueFromUser.reduce((total, item) => total + item.amount_inr, 0)
   );
-  const totalFromCounterparty = roundedMoney(
+  const fullTotalFromCounterparty = roundedMoney(
     valueFromCounterparty.reduce((total, item) => total + item.amount_inr, 0)
   );
-  const netBalance = roundedMoney(totalFromUser - totalFromCounterparty);
+  const netBalance = roundedMoney(fullTotalFromUser - fullTotalFromCounterparty);
 
   const byDate = (
     a: CounterpartyBalanceItem | CounterpartyBalanceUncertainItem,
@@ -1280,13 +1334,64 @@ export function getCounterpartyBalance(
   valueFromCounterparty.sort(byDate);
   uncertain.sort(byDate);
 
+  const currentValueFromUser = valueFromUser.filter(
+    (item) => !archivedSourceIds.has(item.source_id)
+  );
+  const currentValueFromCounterparty = valueFromCounterparty.filter(
+    (item) => !archivedSourceIds.has(item.source_id)
+  );
+  const currentUncertain = uncertain.filter(
+    (item) =>
+      !archivedSourceIds.has(item.source_id) &&
+      !archivedUncertainSourceIds.has(item.source_id)
+  );
+  const returnedValueFromUser = view === "current" ? currentValueFromUser : valueFromUser;
+  const returnedValueFromCounterparty =
+    view === "current" ? currentValueFromCounterparty : valueFromCounterparty;
+  const returnedUncertain = view === "current" ? currentUncertain : uncertain;
+  const totalFromUser = roundedMoney(
+    returnedValueFromUser.reduce((total, item) => total + item.amount_inr, 0)
+  );
+  const totalFromCounterparty = roundedMoney(
+    returnedValueFromCounterparty.reduce((total, item) => total + item.amount_inr, 0)
+  );
+  // Re-derive the opening balance from the authoritative lifetime net. This
+  // keeps the current tab exact if an archived item is later corrected, while
+  // newly backfilled source ids remain visible as current activity.
+  const openingBalance =
+    view === "current" && checkpointFact
+      ? roundedMoney(netBalance - (totalFromUser - totalFromCounterparty))
+      : 0;
+  const checkpoint: CounterpartyBalanceCheckpoint | null =
+    view === "current" && checkpointFact
+      ? {
+          id: checkpointFact.fact.id,
+          created_at:
+            typeof checkpointFact.value?.created_at === "string"
+              ? checkpointFact.value.created_at
+              : checkpointFact.fact.created_at,
+          reason:
+            typeof checkpointFact.value?.reason === "string"
+              ? checkpointFact.value.reason
+              : null,
+          original_opening_balance_inr: roundedMoney(
+            Number(checkpointFact.value?.opening_balance_inr)
+          ),
+          archived_item_count: archivedSourceIds.size,
+          archived_uncertain_count: archivedUncertainSourceIds.size,
+        }
+      : null;
+
   return {
     counterparty,
     since: filters.since ?? null,
     until: filters.until ?? null,
-    value_from_user: valueFromUser,
-    value_from_counterparty: valueFromCounterparty,
-    uncertain,
+    view,
+    opening_balance_inr: openingBalance,
+    checkpoint,
+    value_from_user: returnedValueFromUser,
+    value_from_counterparty: returnedValueFromCounterparty,
+    uncertain: returnedUncertain,
     total_from_user_inr: totalFromUser,
     total_from_counterparty_inr: totalFromCounterparty,
     net_balance_inr: netBalance,
@@ -1305,7 +1410,60 @@ export function getCounterpartyBalance(
       manual_obligations:
         "Person-scoped payable facts represent expenses the counterparty covered outside tracked accounts.",
       uncertain: "Unconfirmed automatic inferences are listed separately and excluded from the net.",
+      checkpoints:
+        "Current view rolls checkpointed activity into opening_balance_inr; full view returns every original item.",
     },
+  };
+}
+
+/**
+ * Collapse the currently known two-sided history into a soft opening balance.
+ * No ledger row is mutated or settled: the checkpoint only stores which
+ * source ids the default current-tab view should fold away.
+ */
+export function createCounterpartyBalanceCheckpoint(
+  db: Database.Database,
+  input: CreateCounterpartyBalanceCheckpointInput
+): { checkpoint: ContextFact; balance: CounterpartyBalanceSummary } {
+  if (!input.counterparty.trim()) throw new Error("counterparty is required");
+  if (!input.created_by.trim()) throw new Error("created_by is required");
+
+  const lifetime = getCounterpartyBalance(db, input.counterparty, { view: "full" });
+  const counterpartyKey = normalizedCounterparty(input.counterparty);
+  const existingPersonFacts = listContextFacts(db, { scope_type: "person" }).filter(
+    (fact) => normalizedCounterparty(fact.scope_id) === counterpartyKey
+  );
+  const canonicalScopeId =
+    existingPersonFacts.find((fact) => fact.key === "counterparty_balance_checkpoint")
+      ?.scope_id ??
+    existingPersonFacts[0]?.scope_id ??
+    input.counterparty.trim();
+  const createdAt = new Date().toISOString();
+  const archivedSourceIds = [
+    ...lifetime.value_from_user.map((item) => item.source_id),
+    ...lifetime.value_from_counterparty.map((item) => item.source_id),
+  ];
+  const archivedUncertainSourceIds = lifetime.uncertain.map((item) => item.source_id);
+  const checkpoint = setContextFact(db, {
+    scope_type: "person",
+    scope_id: canonicalScopeId,
+    key: "counterparty_balance_checkpoint",
+    value: JSON.stringify({
+      version: 1,
+      counterparty: canonicalScopeId,
+      opening_balance_inr: lifetime.net_balance_inr,
+      archived_source_ids: archivedSourceIds,
+      archived_uncertain_source_ids: archivedUncertainSourceIds,
+      created_at: createdAt,
+      reason: input.reason?.trim() || null,
+    }),
+    source: input.created_by,
+    confidence: 1,
+  });
+
+  return {
+    checkpoint,
+    balance: getCounterpartyBalance(db, canonicalScopeId, { view: "current" }),
   };
 }
 
