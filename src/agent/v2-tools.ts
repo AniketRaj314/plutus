@@ -4,6 +4,7 @@ import {
   aggregateSpendMonth,
   aggregateEnvelopeEntries,
   createCommitment,
+  createCounterpartyBalanceCheckpoint,
   createEnvelopeEntry,
   createFlexBudgetPlan,
   createReceivable,
@@ -28,6 +29,7 @@ import {
   updateSalaryProfile,
   type CommitmentStatus,
   type ContextScope,
+  type CounterpartyBalanceView,
   type EnvelopeEntryState,
   type FlexBudgetClassification,
   type FlexBudgetDailyMode,
@@ -692,7 +694,7 @@ export const v2Tools: V2ToolDefinition[] = [
   {
     name: "get_counterparty_balance",
     description:
-      "Canonical deterministic source for questions about what one person owes the user, what the user owes them, and the net balance. Returns original shared expenses, standalone payments, manual off-account obligations, uncertain items, both subtotals, and the net without allocating payments across invoices.",
+      "Canonical deterministic source for questions about what one person owes the user, what the user owes them, and the net balance. Defaults to the concise current tab: a checkpoint opening balance plus activity recorded afterward. Use view=full only when the user asks for lifetime/full history. Payments remain independent and are never allocated across invoices.",
     parameters: {
       type: "object",
       properties: {
@@ -705,6 +707,11 @@ export const v2Tools: V2ToolDefinition[] = [
           type: "string",
           description: "Optional inclusive YYYY-MM-DD end date.",
         },
+        view: {
+          type: "string",
+          enum: ["current", "full"],
+          description: "Defaults to current. Use full only for an explicit lifetime/history request.",
+        },
       },
       required: ["counterparty"],
     },
@@ -712,6 +719,27 @@ export const v2Tools: V2ToolDefinition[] = [
       getCounterpartyBalance(db, args.counterparty as string, {
         since: args.since as string | undefined,
         until: args.until as string | undefined,
+        view: args.view as CounterpartyBalanceView | undefined,
+      }),
+  },
+  {
+    name: "create_counterparty_balance_checkpoint",
+    description:
+      "Create a soft current-tab checkpoint for a person. It snapshots the exact lifetime net and source ids, then folds those items into one opening balance in future current views. It never settles, allocates, deletes, or mutates ledger history. Use when the user asks to close or roll forward a tab, or when a small near-square balance should stop old activity from cluttering future answers.",
+    parameters: {
+      type: "object",
+      properties: {
+        counterparty: { type: "string" },
+        reason: { type: ["string", "null"] },
+        created_by: { type: "string" },
+      },
+      required: ["counterparty", "created_by"],
+    },
+    handler: (db, args) =>
+      createCounterpartyBalanceCheckpoint(db, {
+        counterparty: args.counterparty as string,
+        reason: args.reason as string | null | undefined,
+        created_by: args.created_by as string,
       }),
   },
   {

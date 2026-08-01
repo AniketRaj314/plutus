@@ -442,6 +442,7 @@ const MCP_TOOL_NAMES = [
   "update_receivable",
   "list_receivables",
   "get_counterparty_balance",
+  "create_counterparty_balance_checkpoint",
   "create_commitment",
   "update_commitment",
   "list_commitments_v2",
