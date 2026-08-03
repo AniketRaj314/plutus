@@ -16,10 +16,12 @@ const {
 const {
   aggregateSpendMonth,
   aggregateEnvelopeEntries,
+  cancelFlexRecoveryReserve,
   createCommitment,
   createCounterpartyBalanceCheckpoint,
   createEnvelopeEntry,
   createFlexBudgetPlan,
+  createFlexRecoveryReserve,
   createReceivable,
   getCounterpartyBalance,
   getFlexBudgetStatus,
@@ -28,6 +30,7 @@ const {
   listCommitments,
   listContextFacts,
   listEnvelopeEntries,
+  listFlexRecoveryReserves,
   listReceivables,
   listUninterpretedTransactions,
   recordConfirmedCreditAllocation,
@@ -2368,6 +2371,10 @@ test("flex budget status reproduces daily slices, split shares, and period rollo
   const friday = getFlexBudgetStatus(db, { plan_id: plan.id, as_of: "2026-07-24" });
   assert.equal(friday.exact, true);
   assert.equal(friday.plan_spent_inr, 2060);
+  assert.equal(friday.ordinary_flex_spent_inr, 2060);
+  assert.equal(friday.active_recovery_reserve_inr, 0);
+  assert.equal(friday.spendable_remaining_inr, 42940);
+  assert.equal(friday.recovery_reserves.length, 0);
   assert.equal(friday.current_period.spent_inr, 2060);
   assert.equal(friday.current_period.remaining_inr, 3940);
   assert.equal(friday.today.nominal_target_inr, 1500);
@@ -2528,6 +2535,305 @@ test("equal-slice daily allowance uses the carry-adjusted pool and rebalances ea
   assert.equal(tuesdayOpening.today.spent_inr, 0);
   assert.equal(tuesdayOpening.today.remaining_inr, 672.5);
   assert.equal(tuesdayOpening.current_period.available_inr, 4034.97);
+  db.close();
+});
+
+test("exceptional purchases stay in monthly accounting while recovery reserves reduce future flex", () => {
+  const db = makeDb();
+  const plan = createFlexBudgetPlan(db, {
+    label: "₹45k flex challenge",
+    start_date: "2026-07-23",
+    end_date: "2026-08-20",
+    total_target_inr: 45000,
+    daily_mode: "equal_slice",
+    release_balance_on_last_day: true,
+    created_by: "telegram_user",
+    periods: [
+      { label: "23–26 Jul", start_date: "2026-07-23", end_date: "2026-07-26", target_inr: 6000 },
+      { label: "27 Jul–2 Aug", start_date: "2026-07-27", end_date: "2026-08-02", target_inr: 11000 },
+      { label: "3–9 Aug", start_date: "2026-08-03", end_date: "2026-08-09", target_inr: 11000 },
+      { label: "10–16 Aug", start_date: "2026-08-10", end_date: "2026-08-16", target_inr: 11000 },
+      { label: "17–20 Aug", start_date: "2026-08-17", end_date: "2026-08-20", target_inr: 6000 },
+    ],
+  });
+
+  const ordinary = insertTestTransaction(db, {
+    source: "amex",
+    amount: 22234.25,
+    merchant_raw: "Ordinary flex through 2 Aug",
+    datetime: "2026-08-02T12:00:00+05:30",
+    currency: "INR",
+  });
+  createEnvelopeEntry(db, {
+    raw_transaction_id: ordinary.id,
+    funding_month: "2026-09",
+    occurred_at: ordinary.datetime,
+    source: "amex",
+    card_cycle_start: "2026-07-21",
+    card_cycle_end: "2026-08-20",
+    merchant_clean: "Ordinary flex through 2 Aug",
+    treatment: "normal",
+    gross_amount_inr: 22234.25,
+    personal_impact: 22234.25,
+    cashflow_impact: 22234.25,
+    created_by: "test",
+  });
+  setFlexBudgetClassification(db, {
+    plan_id: plan.id,
+    raw_transaction_id: ordinary.id,
+    classification: "flex",
+    rationale: "Ordinary discretionary spending",
+    created_by: "test",
+  });
+
+  const ps5 = insertTestTransaction(db, {
+    source: "amex",
+    amount: 69990,
+    merchant_raw: "CROMA",
+    datetime: "2026-08-01T12:00:00+05:30",
+    currency: "INR",
+  });
+  const ps5Entry = createEnvelopeEntry(db, {
+    raw_transaction_id: ps5.id,
+    funding_month: "2026-09",
+    occurred_at: ps5.datetime,
+    source: "amex",
+    card_cycle_start: "2026-07-21",
+    card_cycle_end: "2026-08-20",
+    merchant_clean: "Croma",
+    category: "Exceptional purchase",
+    treatment: "reimbursable exceptional purchase",
+    gross_amount_inr: 69990,
+    personal_impact: 59990,
+    cashflow_impact: 69990,
+    receivable_amount: 10000,
+    notes: "₹10,000 Devfolio self-care reimbursement approved but unpaid.",
+    created_by: "telegram_user",
+  });
+  createReceivable(db, {
+    envelope_entry_id: ps5Entry.id,
+    counterparty: "Devfolio",
+    label: "PS5 self-care reimbursement",
+    amount_inr: 10000,
+    created_by: "telegram_user",
+  });
+  setFlexBudgetClassification(db, {
+    plan_id: plan.id,
+    raw_transaction_id: ps5.id,
+    classification: "excluded",
+    rationale: "Exceptional one-off; recovery is represented prospectively by a reserve.",
+    created_by: "telegram_user",
+  });
+
+  const beforeReserve = getFlexBudgetStatus(db, { plan_id: plan.id, as_of: "2026-08-03" });
+  assert.equal(beforeReserve.ordinary_flex_spent_inr, 22234.25);
+  assert.equal(beforeReserve.ordinary_remaining_before_reserves_inr, 22765.75);
+  assert.equal(beforeReserve.active_recovery_reserve_inr, 0);
+  assert.equal(beforeReserve.spendable_remaining_inr, 22765.75);
+  assert.equal(
+    beforeReserve.transactions.find((row) => row.raw_transaction_id === ps5.id).flex_impact_inr,
+    0
+  );
+
+  const reserve = createFlexRecoveryReserve(db, {
+    plan_id: plan.id,
+    label: "PS5 flex recovery",
+    amount_inr: 10000,
+    start_date: "2026-08-03",
+    end_date: "2026-08-20",
+    linked_raw_transaction_id: ps5.id,
+    created_by: "telegram_user",
+    notes: "Prospective savings discipline; not historical PS5 flex spend.",
+    allocations: [
+      { period_id: plan.periods[2].id, amount_inr: 3888.89 },
+      { period_id: plan.periods[3].id, amount_inr: 3888.89 },
+      { period_id: plan.periods[4].id, amount_inr: 2222.22 },
+    ],
+  });
+  assert.equal(reserve.allocations.reduce((sum, row) => sum + row.amount_inr, 0), 10000);
+
+  const status = getFlexBudgetStatus(db, { plan_id: plan.id, as_of: "2026-08-03" });
+  assert.equal(status.exact, true);
+  assert.equal(status.ordinary_flex_spent_inr, 22234.25);
+  assert.equal(status.ordinary_remaining_before_reserves_inr, 22765.75);
+  assert.equal(status.active_recovery_reserve_inr, 10000);
+  assert.equal(status.spendable_remaining_inr, 12765.75);
+  assert.equal(status.plan_remaining_inr, 12765.75);
+  assert.equal(status.recovery_reserves.length, 1);
+  assert.equal(status.current_period.carry_in_inr, -5234.25);
+  assert.equal(status.current_period.recovery_reserve_inr, 3888.89);
+  assert.equal(status.current_period.effective_target_inr, 1876.86);
+  assert.equal(status.current_period.available_inr, 1876.86);
+  assert.equal(status.today.effective_target_inr, 268.12);
+  assert.equal(status.today.remaining_inr, 268.12);
+  assert.equal(status.periods[3].adjusted_target_inr, 7111.11);
+  assert.equal(status.periods[4].adjusted_target_inr, 3777.78);
+
+  const august = aggregateSpendMonth(db, { spend_month: "2026-08" });
+  assert.equal(august.gross_amount_inr, 92224.25);
+  assert.equal(august.personal_impact, 82224.25);
+  assert.equal(august.cashflow_impact, 92224.25);
+  assert.equal(august.receivable_amount, 10000);
+  assert.equal(august.outstanding_receivables, 10000);
+
+  setContextFact(db, {
+    scope_type: "transaction",
+    scope_id: ps5.id,
+    key: "potential_asset_sale",
+    value: JSON.stringify({ asset: "Insta360", hoped_amount_inr: 30000, status: "goal_only" }),
+    source: "telegram_user",
+    confidence: 1,
+  });
+  const afterSaleGoal = getFlexBudgetStatus(db, { plan_id: plan.id, as_of: "2026-08-03" });
+  assert.equal(afterSaleGoal.spendable_remaining_inr, 12765.75);
+  assert.equal(aggregateSpendMonth(db, { spend_month: "2026-08" }).personal_impact, 82224.25);
+
+  const alert = formatV2Transaction(ps5, {
+    status: "interpreted",
+    entry: ps5Entry,
+    flex_budget: status,
+  });
+  assert.match(alert, /Flex: excluded/);
+  assert.doesNotMatch(alert, /recovery reserve/i);
+  assert.equal(alert.split("\n").filter((line) => line.includes("Flex")).length, 1);
+
+  const newSpend = insertTestTransaction(db, {
+    source: "amex",
+    amount: 100,
+    merchant_raw: "Coffee",
+    datetime: "2026-08-03T15:00:00+05:30",
+    currency: "INR",
+  });
+  createEnvelopeEntry(db, {
+    raw_transaction_id: newSpend.id,
+    funding_month: "2026-09",
+    occurred_at: newSpend.datetime,
+    source: "amex",
+    card_cycle_start: "2026-07-21",
+    card_cycle_end: "2026-08-20",
+    merchant_clean: "Coffee",
+    treatment: "normal",
+    gross_amount_inr: 100,
+    personal_impact: 100,
+    cashflow_impact: 100,
+    created_by: "test",
+  });
+  setFlexBudgetClassification(db, {
+    plan_id: plan.id,
+    raw_transaction_id: newSpend.id,
+    classification: "flex",
+    rationale: "Ordinary flex spend",
+    created_by: "test",
+  });
+  const afterCoffee = getFlexBudgetStatus(db, { plan_id: plan.id, as_of: "2026-08-03" });
+  assert.equal(afterCoffee.ordinary_flex_spent_inr, 22334.25);
+  assert.equal(afterCoffee.spendable_remaining_inr, 12665.75);
+  assert.equal(afterCoffee.current_period.available_inr, 1776.86);
+  assert.equal(afterCoffee.today.remaining_inr, 168.12);
+
+  insertRawTransaction(db, {
+    source: "amex",
+    amount: 575,
+    merchant_raw: "Unresolved dinner",
+    occurred_at: "2026-08-03T20:00:00+05:30",
+    direction: "debit",
+  });
+  const provisional = getFlexBudgetStatus(db, { plan_id: plan.id, as_of: "2026-08-03" });
+  assert.equal(provisional.exact, false);
+  assert.equal(provisional.unresolved.length, 1);
+  assert.equal(provisional.active_recovery_reserve_inr, 10000);
+  db.close();
+});
+
+test("recovery reserve cancellation and revision preserve history and recalculate flex", () => {
+  const db = makeDb();
+  const plan = createFlexBudgetPlan(db, {
+    label: "Reserve lifecycle",
+    start_date: "2026-08-03",
+    end_date: "2026-08-09",
+    total_target_inr: 7000,
+    created_by: "test",
+    periods: [
+      { label: "3–9 Aug", start_date: "2026-08-03", end_date: "2026-08-09", target_inr: 7000 },
+    ],
+  });
+  assert.throws(
+    () =>
+      createFlexRecoveryReserve(db, {
+        plan_id: plan.id,
+        label: "Broken reserve",
+        amount_inr: 1000,
+        start_date: plan.start_date,
+        end_date: plan.end_date,
+        created_by: "test",
+        allocations: [{ period_id: plan.periods[0].id, amount_inr: 999.99 }],
+      }),
+    /must total/
+  );
+  const original = createFlexRecoveryReserve(db, {
+    plan_id: plan.id,
+    label: "Original reserve",
+    amount_inr: 1000,
+    start_date: plan.start_date,
+    end_date: plan.end_date,
+    created_by: "test",
+    allocations: [{ period_id: plan.periods[0].id, amount_inr: 1000 }],
+  });
+  assert.equal(
+    getFlexBudgetStatus(db, { plan_id: plan.id, as_of: "2026-08-03" }).spendable_remaining_inr,
+    6000
+  );
+  assert.throws(
+    () =>
+      createFlexBudgetPlan(db, {
+        label: "Unsafe replacement plan",
+        start_date: plan.start_date,
+        end_date: plan.end_date,
+        total_target_inr: 7000,
+        created_by: "test",
+        supersedes_id: plan.id,
+        periods: [
+          {
+            label: "Replacement period",
+            start_date: plan.start_date,
+            end_date: plan.end_date,
+            target_inr: 7000,
+          },
+        ],
+      }),
+    /cancel active recovery reserves/
+  );
+
+  const revised = createFlexRecoveryReserve(db, {
+    plan_id: plan.id,
+    label: "Revised reserve",
+    amount_inr: 1500,
+    start_date: plan.start_date,
+    end_date: plan.end_date,
+    created_by: "test",
+    supersedes_id: original.id,
+    allocations: [{ period_id: plan.periods[0].id, amount_inr: 1500 }],
+  });
+  assert.equal(
+    getFlexBudgetStatus(db, { plan_id: plan.id, as_of: "2026-08-03" }).spendable_remaining_inr,
+    5500
+  );
+  assert.equal(listFlexRecoveryReserves(db, { plan_id: plan.id }).length, 1);
+  const history = listFlexRecoveryReserves(db, { plan_id: plan.id, include_history: true });
+  assert.equal(history.length, 2);
+  assert.equal(history.find((row) => row.id === original.id).status, "superseded");
+  assert.equal(history.find((row) => row.id === original.id).replaced_by_id, revised.id);
+
+  cancelFlexRecoveryReserve(db, revised.id, { notes: "Recovery no longer needed" });
+  const cancelled = getFlexBudgetStatus(db, { plan_id: plan.id, as_of: "2026-08-03" });
+  assert.equal(cancelled.active_recovery_reserve_inr, 0);
+  assert.equal(cancelled.spendable_remaining_inr, 7000);
+  assert.equal(
+    listFlexRecoveryReserves(db, { plan_id: plan.id, include_history: true }).find(
+      (row) => row.id === revised.id
+    ).status,
+    "cancelled"
+  );
   db.close();
 });
 
@@ -2693,6 +2999,9 @@ test("all v2 MCP tools are registered for external agents", () => {
     "get_active_flex_budget_plan",
     "set_flex_budget_classification",
     "get_flex_budget_status",
+    "create_flex_recovery_reserve",
+    "list_flex_recovery_reserves",
+    "cancel_flex_recovery_reserve",
     "set_context_fact",
     "list_context_facts",
     "create_receivable",
@@ -2725,6 +3034,9 @@ test("production MCP surface exposes v2 finance tools and no legacy envelope mut
   assert.equal(names.includes("interpret_pending_transactions"), true);
   assert.equal(names.includes("get_counterparty_balance"), true);
   assert.equal(names.includes("create_counterparty_balance_checkpoint"), true);
+  assert.equal(names.includes("create_flex_recovery_reserve"), true);
+  assert.equal(names.includes("list_flex_recovery_reserves"), true);
+  assert.equal(names.includes("cancel_flex_recovery_reserve"), true);
   assert.equal(names.includes("search_transaction_emails"), true);
   assert.equal(names.includes("post_agent_message"), true);
   assert.equal(names.includes("get_envelope"), false);
@@ -2851,6 +3163,11 @@ test("Violet is required to query raw storage for recent transaction questions",
   );
   assert.match(prompt, /today\.effective_target_inr is the dynamically rebalanced allowance/);
   assert.match(prompt, /today\.nominal_target_inr is only the plan's original pace/);
+  assert.match(prompt, /exceptional one-off purchase/);
+  assert.match(prompt, /flex recovery reserve/);
+  assert.match(prompt, /never create a competing daily-budget system/);
+  assert.match(prompt, /potential asset sale/);
+  assert.match(prompt, /Do not repeat the full recovery-reserve explanation/);
   assert.match(prompt, /call get_counterparty_balance immediately before answering/);
   assert.match(prompt, /include one short net-balance line/);
   assert.match(prompt, /create_counterparty_balance_checkpoint/);

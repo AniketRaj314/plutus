@@ -273,6 +273,45 @@ export function runMigrations(db: Database.Database): void {
       FOREIGN KEY (replaced_by_id) REFERENCES flex_budget_classifications(id)
     );
 
+    -- Recovery reserves are user/AI-authored prospective reductions to an
+    -- existing flex plan. Exact per-period allocations keep arithmetic stable
+    -- without pretending the linked exceptional purchase was ordinary flex
+    -- spending or introducing a second daily-budget system.
+    CREATE TABLE IF NOT EXISTS flex_recovery_reserves (
+      id TEXT PRIMARY KEY,
+      plan_id TEXT NOT NULL,
+      label TEXT NOT NULL,
+      amount_inr REAL NOT NULL CHECK (amount_inr > 0),
+      start_date TEXT NOT NULL,
+      end_date TEXT NOT NULL,
+      linked_raw_transaction_id TEXT,
+      allocation_policy TEXT NOT NULL DEFAULT 'exact_period_allocations',
+      status TEXT NOT NULL DEFAULT 'active'
+        CHECK (status IN ('active', 'cancelled', 'superseded')),
+      notes TEXT,
+      created_by TEXT NOT NULL,
+      supersedes_id TEXT,
+      superseded_at TEXT,
+      replaced_by_id TEXT,
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+      FOREIGN KEY (plan_id) REFERENCES flex_budget_plans(id),
+      FOREIGN KEY (linked_raw_transaction_id) REFERENCES raw_transactions(id),
+      FOREIGN KEY (supersedes_id) REFERENCES flex_recovery_reserves(id),
+      FOREIGN KEY (replaced_by_id) REFERENCES flex_recovery_reserves(id)
+    );
+
+    CREATE TABLE IF NOT EXISTS flex_recovery_reserve_allocations (
+      id TEXT PRIMARY KEY,
+      reserve_id TEXT NOT NULL,
+      period_id TEXT NOT NULL,
+      amount_inr REAL NOT NULL CHECK (amount_inr > 0),
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      FOREIGN KEY (reserve_id) REFERENCES flex_recovery_reserves(id) ON DELETE CASCADE,
+      FOREIGN KEY (period_id) REFERENCES flex_budget_periods(id),
+      UNIQUE (reserve_id, period_id)
+    );
+
     CREATE INDEX IF NOT EXISTS idx_transactions_datetime ON transactions (datetime);
     CREATE INDEX IF NOT EXISTS idx_transactions_source ON transactions (source);
     CREATE INDEX IF NOT EXISTS idx_splits_transaction_id ON splits (transaction_id);
@@ -294,6 +333,10 @@ export function runMigrations(db: Database.Database): void {
     CREATE UNIQUE INDEX IF NOT EXISTS idx_flex_budget_classifications_active
       ON flex_budget_classifications (plan_id, raw_transaction_id)
       WHERE superseded_at IS NULL;
+    CREATE INDEX IF NOT EXISTS idx_flex_recovery_reserves_plan_status
+      ON flex_recovery_reserves (plan_id, status, start_date, end_date);
+    CREATE INDEX IF NOT EXISTS idx_flex_recovery_reserve_allocations_reserve
+      ON flex_recovery_reserve_allocations (reserve_id, period_id);
     CREATE INDEX IF NOT EXISTS idx_raw_transactions_occurred_at ON raw_transactions (occurred_at);
     CREATE INDEX IF NOT EXISTS idx_raw_transactions_source ON raw_transactions (source);
     CREATE UNIQUE INDEX IF NOT EXISTS idx_raw_transactions_email
