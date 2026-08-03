@@ -31,6 +31,7 @@ const {
   listContextFacts,
   listEnvelopeEntries,
   listFlexRecoveryReserves,
+  listRawTransactions,
   listReceivables,
   listUninterpretedTransactions,
   recordConfirmedCreditAllocation,
@@ -471,6 +472,59 @@ test("Gmail distinguishes ignored mail from an unparseable likely transaction al
   assert.equal(await processMessage(db, informational), "ignored");
   assert.equal(isLikelyTransactionAlert(idfcPaymentReminder), false);
   assert.equal(await processMessage(db, idfcPaymentReminder), "ignored");
+  db.close();
+});
+
+test("IDFC card payment confirmations clear retry state without degrading Gmail polling", async () => {
+  const db = makeDb();
+  resetSchedulerHealthForTests();
+  configureScheduler("gmail_poll", { label: "Gmail", interval_minutes: 5, enabled: true });
+  const message = {
+    id: "idfc-card-payment-received",
+    internalDate: String(Date.parse("2026-08-01T19:16:51.000Z")),
+    snippet:
+      "Dear Customer, Payment of Rs. 1036.00 was received on your FIRST Classic Credit Card ending with XX6198 on 02 Aug 2026.",
+    payload: {
+      headers: [
+        { name: "From", value: "<noreply@idfcfirstbank.com>" },
+        {
+          name: "Subject",
+          value: "Payment received for IDFC FIRST Credit Card ending XX6198",
+        },
+      ],
+      mimeType: "text/plain",
+      body: {
+        data: Buffer.from(
+          "Dear Customer, Payment of Rs. 1036.00 was received on your FIRST Classic Credit Card ending with XX6198 on 02 Aug 2026."
+        ).toString("base64url"),
+      },
+    },
+  };
+  setContext(db, "unparseable_gmail_message_ids", JSON.stringify([message.id]));
+  setContext(db, "gmail_parser_revision", "icici-credit-card-v1");
+  setContext(db, "last_gmail_poll", String(Date.parse("2026-08-01T19:15:00.000Z") / 1000));
+  const gmail = {
+    users: {
+      messages: {
+        list: async () => ({ data: { messages: [{ id: message.id }] } }),
+        get: async () => ({ data: message }),
+      },
+    },
+  };
+
+  assert.equal(parseGmailMessage(message), null);
+  assert.equal(isLikelyTransactionAlert(message), false);
+  assert.equal(await processMessage(db, message), "ignored");
+  await runSchedulerCycle("gmail_poll", () => pollOnce(db, { gmail }));
+
+  assert.deepEqual(JSON.parse(getContext(db, "unparseable_gmail_message_ids").value), []);
+  assert.equal(
+    JSON.parse(getContext(db, "processed_message_ids").value).includes(message.id),
+    true
+  );
+  assert.equal(getSchedulerHealth().schedulers.gmail_poll.last_outcome, "success");
+  assert.equal(listRawTransactions(db, { source: "idfc_cc" }).length, 0);
+  resetSchedulerHealthForTests();
   db.close();
 });
 
