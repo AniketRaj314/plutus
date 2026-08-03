@@ -42,6 +42,7 @@ const {
 const { getCardCycleForDate } = require("../src/envelope/engine");
 const { tools } = require("../src/agent/tools");
 const {
+  INFERENCE_SYSTEM_PROMPT,
   inferRawTransaction,
   parseInferenceResponse,
   processInferenceQueue,
@@ -1748,6 +1749,61 @@ test("automatic inference persists a deterministic card cycle and is idempotent"
   db.close();
 });
 
+test("automatic inference asks before treating a materially large ambiguous purchase as flex", async () => {
+  const db = makeDb();
+  const plan = createFlexBudgetPlan(db, {
+    label: "Large purchase review",
+    start_date: "2026-08-01",
+    end_date: "2026-08-31",
+    total_target_inr: 12000,
+    created_by: "test",
+    periods: [
+      { label: "August", start_date: "2026-08-01", end_date: "2026-08-31", target_inr: 12000 },
+    ],
+  });
+  const raw = insertTestTransaction(db, {
+    source: "amex",
+    amount: 70000,
+    merchant_raw: "LARGE RETAILER",
+    datetime: "2026-08-03T12:00:00+05:30",
+    currency: "INR",
+  });
+  const question = "This is large relative to your flex plan. Ordinary flex, or an exceptional purchase with a recovery reserve?";
+  const outcome = await inferRawTransaction(db, raw.id, {
+    generate: async (context) => {
+      assert.equal(context.flex_budget_plan.id, plan.id);
+      assert.equal(context.flex_budget_status.total_target_inr, 12000);
+      assert.equal(context.flex_budget_status.spendable_remaining_inr, 12000);
+      assert.equal(context.flex_budget_status.current_period.available_inr, 12000);
+      assert.equal(context.flex_budget_status.pending_transaction_is_excluded_from_totals, true);
+      return inferenceProposal({
+        decision: "needs_context",
+        confidence: 0.98,
+        question,
+        flex_classification: null,
+        flex_reason: null,
+      });
+    },
+  });
+
+  assert.equal(outcome.status, "needs_context");
+  assert.equal(outcome.question, question);
+  assert.equal(listEnvelopeEntries(db, { raw_transaction_id: raw.id }).length, 0);
+  const status = getFlexBudgetStatus(db, { plan_id: plan.id, as_of: "2026-08-03" });
+  assert.equal(status.ordinary_flex_spent_inr, 0);
+  assert.equal(status.unresolved[0].raw_transaction_id, raw.id);
+  const telegramText = formatV2Transaction(raw, {
+    status: outcome.status,
+    question: outcome.question,
+  });
+  assert.match(telegramText, /Ordinary flex, or an exceptional purchase with a recovery reserve\?/);
+  assert.match(INFERENCE_SYSTEM_PROMPT, /materially large relative to the active flex plan/);
+  assert.match(INFERENCE_SYSTEM_PROMPT, /Do not initially classify the full purchase as flex/);
+  assert.match(INFERENCE_SYSTEM_PROMPT, /Never choose or propose a recovery-reserve amount/);
+  assert.match(INFERENCE_SYSTEM_PROMPT, /do not use a backend-style fixed rupee threshold/);
+  db.close();
+});
+
 test("automatic inference creates a linked receivable atomically", async () => {
   const db = makeDb();
   const raw = insertTestTransaction(db, {
@@ -2635,6 +2691,42 @@ test("exceptional purchases stay in monthly accounting while recovery reserves r
     0
   );
 
+  assert.throws(
+    () =>
+      createFlexRecoveryReserve(db, {
+        plan_id: plan.id,
+        label: "Ambiguous partial-period reserve",
+        amount_inr: 10000,
+        start_date: "2026-08-04",
+        end_date: "2026-08-20",
+        linked_raw_transaction_id: ps5.id,
+        created_by: "test",
+        allocations: [
+          { period_id: plan.periods[2].id, amount_inr: 3888.89 },
+          { period_id: plan.periods[3].id, amount_inr: 3888.89 },
+          { period_id: plan.periods[4].id, amount_inr: 2222.22 },
+        ],
+      }),
+    /align exactly/
+  );
+  assert.throws(
+    () =>
+      createFlexRecoveryReserve(db, {
+        plan_id: plan.id,
+        label: "Non-contiguous reserve",
+        amount_inr: 10000,
+        start_date: "2026-08-03",
+        end_date: "2026-08-20",
+        linked_raw_transaction_id: ps5.id,
+        created_by: "test",
+        allocations: [
+          { period_id: plan.periods[2].id, amount_inr: 6000 },
+          { period_id: plan.periods[4].id, amount_inr: 4000 },
+        ],
+      }),
+    /contiguous flex budget periods/
+  );
+
   const reserve = createFlexRecoveryReserve(db, {
     plan_id: plan.id,
     label: "PS5 flex recovery",
@@ -2757,6 +2849,13 @@ test("recovery reserve cancellation and revision preserve history and recalculat
       { label: "3–9 Aug", start_date: "2026-08-03", end_date: "2026-08-09", target_inr: 7000 },
     ],
   });
+  const linkedPurchase = insertTestTransaction(db, {
+    source: "amex",
+    amount: 25000,
+    merchant_raw: "LINKED EXCEPTIONAL PURCHASE",
+    datetime: "2026-08-03T10:00:00+05:30",
+    currency: "INR",
+  });
   assert.throws(
     () =>
       createFlexRecoveryReserve(db, {
@@ -2776,6 +2875,7 @@ test("recovery reserve cancellation and revision preserve history and recalculat
     amount_inr: 1000,
     start_date: plan.start_date,
     end_date: plan.end_date,
+    linked_raw_transaction_id: linkedPurchase.id,
     created_by: "test",
     allocations: [{ period_id: plan.periods[0].id, amount_inr: 1000 }],
   });
@@ -2783,6 +2883,21 @@ test("recovery reserve cancellation and revision preserve history and recalculat
     getFlexBudgetStatus(db, { plan_id: plan.id, as_of: "2026-08-03" }).spendable_remaining_inr,
     6000
   );
+  assert.throws(
+    () =>
+      createFlexRecoveryReserve(db, {
+        plan_id: plan.id,
+        label: "Accidental duplicate",
+        amount_inr: 500,
+        start_date: plan.start_date,
+        end_date: plan.end_date,
+        linked_raw_transaction_id: linkedPurchase.id,
+        created_by: "test",
+        allocations: [{ period_id: plan.periods[0].id, amount_inr: 500 }],
+      }),
+    /already has active recovery reserve .*revise it with supersedes_id/
+  );
+  assert.equal(listFlexRecoveryReserves(db, { plan_id: plan.id }).length, 1);
   assert.throws(
     () =>
       createFlexBudgetPlan(db, {
@@ -2810,6 +2925,7 @@ test("recovery reserve cancellation and revision preserve history and recalculat
     amount_inr: 1500,
     start_date: plan.start_date,
     end_date: plan.end_date,
+    linked_raw_transaction_id: linkedPurchase.id,
     created_by: "test",
     supersedes_id: original.id,
     allocations: [{ period_id: plan.periods[0].id, amount_inr: 1500 }],

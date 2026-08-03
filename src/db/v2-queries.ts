@@ -2083,6 +2083,20 @@ export function createFlexRecoveryReserve(
   if (input.linked_raw_transaction_id && !getRawTransaction(db, input.linked_raw_transaction_id)) {
     throw new Error(`raw transaction ${input.linked_raw_transaction_id} not found`);
   }
+  if (input.linked_raw_transaction_id) {
+    const activeLinkedReserve = db
+      .prepare(
+        `SELECT id FROM flex_recovery_reserves
+         WHERE linked_raw_transaction_id = ? AND status = 'active'
+         LIMIT 1`
+      )
+      .get(input.linked_raw_transaction_id) as { id: string } | undefined;
+    if (activeLinkedReserve && activeLinkedReserve.id !== input.supersedes_id) {
+      throw new Error(
+        `raw transaction ${input.linked_raw_transaction_id} already has active recovery reserve ${activeLinkedReserve.id}; revise it with supersedes_id`
+      );
+    }
+  }
 
   const periodsById = new Map(plan.periods.map((period) => [period.id, period]));
   const seenPeriodIds = new Set<string>();
@@ -2107,6 +2121,26 @@ export function createFlexRecoveryReserve(
     }
     allocationTotal += allocation.amount_inr;
   }
+  const allocatedPeriods = plan.periods.filter((period) => seenPeriodIds.has(period.id));
+  const firstAllocatedPeriod = allocatedPeriods[0];
+  const lastAllocatedPeriod = allocatedPeriods[allocatedPeriods.length - 1];
+  const firstIndex = plan.periods.findIndex((period) => period.id === firstAllocatedPeriod.id);
+  const lastIndex = plan.periods.findIndex((period) => period.id === lastAllocatedPeriod.id);
+  const contiguousSpan = plan.periods.slice(firstIndex, lastIndex + 1);
+  if (
+    contiguousSpan.length !== allocatedPeriods.length ||
+    contiguousSpan.some((period) => !seenPeriodIds.has(period.id))
+  ) {
+    throw new Error("recovery reserve allocations must cover contiguous flex budget periods");
+  }
+  if (
+    input.start_date !== firstAllocatedPeriod.start_date ||
+    input.end_date !== lastAllocatedPeriod.end_date
+  ) {
+    throw new Error(
+      "recovery reserve dates must align exactly with the first and last allocated flex budget periods"
+    );
+  }
   if (Math.abs(allocationTotal - normalizedAmount) > 0.001) {
     throw new Error(
       `period allocations must total ₹${normalizedAmount}; received ₹${roundMoney(allocationTotal)}`
@@ -2123,6 +2157,9 @@ export function createFlexRecoveryReserve(
       if (replaced.status !== "active") throw new Error("only an active reserve can be superseded");
       if (replaced.plan_id !== input.plan_id) {
         throw new Error("a revised reserve must belong to the same flex budget plan");
+      }
+      if (replaced.linked_raw_transaction_id !== (input.linked_raw_transaction_id ?? null)) {
+        throw new Error("a revised reserve must retain the same linked raw transaction");
       }
       db.prepare(
         `UPDATE flex_recovery_reserves

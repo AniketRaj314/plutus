@@ -586,15 +586,21 @@ export const v2Tools: V2ToolDefinition[] = [
   {
     name: "create_flex_recovery_reserve",
     description:
-      "Persist a prospective reduction to an existing flex plan using exact AI/user-chosen period allocations. This never changes the linked transaction, monthly personal impact, cashflow, receivables, or counterparty balances. Use supersedes_id to revise a reserve without losing history.",
+      "Persist a prospective reduction to an existing flex plan using exact AI/user-chosen allocations across contiguous whole periods. start_date and end_date must equal the first and last allocated period boundaries. This never changes the linked transaction, monthly personal impact, cashflow, receivables, or counterparty balances. Link the originating raw transaction when one exists; it can have only one active reserve. Use supersedes_id to revise that reserve without losing history.",
     parameters: {
       type: "object",
       properties: {
         plan_id: { type: "string" },
         label: { type: "string" },
         amount_inr: { type: "number" },
-        start_date: { type: "string", description: "YYYY-MM-DD in Asia/Kolkata" },
-        end_date: { type: "string", description: "YYYY-MM-DD in Asia/Kolkata" },
+        start_date: {
+          type: "string",
+          description: "YYYY-MM-DD in Asia/Kolkata; must equal the first allocated period start",
+        },
+        end_date: {
+          type: "string",
+          description: "YYYY-MM-DD in Asia/Kolkata; must equal the last allocated period end",
+        },
         linked_raw_transaction_id: { type: ["string", "null"] },
         notes: { type: ["string", "null"] },
         created_by: { type: "string" },
@@ -602,7 +608,7 @@ export const v2Tools: V2ToolDefinition[] = [
         allocations: {
           type: "array",
           description:
-            "Exact amounts assigned to existing flex periods. The amounts must total amount_inr; the backend validates but does not choose the distribution.",
+            "Exact amounts assigned to contiguous whole flex periods. The amounts must total amount_inr; the backend validates but does not choose the distribution.",
           items: {
             type: "object",
             properties: {

@@ -335,6 +335,9 @@ export function runMigrations(db: Database.Database): void {
       WHERE superseded_at IS NULL;
     CREATE INDEX IF NOT EXISTS idx_flex_recovery_reserves_plan_status
       ON flex_recovery_reserves (plan_id, status, start_date, end_date);
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_flex_recovery_reserves_active_linked_raw
+      ON flex_recovery_reserves (linked_raw_transaction_id)
+      WHERE linked_raw_transaction_id IS NOT NULL AND status = 'active';
     CREATE INDEX IF NOT EXISTS idx_flex_recovery_reserve_allocations_reserve
       ON flex_recovery_reserve_allocations (reserve_id, period_id);
     CREATE INDEX IF NOT EXISTS idx_raw_transactions_occurred_at ON raw_transactions (occurred_at);
