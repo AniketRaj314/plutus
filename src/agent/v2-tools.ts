@@ -3,10 +3,12 @@ import { getCreditCard } from "../db/queries";
 import {
   aggregateSpendMonth,
   aggregateEnvelopeEntries,
+  cancelFlexRecoveryReserve,
   createCommitment,
   createCounterpartyBalanceCheckpoint,
   createEnvelopeEntry,
   createFlexBudgetPlan,
+  createFlexRecoveryReserve,
   createReceivable,
   getActiveFlexBudgetPlan,
   getActiveSalaryProfile,
@@ -18,6 +20,7 @@ import {
   listContextFacts,
   listEnvelopeEntries,
   listFlexBudgetPlans,
+  listFlexRecoveryReserves,
   listReceivables,
   listRawTransactions,
   listUninterpretedTransactions,
@@ -34,6 +37,7 @@ import {
   type FlexBudgetClassification,
   type FlexBudgetDailyMode,
   type FlexBudgetPlanStatus,
+  type FlexRecoveryReserveStatus,
   type LedgerGroupBy,
   type ReceivableStatus,
   type TransactionDirection,
@@ -58,6 +62,11 @@ const TRANSACTION_DIRECTIONS: TransactionDirection[] = ["debit", "credit"];
 const FLEX_BUDGET_CLASSIFICATIONS: FlexBudgetClassification[] = ["flex", "fixed", "excluded"];
 const FLEX_BUDGET_PLAN_STATES: FlexBudgetPlanStatus[] = ["active", "completed", "cancelled", "superseded"];
 const FLEX_BUDGET_DAILY_MODES: FlexBudgetDailyMode[] = ["equal_slice", "period_pool"];
+const FLEX_RECOVERY_RESERVE_STATES: FlexRecoveryReserveStatus[] = [
+  "active",
+  "cancelled",
+  "superseded",
+];
 
 function resolvedInrAmount(transaction: NonNullable<ReturnType<typeof getRawTransaction>>): number {
   if (transaction.is_international) return transaction.amount_inr ?? 0;
@@ -433,7 +442,7 @@ export const v2Tools: V2ToolDefinition[] = [
   {
     name: "create_flex_budget_plan",
     description:
-      "Persist an AI/user-chosen flex-spending challenge and its exact date buckets. The service validates the schedule and target sum but does not decide the budget or which spending is discretionary. Use supersedes_id to revise a plan without losing history.",
+      "Persist an AI/user-chosen flex-spending challenge and its exact date buckets. The service validates the schedule and target sum but does not decide the budget or which spending is discretionary. Use supersedes_id to revise a plan without losing history. Cancel active recovery reserves first, then recreate them against the replacement plan's periods.",
     parameters: {
       type: "object",
       properties: {
@@ -559,7 +568,7 @@ export const v2Tools: V2ToolDefinition[] = [
   {
     name: "get_flex_budget_status",
     description:
-      "Canonical deterministic source for daily, weekly/period, and total flex-budget questions. It sums only AI/user-classified flex transactions using their active personal impact, exposes unresolved rows, carries completed-period variance forward, and applies the stored daily policy. In equal_slice mode, today's effective target evenly divides the effective pool remaining before today across all remaining days.",
+      "Canonical deterministic source for daily, weekly/period, and total flex-budget questions. It sums ordinary AI/user-classified flex transactions, subtracts active recovery reserves from their exact stored period allocations, exposes unresolved rows, carries completed-period variance forward, and applies the plan's stored daily policy. In equal_slice mode, today's effective target evenly divides the reserve-adjusted pool remaining before today across the remaining period days.",
     parameters: {
       type: "object",
       properties: {
@@ -573,6 +582,105 @@ export const v2Tools: V2ToolDefinition[] = [
         plan_id: args.plan_id as string | undefined,
         as_of: args.as_of as string | undefined,
       }),
+  },
+  {
+    name: "create_flex_recovery_reserve",
+    description:
+      "Persist a prospective reduction to an existing flex plan using exact AI/user-chosen allocations across contiguous whole periods. start_date and end_date must equal the first and last allocated period boundaries. This never changes the linked transaction, monthly personal impact, cashflow, receivables, or counterparty balances. Link the originating raw transaction when one exists; it can have only one active reserve. Use supersedes_id to revise that reserve without losing history.",
+    parameters: {
+      type: "object",
+      properties: {
+        plan_id: { type: "string" },
+        label: { type: "string" },
+        amount_inr: { type: "number" },
+        start_date: {
+          type: "string",
+          description: "YYYY-MM-DD in Asia/Kolkata; must equal the first allocated period start",
+        },
+        end_date: {
+          type: "string",
+          description: "YYYY-MM-DD in Asia/Kolkata; must equal the last allocated period end",
+        },
+        linked_raw_transaction_id: { type: ["string", "null"] },
+        notes: { type: ["string", "null"] },
+        created_by: { type: "string" },
+        supersedes_id: { type: "string" },
+        allocations: {
+          type: "array",
+          description:
+            "Exact amounts assigned to contiguous whole flex periods. The amounts must total amount_inr; the backend validates but does not choose the distribution.",
+          items: {
+            type: "object",
+            properties: {
+              period_id: { type: "string" },
+              amount_inr: { type: "number" },
+            },
+            required: ["period_id", "amount_inr"],
+          },
+        },
+      },
+      required: [
+        "plan_id",
+        "label",
+        "amount_inr",
+        "start_date",
+        "end_date",
+        "created_by",
+        "allocations",
+      ],
+    },
+    handler: (db, args) =>
+      createFlexRecoveryReserve(db, {
+        plan_id: args.plan_id as string,
+        label: args.label as string,
+        amount_inr: args.amount_inr as number,
+        start_date: args.start_date as string,
+        end_date: args.end_date as string,
+        linked_raw_transaction_id: args.linked_raw_transaction_id as string | null | undefined,
+        notes: args.notes as string | null | undefined,
+        created_by: args.created_by as string,
+        supersedes_id: args.supersedes_id as string | undefined,
+        allocations: args.allocations as Array<{ period_id: string; amount_inr: number }>,
+      }),
+  },
+  {
+    name: "list_flex_recovery_reserves",
+    description:
+      "List active recovery reserves for a flex plan by default, including their exact period allocations. Set include_history=true or a lifecycle status to inspect cancelled and superseded versions.",
+    parameters: {
+      type: "object",
+      properties: {
+        plan_id: { type: "string" },
+        reserve_id: { type: "string" },
+        status: { type: "string", enum: FLEX_RECOVERY_RESERVE_STATES },
+        include_history: { type: "boolean" },
+      },
+      required: [],
+    },
+    handler: (db, args) =>
+      listFlexRecoveryReserves(db, {
+        plan_id: args.plan_id as string | undefined,
+        reserve_id: args.reserve_id as string | undefined,
+        status: args.status as FlexRecoveryReserveStatus | undefined,
+        include_history: args.include_history as boolean | undefined,
+      }),
+  },
+  {
+    name: "cancel_flex_recovery_reserve",
+    description:
+      "Cancel an active recovery reserve and restore its unused flex allowance deterministically. The cancelled reserve and its allocations remain available in history.",
+    parameters: {
+      type: "object",
+      properties: {
+        id: { type: "string" },
+        notes: { type: ["string", "null"] },
+      },
+      required: ["id"],
+    },
+    handler: (db, args) =>
+      cancelFlexRecoveryReserve(db, args.id as string, {
+        notes: args.notes as string | null | undefined,
+      }) ?? { error: `recovery reserve ${String(args.id)} not found` },
   },
   {
     name: "set_context_fact",

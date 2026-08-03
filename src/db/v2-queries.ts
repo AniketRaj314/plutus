@@ -10,6 +10,7 @@ export type TransactionDirection = "debit" | "credit";
 export type FlexBudgetPlanStatus = "active" | "completed" | "cancelled" | "superseded";
 export type FlexBudgetClassification = "flex" | "fixed" | "excluded";
 export type FlexBudgetDailyMode = "equal_slice" | "period_pool";
+export type FlexRecoveryReserveStatus = "active" | "cancelled" | "superseded";
 
 export interface SalaryProfile {
   id: string;
@@ -291,6 +292,37 @@ export interface FlexBudgetClassificationRecord {
   updated_at: string;
 }
 
+export interface FlexRecoveryReserveAllocation {
+  id: string;
+  reserve_id: string;
+  period_id: string;
+  amount_inr: number;
+  created_at: string;
+}
+
+export interface FlexRecoveryReserve {
+  id: string;
+  plan_id: string;
+  label: string;
+  amount_inr: number;
+  start_date: string;
+  end_date: string;
+  linked_raw_transaction_id: string | null;
+  allocation_policy: "exact_period_allocations";
+  status: FlexRecoveryReserveStatus;
+  notes: string | null;
+  created_by: string;
+  supersedes_id: string | null;
+  superseded_at: string | null;
+  replaced_by_id: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface FlexRecoveryReserveWithAllocations extends FlexRecoveryReserve {
+  allocations: FlexRecoveryReserveAllocation[];
+}
+
 export interface FlexBudgetPlanWithPeriods extends FlexBudgetPlan {
   periods: FlexBudgetPeriod[];
 }
@@ -322,6 +354,22 @@ export interface SetFlexBudgetClassificationInput {
   rationale?: string;
   confidence?: number;
   created_by: string;
+}
+
+export interface CreateFlexRecoveryReserveInput {
+  plan_id: string;
+  label: string;
+  amount_inr: number;
+  start_date: string;
+  end_date: string;
+  linked_raw_transaction_id?: string | null;
+  notes?: string | null;
+  created_by: string;
+  supersedes_id?: string;
+  allocations: Array<{
+    period_id: string;
+    amount_inr: number;
+  }>;
 }
 
 function assertFundingMonth(value: string): void {
@@ -1791,6 +1839,19 @@ export function createFlexBudgetPlan(
   if (Math.abs(targetSum - input.total_target_inr) > 0.01) {
     throw new Error("period targets must add up to total_target_inr");
   }
+  if (input.supersedes_id) {
+    const activeReserve = db
+      .prepare(
+        `SELECT id FROM flex_recovery_reserves
+         WHERE plan_id = ? AND status = 'active' LIMIT 1`
+      )
+      .get(input.supersedes_id) as { id: string } | undefined;
+    if (activeReserve) {
+      throw new Error(
+        "cancel active recovery reserves before revising this flex plan, then recreate them with allocations for the new periods"
+      );
+    }
+  }
 
   return db.transaction(() => {
     const id = newId();
@@ -1945,6 +2006,233 @@ export function setFlexBudgetClassification(
   })();
 }
 
+export function getFlexRecoveryReserve(
+  db: Database.Database,
+  id: string
+): FlexRecoveryReserveWithAllocations | undefined {
+  const reserve = db.prepare("SELECT * FROM flex_recovery_reserves WHERE id = ?").get(id) as
+    | FlexRecoveryReserve
+    | undefined;
+  if (!reserve) return undefined;
+  const allocations = db
+    .prepare(
+      `SELECT * FROM flex_recovery_reserve_allocations
+       WHERE reserve_id = ? ORDER BY created_at ASC, period_id ASC`
+    )
+    .all(id) as FlexRecoveryReserveAllocation[];
+  return { ...reserve, allocations };
+}
+
+export function listFlexRecoveryReserves(
+  db: Database.Database,
+  filters: {
+    plan_id?: string;
+    status?: FlexRecoveryReserveStatus;
+    reserve_id?: string;
+    include_history?: boolean;
+  } = {}
+): FlexRecoveryReserveWithAllocations[] {
+  const clauses: string[] = [];
+  const params: Record<string, unknown> = {};
+  if (filters.plan_id) {
+    clauses.push("plan_id = @plan_id");
+    params.plan_id = filters.plan_id;
+  }
+  if (filters.status) {
+    clauses.push("status = @status");
+    params.status = filters.status;
+  } else if (!filters.include_history) {
+    clauses.push("status = 'active'");
+  }
+  if (filters.reserve_id) {
+    clauses.push("id = @reserve_id");
+    params.reserve_id = filters.reserve_id;
+  }
+  const where = clauses.length ? `WHERE ${clauses.join(" AND ")}` : "";
+  const reserves = db
+    .prepare(`SELECT * FROM flex_recovery_reserves ${where} ORDER BY created_at DESC, id DESC`)
+    .all(params) as FlexRecoveryReserve[];
+  return reserves.map(
+    (reserve) => getFlexRecoveryReserve(db, reserve.id) as FlexRecoveryReserveWithAllocations
+  );
+}
+
+export function createFlexRecoveryReserve(
+  db: Database.Database,
+  input: CreateFlexRecoveryReserveInput
+): FlexRecoveryReserveWithAllocations {
+  const plan = getFlexBudgetPlan(db, input.plan_id);
+  if (!plan) throw new Error(`flex budget plan ${input.plan_id} not found`);
+  if (plan.status !== "active") throw new Error("recovery reserves require an active flex budget plan");
+  if (!input.label.trim()) throw new Error("label is required");
+  if (!input.created_by.trim()) throw new Error("created_by is required");
+  if (!Number.isFinite(input.amount_inr) || input.amount_inr <= 0) {
+    throw new Error("amount_inr must be positive");
+  }
+  assertDateOnly("start_date", input.start_date);
+  assertDateOnly("end_date", input.end_date);
+  if (input.start_date < plan.start_date || input.end_date > plan.end_date) {
+    throw new Error("recovery reserve dates must fall within the flex budget plan");
+  }
+  if (input.end_date < input.start_date) {
+    throw new Error("end_date must be on or after start_date");
+  }
+  if (input.allocations.length === 0) {
+    throw new Error("at least one period allocation is required");
+  }
+  if (input.linked_raw_transaction_id && !getRawTransaction(db, input.linked_raw_transaction_id)) {
+    throw new Error(`raw transaction ${input.linked_raw_transaction_id} not found`);
+  }
+  if (input.linked_raw_transaction_id) {
+    const activeLinkedReserve = db
+      .prepare(
+        `SELECT id FROM flex_recovery_reserves
+         WHERE linked_raw_transaction_id = ? AND status = 'active'
+         LIMIT 1`
+      )
+      .get(input.linked_raw_transaction_id) as { id: string } | undefined;
+    if (activeLinkedReserve && activeLinkedReserve.id !== input.supersedes_id) {
+      throw new Error(
+        `raw transaction ${input.linked_raw_transaction_id} already has active recovery reserve ${activeLinkedReserve.id}; revise it with supersedes_id`
+      );
+    }
+  }
+
+  const periodsById = new Map(plan.periods.map((period) => [period.id, period]));
+  const seenPeriodIds = new Set<string>();
+  const normalizedAmount = roundMoney(input.amount_inr);
+  const normalizedAllocations = input.allocations.map((allocation) => ({
+    ...allocation,
+    amount_inr: roundMoney(allocation.amount_inr),
+  }));
+  let allocationTotal = 0;
+  for (const [index, allocation] of normalizedAllocations.entries()) {
+    if (seenPeriodIds.has(allocation.period_id)) {
+      throw new Error(`allocations[${index}] duplicates period ${allocation.period_id}`);
+    }
+    seenPeriodIds.add(allocation.period_id);
+    const period = periodsById.get(allocation.period_id);
+    if (!period) throw new Error(`period ${allocation.period_id} does not belong to this plan`);
+    if (period.end_date < input.start_date || period.start_date > input.end_date) {
+      throw new Error(`period ${allocation.period_id} does not overlap the reserve window`);
+    }
+    if (!Number.isFinite(allocation.amount_inr) || allocation.amount_inr <= 0) {
+      throw new Error(`allocations[${index}].amount_inr must be positive`);
+    }
+    allocationTotal += allocation.amount_inr;
+  }
+  const allocatedPeriods = plan.periods.filter((period) => seenPeriodIds.has(period.id));
+  const firstAllocatedPeriod = allocatedPeriods[0];
+  const lastAllocatedPeriod = allocatedPeriods[allocatedPeriods.length - 1];
+  const firstIndex = plan.periods.findIndex((period) => period.id === firstAllocatedPeriod.id);
+  const lastIndex = plan.periods.findIndex((period) => period.id === lastAllocatedPeriod.id);
+  const contiguousSpan = plan.periods.slice(firstIndex, lastIndex + 1);
+  if (
+    contiguousSpan.length !== allocatedPeriods.length ||
+    contiguousSpan.some((period) => !seenPeriodIds.has(period.id))
+  ) {
+    throw new Error("recovery reserve allocations must cover contiguous flex budget periods");
+  }
+  if (
+    input.start_date !== firstAllocatedPeriod.start_date ||
+    input.end_date !== lastAllocatedPeriod.end_date
+  ) {
+    throw new Error(
+      "recovery reserve dates must align exactly with the first and last allocated flex budget periods"
+    );
+  }
+  if (Math.abs(allocationTotal - normalizedAmount) > 0.001) {
+    throw new Error(
+      `period allocations must total ₹${normalizedAmount}; received ₹${roundMoney(allocationTotal)}`
+    );
+  }
+
+  return db.transaction(() => {
+    let replaced: FlexRecoveryReserve | undefined;
+    if (input.supersedes_id) {
+      replaced = db
+        .prepare("SELECT * FROM flex_recovery_reserves WHERE id = ?")
+        .get(input.supersedes_id) as FlexRecoveryReserve | undefined;
+      if (!replaced) throw new Error(`recovery reserve ${input.supersedes_id} not found`);
+      if (replaced.status !== "active") throw new Error("only an active reserve can be superseded");
+      if (replaced.plan_id !== input.plan_id) {
+        throw new Error("a revised reserve must belong to the same flex budget plan");
+      }
+      if (replaced.linked_raw_transaction_id !== (input.linked_raw_transaction_id ?? null)) {
+        throw new Error("a revised reserve must retain the same linked raw transaction");
+      }
+      db.prepare(
+        `UPDATE flex_recovery_reserves
+         SET status = 'superseded', superseded_at = datetime('now'), updated_at = datetime('now')
+         WHERE id = ?`
+      ).run(replaced.id);
+    }
+
+    const id = newId();
+    db.prepare(
+      `INSERT INTO flex_recovery_reserves (
+        id, plan_id, label, amount_inr, start_date, end_date,
+        linked_raw_transaction_id, allocation_policy, status, notes,
+        created_by, supersedes_id
+      ) VALUES (
+        @id, @plan_id, @label, @amount_inr, @start_date, @end_date,
+        @linked_raw_transaction_id, 'exact_period_allocations', 'active', @notes,
+        @created_by, @supersedes_id
+      )`
+    ).run({
+      id,
+      plan_id: input.plan_id,
+      label: input.label.trim(),
+      amount_inr: normalizedAmount,
+      start_date: input.start_date,
+      end_date: input.end_date,
+      linked_raw_transaction_id: input.linked_raw_transaction_id ?? null,
+      notes: input.notes?.trim() || null,
+      created_by: input.created_by,
+      supersedes_id: replaced?.id ?? null,
+    });
+    const insertAllocation = db.prepare(
+      `INSERT INTO flex_recovery_reserve_allocations (
+        id, reserve_id, period_id, amount_inr
+      ) VALUES (@id, @reserve_id, @period_id, @amount_inr)`
+    );
+    for (const allocation of normalizedAllocations) {
+      insertAllocation.run({
+        id: newId(),
+        reserve_id: id,
+        period_id: allocation.period_id,
+        amount_inr: allocation.amount_inr,
+      });
+    }
+    if (replaced) {
+      db.prepare("UPDATE flex_recovery_reserves SET replaced_by_id = ? WHERE id = ?").run(
+        id,
+        replaced.id
+      );
+    }
+    return getFlexRecoveryReserve(db, id) as FlexRecoveryReserveWithAllocations;
+  })();
+}
+
+export function cancelFlexRecoveryReserve(
+  db: Database.Database,
+  id: string,
+  input: { notes?: string | null } = {}
+): FlexRecoveryReserveWithAllocations | undefined {
+  const current = getFlexRecoveryReserve(db, id);
+  if (!current) return undefined;
+  if (current.status !== "active") throw new Error("only an active reserve can be cancelled");
+  db.prepare(
+    `UPDATE flex_recovery_reserves
+     SET status = 'cancelled', notes = @notes, updated_at = datetime('now')
+     WHERE id = @id`
+  ).run({
+    id,
+    notes: input.notes === undefined ? current.notes : input.notes?.trim() || null,
+  });
+  return getFlexRecoveryReserve(db, id);
+}
+
 interface FlexBudgetLedgerRow {
   raw_transaction_id: string;
   occurred_at: string;
@@ -1968,8 +2256,13 @@ export interface FlexBudgetStatus {
   as_of: string;
   exact: boolean;
   plan: FlexBudgetPlanWithPeriods;
+  ordinary_flex_spent_inr: number;
+  ordinary_remaining_before_reserves_inr: number;
+  active_recovery_reserve_inr: number;
+  spendable_remaining_inr: number;
   plan_spent_inr: number;
   plan_remaining_inr: number;
+  recovery_reserves: FlexRecoveryReserveWithAllocations[];
   current_period: null | {
     id: string;
     label: string;
@@ -1977,6 +2270,7 @@ export interface FlexBudgetStatus {
     end_date: string;
     nominal_target_inr: number;
     carry_in_inr: number;
+    recovery_reserve_inr: number;
     effective_target_inr: number;
     spent_inr: number;
     remaining_inr: number;
@@ -1997,6 +2291,8 @@ export interface FlexBudgetStatus {
     start_date: string;
     end_date: string;
     nominal_target_inr: number;
+    carry_in_inr: number;
+    recovery_reserve_inr: number;
     adjusted_target_inr: number;
     spent_inr: number;
     remaining_inr: number;
@@ -2120,17 +2416,36 @@ export function getFlexBudgetStatus(
         .reduce((sum, row) => sum + row.flex_impact_inr, 0)
     );
 
+  const recoveryReserves = listFlexRecoveryReserves(db, {
+    plan_id: plan.id,
+    status: "active",
+  });
+  const reserveByPeriod = new Map<string, number>();
+  for (const reserve of recoveryReserves) {
+    for (const allocation of reserve.allocations) {
+      reserveByPeriod.set(
+        allocation.period_id,
+        roundMoney((reserveByPeriod.get(allocation.period_id) ?? 0) + allocation.amount_inr)
+      );
+    }
+  }
+  const activeRecoveryReserve = roundMoney(
+    recoveryReserves.reduce((sum, reserve) => sum + reserve.amount_inr, 0)
+  );
+
   let completedCarry = 0;
   const periodStatuses = plan.periods.map((period) => {
     const spent = spentForRange(period.start_date, period.end_date < asOf ? period.end_date : asOf);
     const isPast = period.end_date < asOf;
     const isCurrent = period.start_date <= asOf && period.end_date >= asOf;
-    const adjustedTarget = roundMoney(period.target_inr + completedCarry);
+    const carryIn = completedCarry;
+    const recoveryReserve = reserveByPeriod.get(period.id) ?? 0;
+    const adjustedTarget = roundMoney(period.target_inr + carryIn - recoveryReserve);
     const remaining = roundMoney(adjustedTarget - spent);
     if (isPast) {
       completedCarry = remaining;
-    } else if (isCurrent && remaining < 0) {
-      completedCarry = remaining;
+    } else if (isCurrent) {
+      completedCarry = remaining < 0 ? remaining : 0;
     } else if (!isCurrent) {
       completedCarry = 0;
     }
@@ -2140,6 +2455,8 @@ export function getFlexBudgetStatus(
       start_date: period.start_date,
       end_date: period.end_date,
       nominal_target_inr: period.target_inr,
+      carry_in_inr: carryIn,
+      recovery_reserve_inr: recoveryReserve,
       adjusted_target_inr: adjustedTarget,
       spent_inr: spent,
       remaining_inr: remaining,
@@ -2151,14 +2468,9 @@ export function getFlexBudgetStatus(
   );
   const currentPeriod = currentIndex >= 0 ? plan.periods[currentIndex] : undefined;
   const currentPeriodStatus = currentIndex >= 0 ? periodStatuses[currentIndex] : undefined;
-  const priorNominal = currentIndex > 0
-    ? plan.periods.slice(0, currentIndex).reduce((sum, period) => sum + period.target_inr, 0)
-    : 0;
-  const priorSpent = currentIndex > 0
-    ? spentForRange(plan.start_date, addDays(currentPeriod?.start_date ?? plan.start_date, -1))
-    : 0;
-  const carryIn = roundMoney(priorNominal - priorSpent);
-  const effectiveTarget = currentPeriod ? roundMoney(currentPeriod.target_inr + carryIn) : 0;
+  const carryIn = currentPeriodStatus?.carry_in_inr ?? 0;
+  const currentRecoveryReserve = currentPeriodStatus?.recovery_reserve_inr ?? 0;
+  const effectiveTarget = currentPeriodStatus?.adjusted_target_inr ?? 0;
   const currentSpent = currentPeriod
     ? spentForRange(currentPeriod.start_date, asOf)
     : 0;
@@ -2187,13 +2499,20 @@ export function getFlexBudgetStatus(
           Math.min(currentRemaining, roundMoney(effectiveDailyTarget - todaySpent))
         );
   const planSpent = spentForRange(plan.start_date, asOf);
+  const ordinaryRemaining = roundMoney(plan.total_target_inr - planSpent);
+  const spendableRemaining = roundMoney(ordinaryRemaining - activeRecoveryReserve);
 
   return {
     as_of: asOf,
     exact: unresolved.length === 0,
     plan,
+    ordinary_flex_spent_inr: planSpent,
+    ordinary_remaining_before_reserves_inr: ordinaryRemaining,
+    active_recovery_reserve_inr: activeRecoveryReserve,
+    spendable_remaining_inr: spendableRemaining,
     plan_spent_inr: planSpent,
-    plan_remaining_inr: roundMoney(plan.total_target_inr - planSpent),
+    plan_remaining_inr: spendableRemaining,
+    recovery_reserves: recoveryReserves,
     current_period:
       currentPeriod && currentPeriodStatus
         ? {
@@ -2203,6 +2522,7 @@ export function getFlexBudgetStatus(
             end_date: currentPeriod.end_date,
             nominal_target_inr: currentPeriod.target_inr,
             carry_in_inr: carryIn,
+            recovery_reserve_inr: currentRecoveryReserve,
             effective_target_inr: effectiveTarget,
             spent_inr: currentSpent,
             remaining_inr: currentRemaining,

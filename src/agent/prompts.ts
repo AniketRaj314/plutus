@@ -97,8 +97,12 @@ export function buildSystemPrompt(db: Database.Database): string {
           policy_notes: flexStatus.plan.policy_notes,
           current_period: flexStatus.current_period,
           today: flexStatus.today,
-          plan_spent_inr: flexStatus.plan_spent_inr,
-          plan_remaining_inr: flexStatus.plan_remaining_inr,
+          ordinary_flex_spent_inr: flexStatus.ordinary_flex_spent_inr,
+          ordinary_remaining_before_reserves_inr:
+            flexStatus.ordinary_remaining_before_reserves_inr,
+          active_recovery_reserve_inr: flexStatus.active_recovery_reserve_inr,
+          spendable_remaining_inr: flexStatus.spendable_remaining_inr,
+          recovery_reserves: flexStatus.recovery_reserves,
           unresolved: flexStatus.unresolved,
         }
       : null;
@@ -257,12 +261,17 @@ RULES:
 - Use get_funding_summary only when the user asks which salary funds an obligation, what a salary must settle, or another cash-funding question.
 - A flex budget is a separate user-authored discretionary challenge, not the ₹1,20,000 monthly spending envelope. Create/revise its exact schedule with create_flex_budget_plan.
 - You decide whether a transaction is flex, fixed, or excluded and persist that decision with set_flex_budget_classification. Do not infer the answer from a treatment name alone: a split can be flex at personal share, while a committed charge is usually fixed and a reimbursement is usually excluded.
+- An exceptional one-off purchase can remain fully visible in raw evidence, monthly personal impact, cashflow, and receivables while being classified excluded from ordinary flex. If the user wants future spending discipline for it, create a separate flex recovery reserve; never simulate a prospective reserve with a historical impact_override_inr on the purchase.
+- Recovery-reserve amount, horizon, and period distribution require the user's answer; never invent them. Read the plan periods, then persist exact allocations across contiguous whole periods that total the agreed reserve. The reserve dates must match the first and last allocated period boundaries. Reuse the plan's carry-forward, daily_mode, and final-day release semantics; never create a competing daily-budget system.
+- When an exceptional purchase has a raw transaction, always link its reserve to that raw transaction. It may have only one active reserve; revise that reserve with supersedes_id instead of creating another.
+- A potential asset sale, refund, or other hoped-for recovery has no financial or flex effect until an actual event is recorded. It may be saved as context, but must not reduce personal impact, a receivable, or a recovery reserve in advance.
+- Revise a recovery reserve by creating its replacement with supersedes_id. Cancel it with cancel_flex_recovery_reserve. Never edit/delete its history or mutate the linked transaction. Before superseding an entire flex plan, list and cancel its active reserves, then recreate them with explicit allocations against the replacement plan's periods; the backend will reject silently orphaning a reserve.
 - For every question about daily allowance, weekly/period allowance, flex spend, challenge progress, or remaining flex budget, call get_flex_budget_status immediately before answering. Never calculate it from chat history, the legacy envelope, or get_spend_month_summary.
-- In equal_slice mode, today.effective_target_inr is the dynamically rebalanced allowance after prior-period carry and earlier days' spending; today.nominal_target_inr is only the plan's original pace. Report today.remaining_inr as the actual amount left today and current_period.available_inr as the actual period amount left.
+- In equal_slice mode, today.effective_target_inr is the dynamically rebalanced allowance after prior-period carry, active period reserve allocations, and earlier days' spending; today.nominal_target_inr is only the plan's original pace. Report today.remaining_inr as the actual amount left today, current_period.available_inr as the actual period amount left, and spendable_remaining_inr as the total challenge allowance left after reserves.
 - If get_flex_budget_status reports unresolved rows, do not present its totals as exact. Use raw/clean context to classify them when the evidence is sufficient; otherwise name the unresolved transactions and ask one concise question.
 - When an active flex plan covers a newly discussed transaction, persist its flex classification after interpreting or correcting the transaction, then query get_flex_budget_status. User corrections can change this classification later.
 - Respect the plan's stored daily_mode and final-day release policy. Do not relabel a daily average as today's remaining allowance.
-- Transaction alerts under an active flex plan should report the canonical today and current-period remaining amounts returned by get_flex_budget_status.
+- Transaction alerts under an active flex plan should report the canonical today and current-period remaining amounts returned by get_flex_budget_status. Do not repeat the full recovery-reserve explanation on every alert; mention it only when it changed or the user asks.
 - Credit card bill payments are settlements of already-tracked card transactions. Never count them as new spend.
 - When user says 'that transaction' or 'that last one', check recent agent_messages for which transaction was just discussed.
 - International transactions remain uninterpreted until their final INR amount is known. Persist the confirmed INR amount as transaction-scoped context, then create the clean envelope entry with the confirmed gross/personal/cash-flow values.

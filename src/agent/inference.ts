@@ -7,6 +7,7 @@ import {
   createReceivable,
   getActiveFlexBudgetPlan,
   getActiveSalaryProfile,
+  getFlexBudgetStatus,
   getRawTransaction,
   listCommitments,
   listContextFacts,
@@ -82,6 +83,26 @@ export interface InferenceContext {
   context_facts: ReturnType<typeof listContextFacts>;
   recent_interpretations: EnvelopeEntry[];
   flex_budget_plan: ReturnType<typeof getActiveFlexBudgetPlan>;
+  flex_budget_status: null | {
+    as_of: string;
+    total_target_inr: number;
+    ordinary_flex_spent_inr: number;
+    ordinary_remaining_before_reserves_inr: number;
+    active_recovery_reserve_inr: number;
+    spendable_remaining_inr: number;
+    current_period: {
+      label: string;
+      start_date: string;
+      end_date: string;
+      available_inr: number;
+    } | null;
+    today: {
+      date: string;
+      remaining_inr: number;
+    } | null;
+    unresolved_count: number;
+    pending_transaction_is_excluded_from_totals: true;
+  };
 }
 
 export interface InferenceOutcome {
@@ -134,6 +155,37 @@ function buildInferenceContext(db: Database.Database, raw: RawTransactionV2): In
   const occurredAtIstDate = new Date(occurredAt.getTime() + 5.5 * 60 * 60 * 1000)
     .toISOString()
     .slice(0, 10);
+  const flexBudgetPlan = getActiveFlexBudgetPlan(db, occurredAtIstDate);
+  const flexStatusResult = flexBudgetPlan
+    ? getFlexBudgetStatus(db, { plan_id: flexBudgetPlan.id, as_of: occurredAtIstDate })
+    : null;
+  const flexBudgetStatus = flexStatusResult && "plan" in flexStatusResult
+    ? {
+        as_of: flexStatusResult.as_of,
+        total_target_inr: flexStatusResult.plan.total_target_inr,
+        ordinary_flex_spent_inr: flexStatusResult.ordinary_flex_spent_inr,
+        ordinary_remaining_before_reserves_inr:
+          flexStatusResult.ordinary_remaining_before_reserves_inr,
+        active_recovery_reserve_inr: flexStatusResult.active_recovery_reserve_inr,
+        spendable_remaining_inr: flexStatusResult.spendable_remaining_inr,
+        current_period: flexStatusResult.current_period
+          ? {
+              label: flexStatusResult.current_period.label,
+              start_date: flexStatusResult.current_period.start_date,
+              end_date: flexStatusResult.current_period.end_date,
+              available_inr: flexStatusResult.current_period.available_inr,
+            }
+          : null,
+        today: flexStatusResult.today
+          ? {
+              date: flexStatusResult.today.date,
+              remaining_inr: flexStatusResult.today.remaining_inr,
+            }
+          : null,
+        unresolved_count: flexStatusResult.unresolved.length,
+        pending_transaction_is_excluded_from_totals: true as const,
+      }
+    : null;
 
   return {
     raw,
@@ -156,11 +208,12 @@ function buildInferenceContext(db: Database.Database, raw: RawTransactionV2): In
       .filter((fact) => fact.key !== "automatic_inference")
       .slice(0, 150),
     recent_interpretations: listEnvelopeEntries(db, { limit: 30 }),
-    flex_budget_plan: getActiveFlexBudgetPlan(db, occurredAtIstDate),
+    flex_budget_plan: flexBudgetPlan,
+    flex_budget_status: flexBudgetStatus,
   };
 }
 
-const SYSTEM_PROMPT = `You interpret one immutable bank/card transaction for a personal finance ledger.
+export const INFERENCE_SYSTEM_PROMPT = `You interpret one immutable bank/card transaction for a personal finance ledger.
 
 Financial judgment belongs to you, not to backend rules. Use only the supplied evidence and persisted context. Return strict JSON.
 
@@ -186,6 +239,9 @@ Important rules:
 - A proposed surplus may use a semantic kind such as unallocated_surplus with receivable_id=null. Repayments and confirmed surplus do not become personal spending or extra envelope allowance.
 - For an incoming credit from a named friend or family member, do not propose invoice-level allocations among personal receivables. Ask only whether the transfer belongs on the balance with that person, and return credit_allocations as []. The Telegram agent will record a standalone counterparty_transfer fact after confirmation. Invoice-level credit_allocations are reserved for company/business reimbursements or an explicit user request to match particular items.
 - When flex_budget_plan is present, classify the transaction for that plan. "flex" means discretionary spending that consumes the challenge using its stored personal share; "fixed" means a planned/committed cost outside the challenge; "excluded" means reimbursements, bookkeeping, pass-throughs, or other activity that does not consume the challenge. This is semantic AI judgment—use the supplied plan policy and context, never merchant-name rules.
+- flex_budget_status is a compact snapshot before this pending transaction is counted. Use its total, spendable, current-period, and today amounts when judging whether a debit is materially large for this specific plan; do not use a backend-style fixed rupee threshold.
+- If a debit is plausibly discretionary but materially large relative to the active flex plan, and persisted context does not already establish whether it is ordinary flex, fixed, reimbursable, financed, or exceptional, choose needs_context. Ask whether it should be ordinary flex or an exceptional purchase with a recovery reserve. Do not initially classify the full purchase as flex.
+- Never choose or propose a recovery-reserve amount, dates, duration, or allocation without the user's answer. The conversational agent will persist the real cashflow/personal/receivable treatment, exclude an agreed exceptional purchase from ordinary flex, and create the user-agreed reserve separately.
 - Split spending can be flex: its flex impact will come from personal_impact, not the gross charge.
 - If there is no flex_budget_plan, return flex_classification and flex_reason as null.
 
@@ -232,7 +288,7 @@ export async function generateInferenceWithOpenAI(
     temperature: 0,
     response_format: { type: "json_object" },
     messages: [
-      { role: "system", content: SYSTEM_PROMPT },
+      { role: "system", content: INFERENCE_SYSTEM_PROMPT },
       { role: "user", content: JSON.stringify(context) },
     ],
   });
