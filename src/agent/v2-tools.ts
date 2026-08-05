@@ -540,7 +540,7 @@ export const v2Tools: V2ToolDefinition[] = [
   {
     name: "set_flex_budget_classification",
     description:
-      "Persist the AI/user decision for how one interpreted transaction affects a flex plan: flex spends its personal share, fixed stays outside the flex challenge, and excluded has no flex impact. Use impact_override_inr only when the flex amount intentionally differs from stored personal_impact.",
+      "Persist the AI/user decision for how one interpreted transaction affects a flex plan: flex spends its personal share, fixed is a genuinely committed/recurring/non-negotiable cost outside the challenge, and excluded has no flex impact. Essential is only a category description; ordinary variable groceries and dining remain flex, even when the allowance is exhausted. Use impact_override_inr only when the flex amount intentionally differs from stored personal_impact.",
     parameters: {
       type: "object",
       properties: {

@@ -1855,6 +1855,8 @@ test("automatic inference asks before treating a materially large ambiguous purc
   assert.match(INFERENCE_SYSTEM_PROMPT, /Do not initially classify the full purchase as flex/);
   assert.match(INFERENCE_SYSTEM_PROMPT, /Never choose or propose a recovery-reserve amount/);
   assert.match(INFERENCE_SYSTEM_PROMPT, /do not use a backend-style fixed rupee threshold/);
+  assert.match(INFERENCE_SYSTEM_PROMPT, /"Essential" is a category description, not a flex classification/);
+  assert.match(INFERENCE_SYSTEM_PROMPT, /Never classify ordinary spending as fixed because the flex budget is low, exhausted, or overdrawn/);
   db.close();
 });
 
@@ -3338,6 +3340,8 @@ test("Violet is required to query raw storage for recent transaction questions",
   assert.match(prompt, /never create a competing daily-budget system/);
   assert.match(prompt, /potential asset sale/);
   assert.match(prompt, /Do not repeat the full recovery-reserve explanation/);
+  assert.match(prompt, /"Essential" is a category description, not a reason to mark spending fixed/);
+  assert.match(prompt, /low, zero, or overdrawn flex allowance never changes a transaction's semantic classification/);
   assert.match(prompt, /call get_counterparty_balance immediately before answering/);
   assert.match(prompt, /include one short net-balance line/);
   assert.match(prompt, /create_counterparty_balance_checkpoint/);
