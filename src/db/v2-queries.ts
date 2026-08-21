@@ -230,6 +230,17 @@ export interface ConfirmCreditAllocationInput {
   created_by: string;
 }
 
+export type CounterpartyTransferDirection = "from_counterparty" | "to_counterparty";
+
+export interface RecordCounterpartyTransferInput {
+  raw_transaction_id: string;
+  counterparty: string;
+  direction: CounterpartyTransferDirection;
+  label?: string;
+  notes?: string;
+  created_by: string;
+}
+
 export interface Commitment {
   id: string;
   label: string;
@@ -1607,6 +1618,119 @@ export function recordConfirmedCreditAllocation(
       confidence: 1,
     });
     return { entry, receivables: updatedReceivables, context };
+  })();
+}
+
+/**
+ * Persist a confirmed person-to-person payment as one atomic operation.
+ *
+ * The bank event remains a zero-impact settlement in the monthly ledger while
+ * the counterparty fact places the same payment on the opposite side of the
+ * human balance. Original shared-expense receivables remain immutable history.
+ */
+export function recordCounterpartyTransfer(
+  db: Database.Database,
+  input: RecordCounterpartyTransferInput
+): { entry: EnvelopeEntry; context: ContextFact; balance: CounterpartyBalanceSummary } {
+  const raw = getRawTransaction(db, input.raw_transaction_id);
+  if (!raw) throw new Error(`transaction ${input.raw_transaction_id} not found`);
+  const counterparty = input.counterparty.trim();
+  if (!counterparty) throw new Error("counterparty is required");
+  if (!input.created_by.trim()) throw new Error("created_by is required");
+  if (input.direction !== "from_counterparty" && input.direction !== "to_counterparty") {
+    throw new Error("direction must be from_counterparty or to_counterparty");
+  }
+
+  const rawDirection = rawDirectionFromEvidence(raw);
+  const expectedRawDirection = input.direction === "from_counterparty" ? "credit" : "debit";
+  if (rawDirection !== expectedRawDirection) {
+    throw new Error(
+      `${input.direction} requires a ${expectedRawDirection} raw transaction; received ${rawDirection}`
+    );
+  }
+  const amountInr = rawAmountInr(raw);
+  if (!Number.isFinite(amountInr) || amountInr <= 0) {
+    throw new Error("counterparty transfer requires a positive resolved INR amount");
+  }
+
+  return db.transaction(() => {
+    const cashflowImpact = input.direction === "from_counterparty" ? -amountInr : amountInr;
+    const activeEntry = listEnvelopeEntries(db, {
+      raw_transaction_id: raw.id,
+      limit: 1,
+    })[0];
+    const entryIsCanonical =
+      activeEntry &&
+      activeEntry.state === "actual" &&
+      activeEntry.personal_impact === 0 &&
+      activeEntry.cashflow_impact === cashflowImpact &&
+      activeEntry.receivable_amount === 0;
+
+    let entry: EnvelopeEntry;
+    if (entryIsCanonical) {
+      entry = activeEntry;
+    } else {
+      const occurredAt = new Date(raw.occurred_at);
+      const salaryDay = getActiveSalaryProfile(db)?.salary_day ?? 1;
+      const fundingMonth =
+        activeEntry?.funding_month ?? getSalaryFundingMonthForDate(occurredAt, salaryDay);
+      entry = createEnvelopeEntry(db, {
+        raw_transaction_id: raw.id,
+        funding_month: fundingMonth,
+        occurred_at: raw.occurred_at,
+        source: raw.source,
+        merchant_clean: activeEntry?.merchant_clean ?? raw.merchant_raw ?? undefined,
+        category: "Transfer",
+        treatment: "settlement",
+        state: "actual",
+        gross_amount_inr: amountInr,
+        personal_impact: 0,
+        cashflow_impact: cashflowImpact,
+        receivable_amount: 0,
+        notes:
+          input.notes ??
+          `${input.direction === "from_counterparty" ? "Money received from" : "Money sent to"} ${counterparty}`,
+        confidence: 1,
+        created_by: input.created_by,
+        supersedes_id: activeEntry?.id,
+      });
+    }
+
+    const defaultLabel =
+      input.direction === "from_counterparty"
+        ? `Money received from ${counterparty}`
+        : `Money sent to ${counterparty}`;
+    const factValue = JSON.stringify({
+      status: "confirmed",
+      counterparty,
+      direction: input.direction,
+      amount_inr: amountInr,
+      label: input.label?.trim() || defaultLabel,
+      occurred_at: raw.occurred_at,
+      notes: input.notes?.trim() || null,
+    });
+    const existingContext = listContextFacts(db, {
+      scope_type: "transaction",
+      scope_id: raw.id,
+      key: "counterparty_transfer",
+    })[0];
+    const context =
+      existingContext?.value === factValue
+        ? existingContext
+        : setContextFact(db, {
+            scope_type: "transaction",
+            scope_id: raw.id,
+            key: "counterparty_transfer",
+            value: factValue,
+            source: input.created_by,
+            confidence: 1,
+          });
+
+    return {
+      entry,
+      context,
+      balance: getCounterpartyBalance(db, counterparty),
+    };
   })();
 }
 

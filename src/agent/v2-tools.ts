@@ -24,6 +24,7 @@ import {
   listReceivables,
   listRawTransactions,
   listUninterpretedTransactions,
+  recordCounterpartyTransfer,
   recordConfirmedCreditAllocation,
   setFlexBudgetClassification,
   setContextFact,
@@ -33,6 +34,7 @@ import {
   type CommitmentStatus,
   type ContextScope,
   type CounterpartyBalanceView,
+  type CounterpartyTransferDirection,
   type EnvelopeEntryState,
   type FlexBudgetClassification,
   type FlexBudgetDailyMode,
@@ -847,6 +849,37 @@ export const v2Tools: V2ToolDefinition[] = [
       createCounterpartyBalanceCheckpoint(db, {
         counterparty: args.counterparty as string,
         reason: args.reason as string | null | undefined,
+        created_by: args.created_by as string,
+      }),
+  },
+  {
+    name: "record_counterparty_transfer",
+    description:
+      "After the user confirms that a debit or credit is a payment involving a friend or family member, atomically store its zero-personal-impact settlement entry, the standalone counterparty transfer, and return the canonical net balance. Use this instead of separate create_envelope_entry and set_context_fact calls. Original shared-expense receivables remain unchanged.",
+    parameters: {
+      type: "object",
+      properties: {
+        raw_transaction_id: { type: "string" },
+        counterparty: { type: "string" },
+        direction: {
+          type: "string",
+          enum: ["from_counterparty", "to_counterparty"],
+          description:
+            "from_counterparty for money received; to_counterparty for money sent.",
+        },
+        label: { type: "string" },
+        notes: { type: "string" },
+        created_by: { type: "string" },
+      },
+      required: ["raw_transaction_id", "counterparty", "direction", "created_by"],
+    },
+    handler: (db, args) =>
+      recordCounterpartyTransfer(db, {
+        raw_transaction_id: args.raw_transaction_id as string,
+        counterparty: args.counterparty as string,
+        direction: args.direction as CounterpartyTransferDirection,
+        label: args.label as string | undefined,
+        notes: args.notes as string | undefined,
         created_by: args.created_by as string,
       }),
   },

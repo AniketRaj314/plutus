@@ -1,6 +1,6 @@
 {
   "name": "plutus",
-  "version": "1.9.2",
+  "version": "1.9.3",
   "description": "Personal finance tracker that reads Gmail transaction alerts and communicates via Telegram",
   "main": "dist/index.js",
   "private": true,
