@@ -25,6 +25,7 @@ import {
 import { getRemainingWeeksInMonth, parseIstDateOnly, getBillingWindow } from "../envelope/engine";
 import { getSchedulerHealth } from "../scheduler/status";
 import { describeGmailDiagnosticError, searchTransactionEmails } from "../gmail/diagnostics";
+import { countActiveTelegramContributors } from "../telegram/access";
 
 const VALID_SOURCES = ["idfc_cc", "icici_cc", "bobcard", "amex", "idfc_upi"];
 const MAX_TRANSACTIONS_LIMIT = 100;
@@ -90,7 +91,10 @@ export function registerRoutes(app: FastifyInstance, db: Database.Database): voi
       auto_inference_enabled: process.env.AUTO_INFERENCE_ENABLED !== "false",
       auto_inference_interval: process.env.AUTO_INFERENCE_INTERVAL_MINS ?? "5",
       degraded_components: degradedComponents,
-      telegram_access: telegramAccess,
+      telegram_access: {
+        ...telegramAccess,
+        active_contributor_count: countActiveTelegramContributors(db),
+      },
       ...schedulerHealth,
     };
   });
@@ -431,6 +435,9 @@ interface McpToolSpec {
 // also happens to map more directly onto tools.ts's existing JSON Schema
 // parameter definitions, so most of these are thin passthroughs.
 const MCP_TOOL_NAMES = [
+  "create_telegram_contributor_invite",
+  "list_telegram_contributors",
+  "revoke_telegram_contributor",
   "create_raw_transaction",
   "bulk_create_raw_transactions",
   "get_raw_transactions",

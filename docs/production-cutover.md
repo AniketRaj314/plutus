@@ -80,9 +80,8 @@ deploying:
 
 ```text
 TELEGRAM_OWNER_USER_ID=<Aniket's numeric Telegram user ID>
-TELEGRAM_BROTHER_USER_ID=<brother's numeric Telegram user ID>
-TELEGRAM_BROTHER_NAME=Rushil
 TELEGRAM_WEBHOOK_SECRET=<existing strong random secret>
+TELEGRAM_BOT_USERNAME=<Violet's username without @; optional, for invite links>
 ```
 
 Keep BotFather privacy mode enabled. In a group, the contributor should mention
@@ -90,17 +89,24 @@ Violet or reply to Violet; direct messages work normally. The access model is:
 
 - The owner can use the full financial agent only in a direct chat or the
   configured private Plutus group/topic.
-- The configured brother can only record a payment he personally made on the
-  owner's behalf. He cannot query transactions, balances, cards, income,
-  budgets, reimbursements, or debt history.
+- The owner can dynamically invite, list, and revoke contributors through
+  Violet. Invites are random, one-use, and expire after 24 hours by default;
+  adding another person never requires a deploy.
+- A contributor can record a payment they personally made on the owner's
+  behalf and view only their own bilateral tab with the owner: expenses either
+  person covered, direct transfers between them, and their net balance.
+- Contributors cannot query unrelated transactions, accounts, cards, income,
+  budgets, reimbursements, other people, or owner access controls. Their
+  identity is injected by the server, so they cannot substitute another name.
 - Unknown senders and unverified webhook requests are ignored before an AI or
   financial query runs.
 - Each accepted contributor purchase creates one manual raw record, one owner
   expense at the reported share with zero owner cashflow, and one payable to the
   contributor. The owner receives a separate audit alert.
 
-After deployment, `/health` must report all `telegram_access` booleans as true.
-It intentionally reports configuration state only, never either user's ID.
+After deployment, `/health` must report the Telegram access-control booleans as
+true and the expected `active_contributor_count`. It intentionally reports
+configuration state and a count only, never anyone's Telegram ID.
 
 ## 5. Rollback
 

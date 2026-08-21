@@ -74,7 +74,10 @@ const {
   searchTransactionEmails,
 } = require("../src/gmail/diagnostics");
 const { buildSystemPrompt } = require("../src/agent/prompts");
-const { buildContributorSystemPrompt } = require("../src/agent/contributor");
+const {
+  buildContributorSystemPrompt,
+  getContributorBalanceView,
+} = require("../src/agent/contributor");
 const { formatV2Transaction } = require("../src/telegram/formatter");
 const {
   configureScheduler,
@@ -88,21 +91,42 @@ const {
   getMessageIdForTransaction,
   getTransactionIdForMessage,
   handleTelegramUpdate,
+  parseTelegramContributorClaim,
   recordTransactionMessage,
   resolveTelegramActor,
 } = require("../src/telegram/bot");
+const {
+  claimTelegramContributorInvite,
+  createTelegramContributorInvite,
+  getActiveTelegramContributor,
+  listTelegramContributors,
+  revokeTelegramContributor,
+} = require("../src/telegram/access");
 
 process.env.TELEGRAM_CHAT_ID ||= "-100123456";
 process.env.TELEGRAM_THREAD_ID ||= "77";
 process.env.TELEGRAM_WEBHOOK_SECRET ||= "test-telegram-webhook-secret";
 process.env.TELEGRAM_OWNER_USER_ID ||= "111";
-process.env.TELEGRAM_BROTHER_USER_ID ||= "222";
-process.env.TELEGRAM_BROTHER_NAME ||= "Rushil";
 
 function makeDb() {
   const db = new Database(":memory:");
   runMigrations(db);
   return db;
+}
+
+function authorizeTelegramContributor(db, name, telegramUserId, now = new Date("2026-08-22T10:00:00.000Z")) {
+  const invite = createTelegramContributorInvite(db, {
+    contributor_name: name,
+    created_by: "test_owner",
+    now,
+  });
+  const claim = claimTelegramContributorInvite(db, {
+    claim_token: invite.claim_token,
+    telegram_user_id: String(telegramUserId),
+    owner_telegram_user_id: process.env.TELEGRAM_OWNER_USER_ID,
+    now: new Date(now.getTime() + 60_000),
+  });
+  return { invite, claim };
 }
 
 function findTool(name) {
@@ -2588,25 +2612,174 @@ test("authorized contributor purchases are atomic, idempotent, and attributed wi
   db.close();
 });
 
-test("contributor prompt is write-only and contains no owner financial context or read tools", () => {
+test("contributor prompt permits only identity-bound bilateral reads and contains no owner financial context", () => {
   const prompt = buildContributorSystemPrompt({ telegram_user_id: "222", name: "Rushil" });
-  assert.match(prompt, /only job/i);
+  assert.match(prompt, /only jobs/i);
   assert.match(prompt, /no access to Aniket's financial history/i);
-  assert.match(prompt, /I can only help record payments you made for Aniket/);
+  assert.match(prompt, /shared tab between you and Aniket/);
+  assert.match(prompt, /get_my_tab_with_aniket/);
+  assert.match(prompt, /Never ask for or accept another person's name/);
   assert.doesNotMatch(prompt, /get_raw_transactions|get_counterparty_balance|OPEN SPLITS/i);
   assert.doesNotMatch(prompt, /1,20,000|120000/);
 });
 
-test("Telegram sender authorization is identity-based and fails closed", () => {
+test("Telegram contributor invitations are secure, one-use, revocable, and omit IDs from listings", () => {
+  const db = makeDb();
+  const originalUsername = process.env.TELEGRAM_BOT_USERNAME;
+  process.env.TELEGRAM_BOT_USERNAME = "violet_test_bot";
+  const now = new Date("2026-08-22T10:00:00.000Z");
+  const invite = createTelegramContributorInvite(db, {
+    contributor_name: "Nishidha",
+    expires_hours: 24,
+    created_by: "telegram_owner",
+    now,
+  });
+  assert.match(invite.claim_token, /^[A-Za-z0-9_-]{32}$/);
+  assert.equal(invite.claim_command, `/join ${invite.claim_token}`);
+  assert.equal(invite.deep_link, `https://t.me/violet_test_bot?start=plutus_${invite.claim_token}`);
+  const stored = db
+    .prepare("SELECT token_hash FROM telegram_contributor_invites WHERE id = ?")
+    .get(invite.invite_id);
+  assert.notEqual(stored.token_hash, invite.claim_token);
+
+  const claim = claimTelegramContributorInvite(db, {
+    claim_token: invite.claim_token,
+    telegram_user_id: "444",
+    owner_telegram_user_id: "111",
+    now: new Date("2026-08-22T10:01:00.000Z"),
+  });
+  assert.equal(claim.was_existing, false);
+  assert.equal(claim.contributor.counterparty_name, "Nishidha");
+  assert.equal(getActiveTelegramContributor(db, "444").counterparty_name, "Nishidha");
+  assert.equal(
+    claimTelegramContributorInvite(db, {
+      claim_token: invite.claim_token,
+      telegram_user_id: "444",
+      owner_telegram_user_id: "111",
+      now: new Date("2026-08-22T10:02:00.000Z"),
+    }).was_existing,
+    true
+  );
+  assert.throws(
+    () =>
+      claimTelegramContributorInvite(db, {
+        claim_token: invite.claim_token,
+        telegram_user_id: "555",
+        owner_telegram_user_id: "111",
+        now: new Date("2026-08-22T10:03:00.000Z"),
+      }),
+    /invalid or expired/
+  );
+  const publicList = listTelegramContributors(db);
+  assert.deepEqual(publicList.map((row) => row.contributor_name), ["Nishidha"]);
+  assert.equal(JSON.stringify(publicList).includes("444"), false);
+
+  revokeTelegramContributor(db, {
+    contributor_name: "nishidha",
+    now: new Date("2026-08-22T10:04:00.000Z"),
+  });
+  assert.equal(getActiveTelegramContributor(db, "444"), undefined);
+  assert.equal(listTelegramContributors(db).length, 0);
+  assert.equal(listTelegramContributors(db, { include_revoked: true })[0].status, "revoked");
+
+  const expired = createTelegramContributorInvite(db, {
+    contributor_name: "Calvin",
+    expires_hours: 1,
+    created_by: "telegram_owner",
+    now,
+  });
+  assert.throws(
+    () =>
+      claimTelegramContributorInvite(db, {
+        claim_token: expired.claim_token,
+        telegram_user_id: "666",
+        owner_telegram_user_id: "111",
+        now: new Date("2026-08-22T11:00:01.000Z"),
+      }),
+    /invalid or expired/
+  );
+  if (originalUsername === undefined) delete process.env.TELEGRAM_BOT_USERNAME;
+  else process.env.TELEGRAM_BOT_USERNAME = originalUsername;
+  db.close();
+});
+
+test("contributor bilateral view reveals only their scoped items and translated net", () => {
+  const db = makeDb();
+  recordContributorPurchase(db, {
+    idempotency_key: "222:private:1",
+    reporter: "Rushil",
+    reporter_telegram_user_id: "222",
+    occurred_at: "2026-08-22",
+    gross_amount_inr: 1200,
+    owner_share_inr: 800,
+    label: "Dinner Rushil covered",
+    category: "Dining",
+    treatment: "split",
+  });
+  const ownerEntry = createEnvelopeEntry(db, {
+    funding_month: "2026-08",
+    occurred_at: "2026-08-21T12:00:00+05:30",
+    source: "manual",
+    merchant_clean: "Tickets Aniket covered",
+    category: "Entertainment",
+    treatment: "split",
+    gross_amount_inr: 600,
+    personal_impact: 300,
+    cashflow_impact: 600,
+    receivable_amount: 300,
+    created_by: "telegram_user",
+  });
+  createReceivable(db, {
+    envelope_entry_id: ownerEntry.id,
+    counterparty: "Rushil",
+    label: "Tickets Aniket covered",
+    amount_inr: 300,
+    created_by: "telegram_user",
+  });
+  setContextFact(db, {
+    scope_type: "person",
+    scope_id: "Nishidha",
+    key: "counterparty_payable_private",
+    value: JSON.stringify({
+      status: "outstanding",
+      label: "Nishidha private item",
+      amount_owed_inr: 99999,
+      occurred_at: "2026-08-22T12:00:00+05:30",
+    }),
+    source: "telegram_user",
+    confidence: 1,
+  });
+
+  const view = getContributorBalanceView(
+    db,
+    { telegram_user_id: "222", name: "Rushil" },
+    "current"
+  );
+  assert.equal(view.total_value_you_provided_inr, 800);
+  assert.equal(view.total_value_aniket_provided_inr, 300);
+  assert.deepEqual(view.net, { direction: "aniket_owes_you", amount_inr: 500 });
+  assert.deepEqual(view.value_you_provided.map((item) => item.label), ["Dinner Rushil covered"]);
+  assert.deepEqual(view.value_aniket_provided.map((item) => item.label), ["Tickets Aniket covered"]);
+  const serialized = JSON.stringify(view);
+  assert.equal(serialized.includes("Nishidha"), false);
+  assert.equal(serialized.includes("99999"), false);
+  assert.equal(serialized.includes("raw_transaction_id"), false);
+  assert.equal(serialized.includes("source_id"), false);
+  db.close();
+});
+
+test("Telegram sender authorization is identity-based, dynamic, and fails closed", () => {
+  const db = makeDb();
+  authorizeTelegramContributor(db, "Rushil", "222");
   const ownerDirect = {
     message_id: 1,
     chat: { id: 111, type: "private" },
     from: { id: 111, first_name: "Aniket" },
     text: "hello",
   };
-  assert.equal(resolveTelegramActor(ownerDirect).role, "owner");
+  assert.equal(resolveTelegramActor(db, ownerDirect).role, "owner");
   assert.equal(
-    resolveTelegramActor({
+    resolveTelegramActor(db, {
       ...ownerDirect,
       chat: { id: -100123456, type: "supergroup" },
       message_thread_id: 77,
@@ -2614,42 +2787,44 @@ test("Telegram sender authorization is identity-based and fails closed", () => {
     "owner"
   );
   assert.equal(
-    resolveTelegramActor({ ...ownerDirect, chat: { id: -999, type: "group" } }),
+    resolveTelegramActor(db, { ...ownerDirect, chat: { id: -999, type: "group" } }),
     null
   );
   assert.equal(
-    resolveTelegramActor({
+    resolveTelegramActor(db, {
       ...ownerDirect,
       chat: { id: -999, type: "group" },
       from: { id: 222, first_name: "Rushil" },
     }).role,
-    "brother"
+    "contributor"
   );
   assert.equal(
-    resolveTelegramActor({ ...ownerDirect, from: { id: 333, first_name: "Unknown" } }),
+    resolveTelegramActor(db, { ...ownerDirect, from: { id: 333, first_name: "Unknown" } }),
     null
   );
-  assert.equal(resolveTelegramActor({ ...ownerDirect, from: undefined }), null);
+  assert.equal(resolveTelegramActor(db, { ...ownerDirect, from: undefined }), null);
 
   const originalOwner = process.env.TELEGRAM_OWNER_USER_ID;
   delete process.env.TELEGRAM_OWNER_USER_ID;
   assert.equal(getTelegramAccessStatus().valid, false);
-  assert.equal(resolveTelegramActor(ownerDirect), null);
+  assert.equal(resolveTelegramActor(db, ownerDirect), null);
   process.env.TELEGRAM_OWNER_USER_ID = originalOwner;
 
-  const originalBrother = process.env.TELEGRAM_BROTHER_USER_ID;
-  process.env.TELEGRAM_BROTHER_USER_ID = process.env.TELEGRAM_OWNER_USER_ID;
+  const originalSecret = process.env.TELEGRAM_WEBHOOK_SECRET;
+  delete process.env.TELEGRAM_WEBHOOK_SECRET;
   assert.equal(getTelegramAccessStatus().valid, false);
-  assert.equal(resolveTelegramActor(ownerDirect), null);
-  process.env.TELEGRAM_BROTHER_USER_ID = originalBrother;
+  assert.equal(resolveTelegramActor(db, ownerDirect), null);
+  process.env.TELEGRAM_WEBHOOK_SECRET = originalSecret;
+  db.close();
 });
 
-test("Telegram handler keeps contributors on the write-only path and audits the owner", async () => {
+test("Telegram handler keeps contributors on the bilateral path and audits the owner", async () => {
   const db = makeDb();
+  authorizeTelegramContributor(db, "Rushil", "222");
   const incoming = [];
   const ownerAlerts = [];
   let ownerCalls = 0;
-  let brotherPayload;
+  let contributorPayload;
   await handleTelegramUpdate(
     db,
     {
@@ -2666,8 +2841,8 @@ test("Telegram handler keeps contributors on the write-only path and audits the 
         ownerCalls++;
         return "owner";
       },
-      runBrotherAgent: async (_db, payload) => {
-        brotherPayload = payload;
+      runContributorAgent: async (_db, payload) => {
+        contributorPayload = payload;
         return {
           text: "Recorded ₹800 for dinner.",
           recorded_purchases: [
@@ -2699,9 +2874,9 @@ test("Telegram handler keeps contributors on the write-only path and audits the 
   );
 
   assert.equal(ownerCalls, 0);
-  assert.equal(brotherPayload.identity.telegram_user_id, "222");
-  assert.equal(brotherPayload.identity.name, "Rushil");
-  assert.equal(brotherPayload.conversation_id, "-900");
+  assert.equal(contributorPayload.identity.telegram_user_id, "222");
+  assert.equal(contributorPayload.identity.name, "Rushil");
+  assert.equal(contributorPayload.conversation_id, "-900");
   assert.deepEqual(incoming[0], {
     chatId: -900,
     text: "Recorded ₹800 for dinner.",
@@ -2728,7 +2903,7 @@ test("Telegram handler keeps contributors on the write-only path and audits the 
         calls++;
         return "should not run";
       },
-      runBrotherAgent: async () => {
+      runContributorAgent: async () => {
         calls++;
         return { text: "should not run", recorded_purchases: [] };
       },
@@ -2745,10 +2920,97 @@ test("Telegram handler keeps contributors on the write-only path and audits the 
   db.close();
 });
 
+test("Telegram invite claims authorize the immutable sender identity without invoking an agent", async () => {
+  const db = makeDb();
+  const invite = createTelegramContributorInvite(db, {
+    contributor_name: "Nishidha",
+    created_by: "telegram_owner",
+    now: new Date("2026-08-22T10:00:00.000Z"),
+  });
+  assert.equal(parseTelegramContributorClaim(`/join ${invite.claim_token}`), invite.claim_token);
+  assert.equal(
+    parseTelegramContributorClaim(`/start plutus_${invite.claim_token}`),
+    invite.claim_token
+  );
+  assert.equal(parseTelegramContributorClaim("show me Aniket's cards"), null);
+
+  const replies = [];
+  const ownerAlerts = [];
+  let agentCalls = 0;
+  await handleTelegramUpdate(
+    db,
+    {
+      update_id: 910,
+      message: {
+        message_id: 50,
+        chat: { id: 444, type: "private" },
+        from: { id: 444, first_name: "Different display name" },
+        text: `/join ${invite.claim_token}`,
+      },
+    },
+    {
+      runOwnerAgent: async () => {
+        agentCalls++;
+        return "wrong";
+      },
+      runContributorAgent: async () => {
+        agentCalls++;
+        return { text: "wrong", recorded_purchases: [] };
+      },
+      sendToIncomingChat: async (chatId, text, options) => {
+        replies.push({ chatId, text, options });
+        return 1;
+      },
+      sendOwnerMessage: async (text) => {
+        ownerAlerts.push(text);
+        return 2;
+      },
+    }
+  );
+
+  assert.equal(agentCalls, 0);
+  assert.equal(getActiveTelegramContributor(db, "444").counterparty_name, "Nishidha");
+  assert.match(replies[0].text, /Access confirmed as Nishidha/);
+  assert.match(ownerAlerts[0], /Nishidha accepted/);
+  assert.equal(
+    resolveTelegramActor(db, {
+      message_id: 51,
+      chat: { id: 444, type: "private" },
+      from: { id: 444, first_name: "Renamed account" },
+      text: "What is my tab with Aniket?",
+    }).name,
+    "Nishidha"
+  );
+  db.close();
+});
+
+test("owner Telegram access tools create, list, and revoke dynamic contributors", async () => {
+  const db = makeDb();
+  const created = await findTool("create_telegram_contributor_invite").handler(db, {
+    contributor_name: "Calvin",
+    expires_hours: 12,
+  });
+  assert.equal(created.contributor_name, "Calvin");
+  claimTelegramContributorInvite(db, {
+    claim_token: created.claim_token,
+    telegram_user_id: "555",
+    owner_telegram_user_id: "111",
+  });
+  const listed = await findTool("list_telegram_contributors").handler(db, {});
+  assert.deepEqual(listed.map((row) => row.contributor_name), ["Calvin"]);
+  assert.equal(JSON.stringify(listed).includes("555"), false);
+  const revoked = await findTool("revoke_telegram_contributor").handler(db, {
+    contributor_name: "Calvin",
+  });
+  assert.equal(revoked.status, "revoked");
+  assert.equal(getActiveTelegramContributor(db, "555"), undefined);
+  db.close();
+});
+
 test("Telegram handler gives only the owner the full agent path", async () => {
   const db = makeDb();
   let ownerPayload;
-  let brotherCalls = 0;
+  let contributorCalls = 0;
   const replies = [];
   await handleTelegramUpdate(
     db,
@@ -2767,8 +3029,8 @@ test("Telegram handler gives only the owner the full agent path", async () => {
         ownerPayload = payload;
         return "Owner-only answer";
       },
-      runBrotherAgent: async () => {
-        brotherCalls++;
+      runContributorAgent: async () => {
+        contributorCalls++;
         return { text: "wrong", recorded_purchases: [] };
       },
       sendToIncomingChat: async (chatId, text, options) => {
@@ -2778,7 +3040,7 @@ test("Telegram handler gives only the owner the full agent path", async () => {
       sendTyping: async () => {},
     }
   );
-  assert.equal(brotherCalls, 0);
+  assert.equal(contributorCalls, 0);
   assert.equal(ownerPayload.user_message, "What did I spend?");
   assert.deepEqual(replies[0], {
     chatId: -100123456,
@@ -3534,6 +3796,9 @@ test("revising a flex budget preserves existing AI classifications", () => {
 
 test("all v2 MCP tools are registered for external agents", () => {
   const expected = [
+    "create_telegram_contributor_invite",
+    "list_telegram_contributors",
+    "revoke_telegram_contributor",
     "create_raw_transaction",
     "bulk_create_raw_transactions",
     "get_raw_transactions",
@@ -3585,6 +3850,9 @@ test("all v2 MCP tools are registered for external agents", () => {
 
 test("production MCP surface exposes v2 finance tools and no legacy envelope mutators", () => {
   const names = buildMcpToolSpecs().map((spec) => spec.name);
+  assert.equal(names.includes("create_telegram_contributor_invite"), true);
+  assert.equal(names.includes("list_telegram_contributors"), true);
+  assert.equal(names.includes("revoke_telegram_contributor"), true);
   assert.equal(names.includes("interpret_pending_transactions"), true);
   assert.equal(names.includes("get_counterparty_balance"), true);
   assert.equal(names.includes("create_counterparty_balance_checkpoint"), true);
@@ -3630,9 +3898,8 @@ test("health reports the next enabled cron and per-scheduler timing", async () =
   assert.deepEqual(health.telegram_access, {
     webhook_secret_configured: true,
     owner_identity_configured: true,
-    brother_identity_configured: true,
-    brother_name_configured: true,
     valid: true,
+    active_contributor_count: 0,
   });
   await app.close();
   db.close();
