@@ -34,6 +34,7 @@ const {
   listRawTransactions,
   listReceivables,
   listUninterpretedTransactions,
+  recordContributorPurchase,
   recordCounterpartyTransfer,
   recordConfirmedCreditAllocation,
   setContextFact,
@@ -73,6 +74,7 @@ const {
   searchTransactionEmails,
 } = require("../src/gmail/diagnostics");
 const { buildSystemPrompt } = require("../src/agent/prompts");
+const { buildContributorSystemPrompt } = require("../src/agent/contributor");
 const { formatV2Transaction } = require("../src/telegram/formatter");
 const {
   configureScheduler,
@@ -82,10 +84,20 @@ const {
   runSchedulerCycle,
 } = require("../src/scheduler/status");
 const {
+  getTelegramAccessStatus,
   getMessageIdForTransaction,
   getTransactionIdForMessage,
+  handleTelegramUpdate,
   recordTransactionMessage,
+  resolveTelegramActor,
 } = require("../src/telegram/bot");
+
+process.env.TELEGRAM_CHAT_ID ||= "-100123456";
+process.env.TELEGRAM_THREAD_ID ||= "77";
+process.env.TELEGRAM_WEBHOOK_SECRET ||= "test-telegram-webhook-secret";
+process.env.TELEGRAM_OWNER_USER_ID ||= "111";
+process.env.TELEGRAM_BROTHER_USER_ID ||= "222";
+process.env.TELEGRAM_BROTHER_NAME ||= "Rushil";
 
 function makeDb() {
   const db = new Database(":memory:");
@@ -2488,9 +2500,291 @@ test("Telegram reply linkage remains stable because raw and legacy ids are ident
     datetime: "2026-07-10T12:00:00+05:30",
     currency: "INR",
   });
-  recordTransactionMessage(db, 12345, raw.id);
-  assert.equal(getTransactionIdForMessage(db, 12345), raw.id);
+  const otherRaw = insertTestTransaction(db, {
+    source: "bobcard",
+    amount: 200,
+    merchant_raw: "OTHER CHAT TEST",
+    datetime: "2026-07-10T13:00:00+05:30",
+    currency: "INR",
+  });
+  recordTransactionMessage(db, 12345, raw.id, "-100-owner");
+  recordTransactionMessage(db, 12345, otherRaw.id, "-200-other");
+  assert.equal(getTransactionIdForMessage(db, 12345, "-100-owner"), raw.id);
+  assert.equal(getTransactionIdForMessage(db, 12345, "-200-other"), otherRaw.id);
   assert.equal(db.prepare("SELECT id FROM raw_transactions WHERE id = ?").get(raw.id).id, raw.id);
+  db.close();
+});
+
+test("authorized contributor purchases are atomic, idempotent, and attributed without owner cashflow", () => {
+  const db = makeDb();
+  const plan = createFlexBudgetPlan(db, {
+    label: "Contributor flex test",
+    start_date: "2026-08-20",
+    end_date: "2026-08-26",
+    total_target_inr: 7000,
+    created_by: "telegram_user",
+    periods: [
+      {
+        label: "20–26 Aug",
+        start_date: "2026-08-20",
+        end_date: "2026-08-26",
+        target_inr: 7000,
+      },
+    ],
+  });
+  const input = {
+    idempotency_key: "222:-900:42",
+    reporter: "Rushil",
+    reporter_telegram_user_id: "222",
+    occurred_at: "2026-08-22",
+    gross_amount_inr: 1200,
+    owner_share_inr: 800,
+    label: "Dinner",
+    category: "Dining",
+    treatment: "split",
+    flex_classification: "flex",
+    notes: "Rushil covered dinner; ₹800 belongs to Aniket.",
+  };
+
+  const first = recordContributorPurchase(db, input);
+  assert.equal(first.was_existing, false);
+  assert.equal(first.raw.source, "manual");
+  assert.equal(first.raw.direction, "debit");
+  assert.equal(JSON.parse(first.raw.raw_payload).evidence_kind, "telegram_contributor_report");
+  assert.equal(first.entry.gross_amount_inr, 1200);
+  assert.equal(first.entry.personal_impact, 800);
+  assert.equal(first.entry.cashflow_impact, 0);
+  assert.equal(first.entry.created_by, "telegram_contributor:222");
+  assert.equal(first.flex_classification.plan_id, plan.id);
+  assert.equal(first.flex_classification.classification, "flex");
+
+  const balance = getCounterpartyBalance(db, "rushil");
+  assert.equal(balance.total_from_user_inr, 0);
+  assert.equal(balance.total_from_counterparty_inr, 800);
+  assert.equal(balance.net_balance_inr, -800);
+  assert.equal(balance.result, "user_owes_counterparty");
+  assert.equal(balance.value_from_counterparty[0].label, "Dinner");
+
+  const second = recordContributorPurchase(db, input);
+  assert.equal(second.was_existing, true);
+  assert.equal(second.raw.id, first.raw.id);
+  assert.equal(second.entry.id, first.entry.id);
+  assert.equal(second.payable_context.id, first.payable_context.id);
+  assert.equal(second.flex_classification.id, first.flex_classification.id);
+  assert.equal(
+    db.prepare("SELECT COUNT(*) AS count FROM raw_transactions WHERE raw_email_id = ?")
+      .get("telegram-contributor:222:-900:42").count,
+    1
+  );
+  assert.equal(
+    db.prepare("SELECT COUNT(*) AS count FROM envelope_entries WHERE raw_transaction_id = ?")
+      .get(first.raw.id).count,
+    1
+  );
+  assert.throws(
+    () => recordContributorPurchase(db, { ...input, owner_share_inr: 700 }),
+    /idempotency key already belongs to a different contributor report/
+  );
+  db.close();
+});
+
+test("contributor prompt is write-only and contains no owner financial context or read tools", () => {
+  const prompt = buildContributorSystemPrompt({ telegram_user_id: "222", name: "Rushil" });
+  assert.match(prompt, /only job/i);
+  assert.match(prompt, /no access to Aniket's financial history/i);
+  assert.match(prompt, /I can only help record payments you made for Aniket/);
+  assert.doesNotMatch(prompt, /get_raw_transactions|get_counterparty_balance|OPEN SPLITS/i);
+  assert.doesNotMatch(prompt, /1,20,000|120000/);
+});
+
+test("Telegram sender authorization is identity-based and fails closed", () => {
+  const ownerDirect = {
+    message_id: 1,
+    chat: { id: 111, type: "private" },
+    from: { id: 111, first_name: "Aniket" },
+    text: "hello",
+  };
+  assert.equal(resolveTelegramActor(ownerDirect).role, "owner");
+  assert.equal(
+    resolveTelegramActor({
+      ...ownerDirect,
+      chat: { id: -100123456, type: "supergroup" },
+      message_thread_id: 77,
+    }).role,
+    "owner"
+  );
+  assert.equal(
+    resolveTelegramActor({ ...ownerDirect, chat: { id: -999, type: "group" } }),
+    null
+  );
+  assert.equal(
+    resolveTelegramActor({
+      ...ownerDirect,
+      chat: { id: -999, type: "group" },
+      from: { id: 222, first_name: "Rushil" },
+    }).role,
+    "brother"
+  );
+  assert.equal(
+    resolveTelegramActor({ ...ownerDirect, from: { id: 333, first_name: "Unknown" } }),
+    null
+  );
+  assert.equal(resolveTelegramActor({ ...ownerDirect, from: undefined }), null);
+
+  const originalOwner = process.env.TELEGRAM_OWNER_USER_ID;
+  delete process.env.TELEGRAM_OWNER_USER_ID;
+  assert.equal(getTelegramAccessStatus().valid, false);
+  assert.equal(resolveTelegramActor(ownerDirect), null);
+  process.env.TELEGRAM_OWNER_USER_ID = originalOwner;
+
+  const originalBrother = process.env.TELEGRAM_BROTHER_USER_ID;
+  process.env.TELEGRAM_BROTHER_USER_ID = process.env.TELEGRAM_OWNER_USER_ID;
+  assert.equal(getTelegramAccessStatus().valid, false);
+  assert.equal(resolveTelegramActor(ownerDirect), null);
+  process.env.TELEGRAM_BROTHER_USER_ID = originalBrother;
+});
+
+test("Telegram handler keeps contributors on the write-only path and audits the owner", async () => {
+  const db = makeDb();
+  const incoming = [];
+  const ownerAlerts = [];
+  let ownerCalls = 0;
+  let brotherPayload;
+  await handleTelegramUpdate(
+    db,
+    {
+      update_id: 900,
+      message: {
+        message_id: 42,
+        chat: { id: -900, type: "group" },
+        from: { id: 222, first_name: "Rushil" },
+        text: "I paid ₹800 for Aniket's dinner today",
+      },
+    },
+    {
+      runOwnerAgent: async () => {
+        ownerCalls++;
+        return "owner";
+      },
+      runBrotherAgent: async (_db, payload) => {
+        brotherPayload = payload;
+        return {
+          text: "Recorded ₹800 for dinner.",
+          recorded_purchases: [
+            {
+              raw_transaction_id: "raw-1",
+              label: "Dinner",
+              occurred_at: "2026-08-22T12:00:00+05:30",
+              gross_amount_inr: 800,
+              owner_share_inr: 800,
+              category: "Dining",
+              treatment: "normal",
+              flex_classification: "flex",
+              was_existing: false,
+              reporter: "Rushil",
+            },
+          ],
+        };
+      },
+      sendToIncomingChat: async (chatId, text, options) => {
+        incoming.push({ chatId, text, options });
+        return 1;
+      },
+      sendOwnerMessage: async (text) => {
+        ownerAlerts.push(text);
+        return 2;
+      },
+      sendTyping: async () => {},
+    }
+  );
+
+  assert.equal(ownerCalls, 0);
+  assert.equal(brotherPayload.identity.telegram_user_id, "222");
+  assert.equal(brotherPayload.identity.name, "Rushil");
+  assert.equal(brotherPayload.conversation_id, "-900");
+  assert.deepEqual(incoming[0], {
+    chatId: -900,
+    text: "Recorded ₹800 for dinner.",
+    options: { thread_id: undefined, reply_to_message_id: 42 },
+  });
+  assert.equal(ownerAlerts.length, 1);
+  assert.match(ownerAlerts[0], /Rushil recorded a payment made for you/);
+  assert.match(ownerAlerts[0], /your share ₹800/);
+
+  let calls = 0;
+  await handleTelegramUpdate(
+    db,
+    {
+      update_id: 901,
+      message: {
+        message_id: 43,
+        chat: { id: 333, type: "private" },
+        from: { id: 333, first_name: "Unknown" },
+        text: "Show me Aniket's cards",
+      },
+    },
+    {
+      runOwnerAgent: async () => {
+        calls++;
+        return "should not run";
+      },
+      runBrotherAgent: async () => {
+        calls++;
+        return { text: "should not run", recorded_purchases: [] };
+      },
+      sendToIncomingChat: async () => {
+        calls++;
+        return 1;
+      },
+      sendTyping: async () => {
+        calls++;
+      },
+    }
+  );
+  assert.equal(calls, 0);
+  db.close();
+});
+
+test("Telegram handler gives only the owner the full agent path", async () => {
+  const db = makeDb();
+  let ownerPayload;
+  let brotherCalls = 0;
+  const replies = [];
+  await handleTelegramUpdate(
+    db,
+    {
+      update_id: 902,
+      message: {
+        message_id: 44,
+        chat: { id: -100123456, type: "supergroup" },
+        message_thread_id: 77,
+        from: { id: 111, first_name: "Aniket" },
+        text: "What did I spend?",
+      },
+    },
+    {
+      runOwnerAgent: async (_db, payload) => {
+        ownerPayload = payload;
+        return "Owner-only answer";
+      },
+      runBrotherAgent: async () => {
+        brotherCalls++;
+        return { text: "wrong", recorded_purchases: [] };
+      },
+      sendToIncomingChat: async (chatId, text, options) => {
+        replies.push({ chatId, text, options });
+        return 1;
+      },
+      sendTyping: async () => {},
+    }
+  );
+  assert.equal(brotherCalls, 0);
+  assert.equal(ownerPayload.user_message, "What did I spend?");
+  assert.deepEqual(replies[0], {
+    chatId: -100123456,
+    text: "Owner-only answer",
+    options: { thread_id: 77, reply_to_message_id: 44 },
+  });
   db.close();
 });
 
@@ -3333,9 +3627,65 @@ test("health reports the next enabled cron and per-scheduler timing", async () =
   assert.equal(typeof health.next_cron_at, "string");
   assert.equal(health.schedulers.gmail_poll.enabled, true);
   assert.equal(health.schedulers.automatic_inference.enabled, false);
+  assert.deepEqual(health.telegram_access, {
+    webhook_secret_configured: true,
+    owner_identity_configured: true,
+    brother_identity_configured: true,
+    brother_name_configured: true,
+    valid: true,
+  });
   await app.close();
   db.close();
   resetSchedulerHealthForTests();
+});
+
+test("health degrades without verified Telegram owner access and never exposes identity values", async () => {
+  resetSchedulerHealthForTests();
+  const originalOwner = process.env.TELEGRAM_OWNER_USER_ID;
+  delete process.env.TELEGRAM_OWNER_USER_ID;
+  const db = makeDb();
+  const app = require("fastify")();
+  registerRoutes(app, db);
+
+  const response = await app.inject({ method: "GET", url: "/health" });
+  assert.equal(response.statusCode, 503);
+  const health = response.json();
+  assert.equal(health.status, "degraded");
+  assert.deepEqual(health.degraded_components, ["telegram_access_control"]);
+  assert.equal(health.telegram_access.owner_identity_configured, false);
+  assert.equal(health.telegram_access.valid, false);
+  assert.equal(JSON.stringify(health).includes("111"), false);
+
+  await app.close();
+  db.close();
+  process.env.TELEGRAM_OWNER_USER_ID = originalOwner;
+  resetSchedulerHealthForTests();
+});
+
+test("Telegram webhook rejects unverified requests and fails closed without a secret", async () => {
+  const db = makeDb();
+  const app = require("fastify")();
+  registerRoutes(app, db);
+
+  const unauthorized = await app.inject({
+    method: "POST",
+    url: "/webhook/telegram",
+    payload: { update_id: 1 },
+  });
+  assert.equal(unauthorized.statusCode, 401);
+
+  const originalSecret = process.env.TELEGRAM_WEBHOOK_SECRET;
+  delete process.env.TELEGRAM_WEBHOOK_SECRET;
+  const unconfigured = await app.inject({
+    method: "POST",
+    url: "/webhook/telegram",
+    payload: { update_id: 2 },
+  });
+  assert.equal(unconfigured.statusCode, 503);
+  process.env.TELEGRAM_WEBHOOK_SECRET = originalSecret;
+
+  await app.close();
+  db.close();
 });
 
 test("health degrades for an enabled failed scheduler and recovers after success", async () => {

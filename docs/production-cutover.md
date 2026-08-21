@@ -72,6 +72,36 @@ INFERENCE_MODEL=gpt-4o
 5. Reply to the Telegram alert with a correction/context and verify the clean
    entry is superseded rather than duplicated.
 
+### Telegram owner and contributor access
+
+Violet authorizes people by Telegram's immutable numeric user ID, not by name,
+username, chat title, or message text. Configure these Railway variables before
+deploying:
+
+```text
+TELEGRAM_OWNER_USER_ID=<Aniket's numeric Telegram user ID>
+TELEGRAM_BROTHER_USER_ID=<brother's numeric Telegram user ID>
+TELEGRAM_BROTHER_NAME=Rushil
+TELEGRAM_WEBHOOK_SECRET=<existing strong random secret>
+```
+
+Keep BotFather privacy mode enabled. In a group, the contributor should mention
+Violet or reply to Violet; direct messages work normally. The access model is:
+
+- The owner can use the full financial agent only in a direct chat or the
+  configured private Plutus group/topic.
+- The configured brother can only record a payment he personally made on the
+  owner's behalf. He cannot query transactions, balances, cards, income,
+  budgets, reimbursements, or debt history.
+- Unknown senders and unverified webhook requests are ignored before an AI or
+  financial query runs.
+- Each accepted contributor purchase creates one manual raw record, one owner
+  expense at the reported share with zero owner cashflow, and one payable to the
+  contributor. The owner receives a separate audit alert.
+
+After deployment, `/health` must report all `telegram_access` booleans as true.
+It intentionally reports configuration state only, never either user's ID.
+
 ## 5. Rollback
 
 If the live journey fails, switch `DATABASE_PATH` back to `/data/plutus.db` and

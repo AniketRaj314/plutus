@@ -88,6 +88,15 @@ export function runMigrations(db: Database.Database): void {
       created_at TEXT DEFAULT (datetime('now'))
     );
 
+    CREATE TABLE IF NOT EXISTS contributor_agent_messages (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      telegram_user_id TEXT NOT NULL,
+      conversation_id TEXT NOT NULL,
+      role TEXT NOT NULL,
+      content TEXT NOT NULL,
+      created_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+
     CREATE TABLE IF NOT EXISTS credit_cards (
       id TEXT PRIMARY KEY,
       name TEXT,
@@ -314,6 +323,8 @@ export function runMigrations(db: Database.Database): void {
 
     CREATE INDEX IF NOT EXISTS idx_transactions_datetime ON transactions (datetime);
     CREATE INDEX IF NOT EXISTS idx_transactions_source ON transactions (source);
+    CREATE INDEX IF NOT EXISTS idx_contributor_messages_scope
+      ON contributor_agent_messages (telegram_user_id, conversation_id, id DESC);
     CREATE INDEX IF NOT EXISTS idx_splits_transaction_id ON splits (transaction_id);
     CREATE INDEX IF NOT EXISTS idx_envelope_entries_funding_month ON envelope_entries (funding_month);
     CREATE INDEX IF NOT EXISTS idx_envelope_entries_source ON envelope_entries (source);
