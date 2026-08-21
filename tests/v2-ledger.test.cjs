@@ -34,6 +34,7 @@ const {
   listRawTransactions,
   listReceivables,
   listUninterpretedTransactions,
+  recordCounterpartyTransfer,
   recordConfirmedCreditAllocation,
   setContextFact,
   setFlexBudgetClassification,
@@ -1474,6 +1475,92 @@ test("counterparty transfers are standalone facts and never mutate personal rece
   assert.equal(summary.net_balance_inr, 200);
   assert.equal(listReceivables(db, { counterparty: "Nishidha" })[0].received_inr, 0);
   assert.equal(listReceivables(db, { counterparty: "Nishidha" })[0].id, receivable.id);
+  db.close();
+});
+
+test("confirmed counterparty transfers atomically update the ledger and balance", () => {
+  const db = makeDb();
+  const expenseEntry = createEnvelopeEntry(db, {
+    funding_month: "2026-09",
+    occurred_at: "2026-08-21T19:00:00+05:30",
+    source: "amex",
+    merchant_clean: "The Burgery",
+    treatment: "split",
+    gross_amount_inr: 2672,
+    personal_impact: 1782,
+    cashflow_impact: 2672,
+    receivable_amount: 890,
+    created_by: "telegram_user",
+  });
+  const receivable = createReceivable(db, {
+    envelope_entry_id: expenseEntry.id,
+    counterparty: "Denver",
+    label: "The Burgery dinner split",
+    amount_inr: 890,
+    created_by: "telegram_user",
+  });
+  const payment = insertRawTransaction(db, {
+    source: "idfc_upi",
+    amount: 890,
+    amount_inr: 890,
+    merchant_raw: "Denver J",
+    occurred_at: "2026-08-21T20:00:00+05:30",
+    direction: "credit",
+    raw_email_id: "denver-payment",
+  });
+  const inferredEntry = createEnvelopeEntry(db, {
+    raw_transaction_id: payment.id,
+    funding_month: "2026-08",
+    occurred_at: payment.occurred_at,
+    source: payment.source,
+    merchant_clean: "Denver J",
+    category: "Transfer",
+    treatment: "settlement",
+    gross_amount_inr: 890,
+    personal_impact: 0,
+    cashflow_impact: -890,
+    receivable_amount: 0,
+    created_by: "automatic_inference",
+  });
+
+  const recorded = recordCounterpartyTransfer(db, {
+    raw_transaction_id: payment.id,
+    counterparty: "Denver",
+    direction: "from_counterparty",
+    label: "Money received from Denver",
+    notes: "User confirmed this offsets the dinner split.",
+    created_by: "telegram_user",
+  });
+  assert.equal(recorded.entry.id, inferredEntry.id);
+  assert.equal(recorded.entry.personal_impact, 0);
+  assert.equal(recorded.entry.cashflow_impact, -890);
+  assert.equal(recorded.balance.net_balance_inr, 0);
+  assert.equal(recorded.balance.result, "settled");
+  assert.equal(recorded.balance.value_from_user[0].amount_inr, 890);
+  assert.equal(recorded.balance.value_from_counterparty[0].amount_inr, 890);
+  assert.equal(listReceivables(db, { counterparty: "Denver" })[0].id, receivable.id);
+  assert.equal(listReceivables(db, { counterparty: "Denver" })[0].received_inr, 0);
+
+  const repeated = recordCounterpartyTransfer(db, {
+    raw_transaction_id: payment.id,
+    counterparty: "Denver",
+    direction: "from_counterparty",
+    label: "Money received from Denver",
+    notes: "User confirmed this offsets the dinner split.",
+    created_by: "telegram_user",
+  });
+  assert.equal(repeated.entry.id, recorded.entry.id);
+  assert.equal(repeated.context.id, recorded.context.id);
+  assert.equal(
+    listContextFacts(db, {
+      scope_type: "transaction",
+      scope_id: payment.id,
+      key: "counterparty_transfer",
+      include_superseded: true,
+    }).length,
+    1
+  );
+  assert.equal(listEnvelopeEntries(db, { raw_transaction_id: payment.id }).length, 1);
   db.close();
 });
 
@@ -3181,6 +3268,7 @@ test("all v2 MCP tools are registered for external agents", () => {
     "list_receivables",
     "get_counterparty_balance",
     "create_counterparty_balance_checkpoint",
+    "record_counterparty_transfer",
     "record_confirmed_credit_allocation",
     "create_commitment",
     "update_commitment",
@@ -3206,6 +3294,7 @@ test("production MCP surface exposes v2 finance tools and no legacy envelope mut
   assert.equal(names.includes("interpret_pending_transactions"), true);
   assert.equal(names.includes("get_counterparty_balance"), true);
   assert.equal(names.includes("create_counterparty_balance_checkpoint"), true);
+  assert.equal(names.includes("record_counterparty_transfer"), true);
   assert.equal(names.includes("create_flex_recovery_reserve"), true);
   assert.equal(names.includes("list_flex_recovery_reserves"), true);
   assert.equal(names.includes("cancel_flex_recovery_reserve"), true);
@@ -3347,6 +3436,8 @@ test("Violet is required to query raw storage for recent transaction questions",
   assert.match(prompt, /create_counterparty_balance_checkpoint/);
   assert.match(prompt, /roughly 2-6 short lines/);
   assert.match(prompt, /person-to-person payment is a standalone event, not an invoice allocation/);
+  assert.match(prompt, /MUST call record_counterparty_transfer/);
+  assert.match(prompt, /Never say a personal payment was recorded/);
   assert.match(prompt, /source=manual raw transaction for the reported purchase event/);
   assert.match(prompt, /cashflow_impact=0/);
   assert.match(prompt, /independent opposite-side event/);
