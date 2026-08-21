@@ -46,6 +46,11 @@ import {
 } from "../db/v2-queries";
 import { getCardCycleForDate } from "../envelope/engine";
 import { inferRawTransaction, processInferenceQueue } from "./inference";
+import {
+  createTelegramContributorInvite,
+  listTelegramContributors,
+  revokeTelegramContributor,
+} from "../telegram/access";
 
 interface V2ToolDefinition {
   name: string;
@@ -106,6 +111,56 @@ function createEntryHandler(db: Database.Database, args: Record<string, unknown>
 }
 
 export const v2Tools: V2ToolDefinition[] = [
+  {
+    name: "create_telegram_contributor_invite",
+    description:
+      "Owner-only access control: create a secure, one-use, expiring invitation for a named person to record purchases for Aniket and read only their own bilateral tab with him. Return the claim command/link to Aniket so he can share it privately.",
+    parameters: {
+      type: "object",
+      properties: {
+        contributor_name: { type: "string" },
+        expires_hours: {
+          type: "number",
+          description: "Whole hours from 1 to 168; defaults to 24.",
+        },
+      },
+      required: ["contributor_name"],
+    },
+    handler: (db, args) =>
+      createTelegramContributorInvite(db, {
+        contributor_name: args.contributor_name as string,
+        expires_hours: args.expires_hours as number | undefined,
+        created_by: "telegram_owner",
+      }),
+  },
+  {
+    name: "list_telegram_contributors",
+    description:
+      "Owner-only access control: list named Telegram contributors and their access status without exposing Telegram user IDs.",
+    parameters: {
+      type: "object",
+      properties: { include_revoked: { type: "boolean" } },
+      required: [],
+    },
+    handler: (db, args) =>
+      listTelegramContributors(db, {
+        include_revoked: args.include_revoked as boolean | undefined,
+      }),
+  },
+  {
+    name: "revoke_telegram_contributor",
+    description:
+      "Owner-only access control: immediately revoke a named contributor's Telegram access. This preserves their ledger history.",
+    parameters: {
+      type: "object",
+      properties: { contributor_name: { type: "string" } },
+      required: ["contributor_name"],
+    },
+    handler: (db, args) =>
+      revokeTelegramContributor(db, {
+        contributor_name: args.contributor_name as string,
+      }),
+  },
   {
     name: "create_raw_transaction",
     description:

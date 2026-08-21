@@ -3,7 +3,11 @@ import type Database from "better-sqlite3";
 import { Server as McpServer } from "@modelcontextprotocol/sdk/server/index.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { ListToolsRequestSchema, CallToolRequestSchema } from "@modelcontextprotocol/sdk/types.js";
-import { handleTelegramUpdate, type TelegramUpdate } from "../telegram/bot";
+import {
+  getTelegramAccessStatus,
+  handleTelegramUpdate,
+  type TelegramUpdate,
+} from "../telegram/bot";
 import { runAgent } from "../agent/runner";
 import { todayIst, daysUntilSalaryDay } from "../agent/prompts";
 import { tools as agentTools } from "../agent/tools";
@@ -21,6 +25,7 @@ import {
 import { getRemainingWeeksInMonth, parseIstDateOnly, getBillingWindow } from "../envelope/engine";
 import { getSchedulerHealth } from "../scheduler/status";
 import { describeGmailDiagnosticError, searchTransactionEmails } from "../gmail/diagnostics";
+import { countActiveTelegramContributors } from "../telegram/access";
 
 const VALID_SOURCES = ["idfc_cc", "icici_cc", "bobcard", "amex", "idfc_upi"];
 const MAX_TRANSACTIONS_LIMIT = 100;
@@ -34,13 +39,16 @@ export const PACKAGE_VERSION = (require("../../package.json") as { version?: str
 export function registerRoutes(app: FastifyInstance, db: Database.Database): void {
   app.post("/webhook/telegram", async (request, reply) => {
     const expectedSecret = process.env.TELEGRAM_WEBHOOK_SECRET;
-    if (expectedSecret) {
-      const receivedSecret = request.headers["x-telegram-bot-api-secret-token"];
-      if (receivedSecret !== expectedSecret) {
-        console.warn(`[telegram] rejected webhook call with invalid/missing secret token from ${request.ip}`);
-        reply.status(401).send({ error: "Unauthorized" });
-        return;
-      }
+    if (!expectedSecret) {
+      console.error("[telegram] rejected webhook because TELEGRAM_WEBHOOK_SECRET is not configured");
+      reply.status(503).send({ error: "Telegram access control is not configured" });
+      return;
+    }
+    const receivedSecret = request.headers["x-telegram-bot-api-secret-token"];
+    if (receivedSecret !== expectedSecret) {
+      console.warn(`[telegram] rejected webhook call with invalid/missing secret token from ${request.ip}`);
+      reply.status(401).send({ error: "Unauthorized" });
+      return;
     }
 
     reply.status(200).send({ ok: true });
@@ -64,7 +72,12 @@ export function registerRoutes(app: FastifyInstance, db: Database.Database): voi
     const failedSchedulers = Object.values(schedulerHealth.schedulers)
       .filter((scheduler) => scheduler.enabled && scheduler.last_outcome === "error")
       .map((scheduler) => scheduler.name);
-    const status = failedSchedulers.length > 0 ? "degraded" : "ok";
+    const telegramAccess = getTelegramAccessStatus();
+    const degradedComponents = [
+      ...failedSchedulers,
+      ...(telegramAccess.valid ? [] : ["telegram_access_control"]),
+    ];
+    const status = degradedComponents.length > 0 ? "degraded" : "ok";
     if (status === "degraded") reply.status(503);
     return {
       status,
@@ -77,7 +90,11 @@ export function registerRoutes(app: FastifyInstance, db: Database.Database): voi
       poll_interval: process.env.POLL_INTERVAL_MINS,
       auto_inference_enabled: process.env.AUTO_INFERENCE_ENABLED !== "false",
       auto_inference_interval: process.env.AUTO_INFERENCE_INTERVAL_MINS ?? "5",
-      degraded_components: failedSchedulers,
+      degraded_components: degradedComponents,
+      telegram_access: {
+        ...telegramAccess,
+        active_contributor_count: countActiveTelegramContributors(db),
+      },
       ...schedulerHealth,
     };
   });
@@ -418,6 +435,9 @@ interface McpToolSpec {
 // also happens to map more directly onto tools.ts's existing JSON Schema
 // parameter definitions, so most of these are thin passthroughs.
 const MCP_TOOL_NAMES = [
+  "create_telegram_contributor_invite",
+  "list_telegram_contributors",
+  "revoke_telegram_contributor",
   "create_raw_transaction",
   "bulk_create_raw_transactions",
   "get_raw_transactions",

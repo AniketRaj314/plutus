@@ -72,6 +72,42 @@ INFERENCE_MODEL=gpt-4o
 5. Reply to the Telegram alert with a correction/context and verify the clean
    entry is superseded rather than duplicated.
 
+### Telegram owner and contributor access
+
+Violet authorizes people by Telegram's immutable numeric user ID, not by name,
+username, chat title, or message text. Configure these Railway variables before
+deploying:
+
+```text
+TELEGRAM_OWNER_USER_ID=<Aniket's numeric Telegram user ID>
+TELEGRAM_WEBHOOK_SECRET=<existing strong random secret>
+TELEGRAM_BOT_USERNAME=<Violet's username without @; optional, for invite links>
+```
+
+Keep BotFather privacy mode enabled. In a group, the contributor should mention
+Violet or reply to Violet; direct messages work normally. The access model is:
+
+- The owner can use the full financial agent only in a direct chat or the
+  configured private Plutus group/topic.
+- The owner can dynamically invite, list, and revoke contributors through
+  Violet. Invites are random, one-use, and expire after 24 hours by default;
+  adding another person never requires a deploy.
+- A contributor can record a payment they personally made on the owner's
+  behalf and view only their own bilateral tab with the owner: expenses either
+  person covered, direct transfers between them, and their net balance.
+- Contributors cannot query unrelated transactions, accounts, cards, income,
+  budgets, reimbursements, other people, or owner access controls. Their
+  identity is injected by the server, so they cannot substitute another name.
+- Unknown senders and unverified webhook requests are ignored before an AI or
+  financial query runs.
+- Each accepted contributor purchase creates one manual raw record, one owner
+  expense at the reported share with zero owner cashflow, and one payable to the
+  contributor. The owner receives a separate audit alert.
+
+After deployment, `/health` must report the Telegram access-control booleans as
+true and the expected `active_contributor_count`. It intentionally reports
+configuration state and a count only, never anyone's Telegram ID.
+
 ## 5. Rollback
 
 If the live journey fails, switch `DATABASE_PATH` back to `/data/plutus.db` and

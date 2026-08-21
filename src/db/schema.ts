@@ -88,6 +88,40 @@ export function runMigrations(db: Database.Database): void {
       created_at TEXT DEFAULT (datetime('now'))
     );
 
+    CREATE TABLE IF NOT EXISTS contributor_agent_messages (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      telegram_user_id TEXT NOT NULL,
+      conversation_id TEXT NOT NULL,
+      role TEXT NOT NULL,
+      content TEXT NOT NULL,
+      created_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+
+    CREATE TABLE IF NOT EXISTS telegram_contributor_invites (
+      id TEXT PRIMARY KEY,
+      token_hash TEXT NOT NULL UNIQUE,
+      contributor_name TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'pending'
+        CHECK (status IN ('pending', 'claimed', 'revoked')),
+      expires_at TEXT NOT NULL,
+      claimed_by_telegram_user_id TEXT,
+      created_by TEXT NOT NULL,
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      claimed_at TEXT
+    );
+
+    CREATE TABLE IF NOT EXISTS telegram_contributors (
+      telegram_user_id TEXT PRIMARY KEY,
+      counterparty_name TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'active'
+        CHECK (status IN ('active', 'revoked')),
+      invite_id TEXT,
+      activated_at TEXT NOT NULL DEFAULT (datetime('now')),
+      revoked_at TEXT,
+      updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+      FOREIGN KEY (invite_id) REFERENCES telegram_contributor_invites(id)
+    );
+
     CREATE TABLE IF NOT EXISTS credit_cards (
       id TEXT PRIMARY KEY,
       name TEXT,
@@ -314,6 +348,12 @@ export function runMigrations(db: Database.Database): void {
 
     CREATE INDEX IF NOT EXISTS idx_transactions_datetime ON transactions (datetime);
     CREATE INDEX IF NOT EXISTS idx_transactions_source ON transactions (source);
+    CREATE INDEX IF NOT EXISTS idx_contributor_messages_scope
+      ON contributor_agent_messages (telegram_user_id, conversation_id, id DESC);
+    CREATE INDEX IF NOT EXISTS idx_telegram_contributors_status
+      ON telegram_contributors (status, counterparty_name COLLATE NOCASE);
+    CREATE INDEX IF NOT EXISTS idx_telegram_invites_status_expiry
+      ON telegram_contributor_invites (status, expires_at);
     CREATE INDEX IF NOT EXISTS idx_splits_transaction_id ON splits (transaction_id);
     CREATE INDEX IF NOT EXISTS idx_envelope_entries_funding_month ON envelope_entries (funding_month);
     CREATE INDEX IF NOT EXISTS idx_envelope_entries_source ON envelope_entries (source);

@@ -2,6 +2,15 @@ import TelegramBot from "node-telegram-bot-api";
 import type Database from "better-sqlite3";
 import { getContext, setContext, deleteContext } from "../db/queries";
 import { runAgent } from "../agent/runner";
+import {
+  runContributorAgent,
+  type ContributorAgentResult,
+  type ContributorIdentity,
+} from "../agent/contributor";
+import {
+  claimTelegramContributorInvite,
+  getActiveTelegramContributor,
+} from "./access";
 
 const MESSAGE_MAP_KEY = "telegram_message_map";
 const PENDING_REBALANCE_KEY = "pending_rebalance_message";
@@ -29,29 +38,59 @@ function getThreadId(): number {
   return Number(threadId);
 }
 
+export interface TelegramAccessStatus {
+  webhook_secret_configured: boolean;
+  owner_identity_configured: boolean;
+  valid: boolean;
+}
+
+export type TelegramActor =
+  | { role: "owner"; telegram_user_id: string; name: "Aniket" }
+  | { role: "contributor"; telegram_user_id: string; name: string };
+
+export function getTelegramAccessStatus(): TelegramAccessStatus {
+  const ownerId = process.env.TELEGRAM_OWNER_USER_ID?.trim() ?? "";
+  const webhookSecret = process.env.TELEGRAM_WEBHOOK_SECRET?.trim() ?? "";
+  return {
+    webhook_secret_configured: Boolean(webhookSecret),
+    owner_identity_configured: Boolean(ownerId),
+    valid: Boolean(webhookSecret) && Boolean(ownerId),
+  };
+}
+
 export function createBot(): TelegramBot {
   return getBot();
 }
 
 export async function sendMessage(text: string, replyToMessageId?: number): Promise<number> {
-  const bot = getBot();
-  const chatId = getChatId();
-  const threadId = getThreadId();
-
-  const message = await bot.sendMessage(chatId, text, {
-    message_thread_id: threadId,
+  return sendMessageToChat(getChatId(), text, {
+    thread_id: getThreadId(),
     reply_to_message_id: replyToMessageId,
   });
+}
 
+export async function sendMessageToChat(
+  chatId: string | number,
+  text: string,
+  options: { thread_id?: number; reply_to_message_id?: number } = {}
+): Promise<number> {
+  const message = await getBot().sendMessage(chatId, text, {
+    message_thread_id: options.thread_id,
+    reply_to_message_id: options.reply_to_message_id,
+  });
   return message.message_id;
 }
 
 export async function sendTypingAction(): Promise<void> {
+  return sendTypingActionToChat(getChatId(), getThreadId());
+}
+
+export async function sendTypingActionToChat(
+  chatId: string | number,
+  threadId?: number
+): Promise<void> {
   try {
-    const bot = getBot();
-    const chatId = getChatId();
-    const threadId = getThreadId();
-    await bot.sendChatAction(chatId, "typing", { message_thread_id: threadId });
+    await getBot().sendChatAction(chatId, "typing", { message_thread_id: threadId });
   } catch (err) {
     console.error("[telegram] failed to send typing action:", err instanceof Error ? err.message : err);
   }
@@ -82,8 +121,15 @@ export async function registerWebhook(): Promise<void> {
 
   const secretToken = process.env.TELEGRAM_WEBHOOK_SECRET;
   if (!secretToken) {
-    console.warn(
-      "[telegram] TELEGRAM_WEBHOOK_SECRET not set — webhook will register without Telegram's secret_token verification, meaning the webhook route can't prove incoming requests are genuinely from Telegram"
+    console.error(
+      "[telegram] TELEGRAM_WEBHOOK_SECRET not set — refusing to register an unverifiable webhook"
+    );
+    return;
+  }
+  const accessStatus = getTelegramAccessStatus();
+  if (!accessStatus.valid) {
+    console.error(
+      "[telegram] access control is not configured; incoming messages will fail closed until TELEGRAM_OWNER_USER_ID and TELEGRAM_WEBHOOK_SECRET are valid"
     );
   }
 
@@ -123,27 +169,50 @@ function getMessageMap(db: Database.Database): Record<string, string> {
   }
 }
 
-export function recordTransactionMessage(db: Database.Database, messageId: number, transactionId: string): void {
+function scopedMessageKey(chatId: string | number, messageId: number): string {
+  return `${String(chatId)}:${messageId}`;
+}
+
+export function recordTransactionMessage(
+  db: Database.Database,
+  messageId: number,
+  transactionId: string,
+  chatId: string | number = getChatId()
+): void {
   const map = getMessageMap(db);
-  map[String(messageId)] = transactionId;
+  map[scopedMessageKey(chatId, messageId)] = transactionId;
   setContext(db, MESSAGE_MAP_KEY, JSON.stringify(map));
 }
 
-export function getTransactionIdForMessage(db: Database.Database, messageId: number): string | undefined {
-  return getMessageMap(db)[String(messageId)];
+export function getTransactionIdForMessage(
+  db: Database.Database,
+  messageId: number,
+  chatId: string | number = getChatId()
+): string | undefined {
+  const map = getMessageMap(db);
+  return map[scopedMessageKey(chatId, messageId)] ?? map[String(messageId)];
 }
 
 export function getMessageIdForTransaction(db: Database.Database, transactionId: string): number | undefined {
   const map = getMessageMap(db);
   const entry = Object.entries(map).find(([, txId]) => txId === transactionId);
-  return entry ? Number(entry[0]) : undefined;
+  if (!entry) return undefined;
+  const messageId = entry[0].includes(":") ? entry[0].split(":").at(-1) : entry[0];
+  return messageId ? Number(messageId) : undefined;
 }
 
 // -- incoming webhook updates --
 
 export interface TelegramIncomingMessage {
   message_id: number;
-  chat: { id: number | string };
+  chat: { id: number | string; type?: "private" | "group" | "supergroup" | "channel" };
+  from?: {
+    id: number | string;
+    is_bot?: boolean;
+    username?: string;
+    first_name?: string;
+    last_name?: string;
+  };
   message_thread_id?: number;
   text?: string;
   reply_to_message?: { message_id: number };
@@ -154,43 +223,174 @@ export interface TelegramUpdate {
   message?: TelegramIncomingMessage;
 }
 
-export async function handleTelegramUpdate(db: Database.Database, update: TelegramUpdate): Promise<void> {
+export function resolveTelegramActor(
+  db: Database.Database,
+  message: TelegramIncomingMessage
+): TelegramActor | null {
+  const senderId = message.from?.id;
+  if (senderId === undefined || message.from?.is_bot) return null;
+  if (!getTelegramAccessStatus().valid) return null;
+  const sender = String(senderId);
+  const ownerId = process.env.TELEGRAM_OWNER_USER_ID?.trim();
+  if (!ownerId) return null;
+
+  if (sender === ownerId) {
+    const isDirect = message.chat.type === "private" || String(message.chat.id) === sender;
+    const isConfiguredOwnerTopic =
+      String(message.chat.id) === String(process.env.TELEGRAM_CHAT_ID ?? "") &&
+      message.message_thread_id === Number(process.env.TELEGRAM_THREAD_ID);
+    return isDirect || isConfiguredOwnerTopic
+      ? { role: "owner", telegram_user_id: sender, name: "Aniket" }
+      : null;
+  }
+
+  const contributor = getActiveTelegramContributor(db, sender);
+  if (contributor)
+    return {
+      role: "contributor",
+      telegram_user_id: sender,
+      name: contributor.counterparty_name,
+    };
+  return null;
+}
+
+interface TelegramHandlerDependencies {
+  runOwnerAgent?: typeof runAgent;
+  runContributorAgent?: typeof runContributorAgent;
+  sendToIncomingChat?: typeof sendMessageToChat;
+  sendOwnerMessage?: typeof sendMessage;
+  sendTyping?: typeof sendTypingActionToChat;
+}
+
+function contributorAuditMessage(receipt: ContributorAgentResult["recorded_purchases"][number]): string {
+  const classification = receipt.flex_classification
+    ? ` · ${receipt.flex_classification}`
+    : " · flex unclassified";
+  return [
+    `👤 ${receipt.reporter} recorded a payment made for you`,
+    `₹${receipt.gross_amount_inr.toLocaleString("en-IN")} · ${receipt.label}`,
+    `${receipt.occurred_at.slice(0, 10)} · your share ₹${receipt.owner_share_inr.toLocaleString("en-IN")}`,
+    `${receipt.treatment}${classification}`,
+    `Reply with corrections if anything is off.`,
+  ].join("\n");
+}
+
+export function parseTelegramContributorClaim(text: string): string | null {
+  const match = text
+    .trim()
+    .match(/^\/(?:join|start)(?:@[A-Za-z0-9_]+)?(?:\s+)(?:plutus_)?([A-Za-z0-9_-]{24,})$/i);
+  return match?.[1] ?? null;
+}
+
+export async function handleTelegramUpdate(
+  db: Database.Database,
+  update: TelegramUpdate,
+  dependencies: TelegramHandlerDependencies = {}
+): Promise<void> {
   const message = update.message;
   if (!message) return;
+  if (!message.text) return;
 
-  const chatId = getChatId();
-  const threadId = getThreadId();
-
-  if (String(message.chat.id) !== String(chatId) || message.message_thread_id !== threadId) {
+  const claimToken = parseTelegramContributorClaim(message.text);
+  if (claimToken) {
+    const senderId = message.from?.id;
+    const sendIncoming = dependencies.sendToIncomingChat ?? sendMessageToChat;
+    if (senderId === undefined || message.from?.is_bot || !getTelegramAccessStatus().valid) return;
+    try {
+      const claim = claimTelegramContributorInvite(db, {
+        claim_token: claimToken,
+        telegram_user_id: String(senderId),
+        owner_telegram_user_id: process.env.TELEGRAM_OWNER_USER_ID as string,
+      });
+      await sendIncoming(
+        message.chat.id,
+        `Access confirmed as ${claim.contributor.counterparty_name}. I can help record what you pay for Aniket and show only your shared tab with him.`,
+        { thread_id: message.message_thread_id, reply_to_message_id: message.message_id }
+      );
+      if (!claim.was_existing) {
+        await (dependencies.sendOwnerMessage ?? sendMessage)(
+          `🔐 ${claim.contributor.counterparty_name} accepted their Plutus invitation.\nThey can now record payments for you and view only your bilateral tab.`
+        );
+      }
+    } catch {
+      await sendIncoming(
+        message.chat.id,
+        "That invitation is invalid or expired. Ask Aniket for a new one.",
+        { thread_id: message.message_thread_id, reply_to_message_id: message.message_id }
+      );
+    }
     return;
   }
 
-  if (!message.text) return;
+  const actor = resolveTelegramActor(db, message);
+  if (!actor) {
+    console.warn(
+      `[telegram] ignored unauthorized message update_id=${update.update_id} sender=${String(message.from?.id ?? "missing")}`
+    );
+    return;
+  }
 
   const replyToId = message.reply_to_message?.message_id;
-  const linkedTransactionId = replyToId ? getTransactionIdForMessage(db, replyToId) : undefined;
+  const linkedTransactionId =
+    actor.role === "owner" && replyToId
+      ? getTransactionIdForMessage(db, replyToId, message.chat.id)
+      : undefined;
 
   if (linkedTransactionId) {
-    console.log(`[telegram] incoming reply linked to transaction ${linkedTransactionId}: "${message.text}"`);
+    console.log(`[telegram] authorized owner reply linked to transaction ${linkedTransactionId}`);
   } else {
-    console.log(`[telegram] incoming general message: "${message.text}"`);
+    console.log(
+      `[telegram] authorized ${actor.role} message update_id=${update.update_id} chat=${String(message.chat.id)}`
+    );
   }
 
   // Telegram's "typing" indicator only lasts ~5s, so refresh it periodically
   // while the agent (o3 can take 10-30s) is still working.
-  void sendTypingAction();
-  const typingInterval = setInterval(() => void sendTypingAction(), 4000);
+  const sendTyping = dependencies.sendTyping ?? sendTypingActionToChat;
+  void sendTyping(message.chat.id, message.message_thread_id);
+  const typingInterval = setInterval(
+    () => void sendTyping(message.chat.id, message.message_thread_id),
+    4000
+  );
 
   try {
-    const reply = await runAgent(db, {
-      user_message: message.text,
-      interface: "telegram",
-      replied_to_transaction_id: linkedTransactionId,
+    let reply: string;
+    if (actor.role === "owner") {
+      reply = await (dependencies.runOwnerAgent ?? runAgent)(db, {
+        user_message: message.text,
+        interface: "telegram",
+        replied_to_transaction_id: linkedTransactionId,
+      });
+    } else {
+      const contributorIdentity: ContributorIdentity = {
+        telegram_user_id: actor.telegram_user_id,
+        name: actor.name,
+      };
+      const result = await (dependencies.runContributorAgent ?? runContributorAgent)(db, {
+        identity: contributorIdentity,
+        conversation_id: String(message.chat.id),
+        message_id: message.message_id,
+        user_message: message.text,
+      });
+      reply = result.text;
+      for (const receipt of result.recorded_purchases) {
+        await (dependencies.sendOwnerMessage ?? sendMessage)(contributorAuditMessage(receipt));
+      }
+    }
+    await (dependencies.sendToIncomingChat ?? sendMessageToChat)(message.chat.id, reply, {
+      thread_id: message.message_thread_id,
+      reply_to_message_id: message.message_id,
     });
-    await sendMessage(reply, message.message_id);
   } catch (err) {
     console.error("[telegram] agent run failed:", err);
-    await sendMessage("Something went wrong on my end — try again in a bit.", message.message_id);
+    await (dependencies.sendToIncomingChat ?? sendMessageToChat)(
+      message.chat.id,
+      "Something went wrong on my end — try again in a bit.",
+      {
+        thread_id: message.message_thread_id,
+        reply_to_message_id: message.message_id,
+      }
+    );
   } finally {
     clearInterval(typingInterval);
   }

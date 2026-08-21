@@ -241,6 +241,28 @@ export interface RecordCounterpartyTransferInput {
   created_by: string;
 }
 
+export interface RecordContributorPurchaseInput {
+  idempotency_key: string;
+  reporter: string;
+  reporter_telegram_user_id: string;
+  occurred_at: string;
+  gross_amount_inr: number;
+  owner_share_inr: number;
+  label: string;
+  category?: string;
+  treatment?: string;
+  flex_classification?: FlexBudgetClassification;
+  notes?: string;
+}
+
+export interface RecordContributorPurchaseResult {
+  raw: RawTransactionV2;
+  entry: EnvelopeEntry;
+  payable_context: ContextFact;
+  flex_classification: FlexBudgetClassificationRecord | null;
+  was_existing: boolean;
+}
+
 export interface Commitment {
   id: string;
   label: string;
@@ -1730,6 +1752,175 @@ export function recordCounterpartyTransfer(
       entry,
       context,
       balance: getCounterpartyBalance(db, counterparty),
+    };
+  })();
+}
+
+/**
+ * Append an off-account purchase reported by an explicitly authorized,
+ * privacy-restricted Telegram contributor. The caller supplies the trusted
+ * reporter identity; the AI never gets to choose it.
+ */
+export function recordContributorPurchase(
+  db: Database.Database,
+  input: RecordContributorPurchaseInput
+): RecordContributorPurchaseResult {
+  const reporter = input.reporter.trim();
+  const reporterTelegramUserId = input.reporter_telegram_user_id.trim();
+  const label = input.label.trim();
+  if (!input.idempotency_key.trim()) throw new Error("idempotency_key is required");
+  if (!reporter) throw new Error("reporter is required");
+  if (!reporterTelegramUserId) throw new Error("reporter_telegram_user_id is required");
+  if (!label) throw new Error("label is required");
+  if (!Number.isFinite(input.gross_amount_inr) || input.gross_amount_inr <= 0) {
+    throw new Error("gross_amount_inr must be positive");
+  }
+  if (
+    !Number.isFinite(input.owner_share_inr) ||
+    input.owner_share_inr <= 0 ||
+    input.owner_share_inr - input.gross_amount_inr > 0.01
+  ) {
+    throw new Error("owner_share_inr must be positive and no greater than gross_amount_inr");
+  }
+  const occurredAt = /^\d{4}-\d{2}-\d{2}$/.test(input.occurred_at)
+    ? `${input.occurred_at}T12:00:00+05:30`
+    : input.occurred_at;
+  if (Number.isNaN(new Date(occurredAt).getTime())) {
+    throw new Error("occurred_at must be valid ISO 8601 or YYYY-MM-DD");
+  }
+  if (
+    input.flex_classification !== undefined &&
+    !(["flex", "fixed", "excluded"] as FlexBudgetClassification[]).includes(
+      input.flex_classification
+    )
+  ) {
+    throw new Error("flex_classification must be flex, fixed, or excluded");
+  }
+
+  const rawEmailId = `telegram-contributor:${input.idempotency_key.trim()}`;
+  const createdBy = `telegram_contributor:${reporterTelegramUserId}`;
+  return db.transaction(() => {
+    const existingRaw = db
+      .prepare("SELECT * FROM raw_transactions WHERE raw_email_id = ?")
+      .get(rawEmailId) as RawTransactionV2 | undefined;
+    if (existingRaw) {
+      const payload = parseJsonObject(existingRaw.raw_payload);
+      const sameReport =
+        existingRaw.source === "manual" &&
+        existingRaw.merchant_raw === label &&
+        existingRaw.occurred_at === occurredAt &&
+        Math.abs(rawAmountInr(existingRaw) - input.gross_amount_inr) <= 0.01 &&
+        payload?.evidence_kind === "telegram_contributor_report" &&
+        String(payload?.reporter_telegram_user_id ?? "") === reporterTelegramUserId &&
+        Math.abs(Number(payload?.owner_share_inr) - input.owner_share_inr) <= 0.01;
+      if (!sameReport) {
+        throw new Error("idempotency key already belongs to a different contributor report");
+      }
+    }
+    const raw =
+      existingRaw ??
+      insertRawTransaction(db, {
+        source: "manual",
+        amount: input.gross_amount_inr,
+        amount_inr: input.gross_amount_inr,
+        currency: "INR",
+        merchant_raw: label,
+        occurred_at: occurredAt,
+        direction: "debit",
+        raw_email_id: rawEmailId,
+        raw_payload: JSON.stringify({
+          evidence_kind: "telegram_contributor_report",
+          reporter,
+          reporter_telegram_user_id: reporterTelegramUserId,
+          owner_share_inr: input.owner_share_inr,
+          notes: input.notes?.trim() || null,
+        }),
+      });
+
+    const existingEntry = listEnvelopeEntries(db, {
+      raw_transaction_id: raw.id,
+      limit: 1,
+    })[0];
+    if (existingEntry && existingEntry.created_by !== createdBy) {
+      throw new Error("contributor report already has an interpretation from another source");
+    }
+    const salaryDay = getActiveSalaryProfile(db)?.salary_day ?? 1;
+    const entry =
+      existingEntry ??
+      createEnvelopeEntry(db, {
+        raw_transaction_id: raw.id,
+        funding_month: getSalaryFundingMonthForDate(new Date(occurredAt), salaryDay),
+        occurred_at: occurredAt,
+        source: "manual",
+        merchant_clean: label,
+        category: input.category?.trim() || "Other",
+        treatment: input.treatment?.trim() || "normal",
+        state: "actual",
+        gross_amount_inr: input.gross_amount_inr,
+        personal_impact: input.owner_share_inr,
+        cashflow_impact: 0,
+        receivable_amount: 0,
+        notes:
+          input.notes?.trim() ||
+          `${reporter} reported paying this off-account on the owner's behalf.`,
+        confidence: 1,
+        created_by: createdBy,
+      });
+
+    const payableKey = `counterparty_payable_${raw.id}`;
+    const existingPayable = listContextFacts(db, {
+      scope_type: "person",
+      scope_id: reporter,
+      key: payableKey,
+    })[0];
+    const payableContext =
+      existingPayable ??
+      setContextFact(db, {
+        scope_type: "person",
+        scope_id: reporter,
+        key: payableKey,
+        value: JSON.stringify({
+          status: "outstanding",
+          label,
+          amount_owed_inr: input.owner_share_inr,
+          occurred_at: occurredAt,
+          raw_transaction_id: raw.id,
+          envelope_entry_id: entry.id,
+          reported_by: reporter,
+          reporter_telegram_user_id: reporterTelegramUserId,
+          notes: input.notes?.trim() || null,
+        }),
+        source: createdBy,
+        confidence: 1,
+      });
+
+    const dateIst = occurredAt.slice(0, 10);
+    const plan = getActiveFlexBudgetPlan(db, dateIst);
+    let classification: FlexBudgetClassificationRecord | null = null;
+    if (plan && input.flex_classification) {
+      classification =
+        (db
+          .prepare(
+            `SELECT * FROM flex_budget_classifications
+             WHERE plan_id = ? AND raw_transaction_id = ? AND superseded_at IS NULL`
+          )
+          .get(plan.id, raw.id) as FlexBudgetClassificationRecord | undefined) ??
+        setFlexBudgetClassification(db, {
+          plan_id: plan.id,
+          raw_transaction_id: raw.id,
+          classification: input.flex_classification,
+          rationale: `Reported by authorized contributor ${reporter}: ${label}`,
+          confidence: 1,
+          created_by: createdBy,
+        });
+    }
+
+    return {
+      raw,
+      entry,
+      payable_context: payableContext,
+      flex_classification: classification,
+      was_existing: Boolean(existingRaw),
     };
   })();
 }
