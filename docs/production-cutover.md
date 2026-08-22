@@ -21,11 +21,20 @@ AUTO_INFERENCE_MIN_CONFIDENCE=0.75
 INFERENCE_MODEL=gpt-4o
 ```
 
+Violet's owner and contributor conversations default to the flagship model at
+high reasoning. These overrides are optional:
+
+```text
+VIOLET_MODEL=gpt-5.6-sol
+VIOLET_REASONING_EFFORT=high
+```
+
 ## 2. Deployment smoke test
 
 1. Confirm `/health` reports `status=ok`, the expected package version,
-   `next_cron_at`, and scheduler-specific `next_run_at` values. The new database
-   path appears in startup logs.
+   `next_cron_at`, scheduler-specific `next_run_at` values, and the intended
+   `violet_ai` model configuration. The new database path appears in startup
+   logs.
 2. Confirm MCP lists `create_raw_transaction`,
    `bulk_create_raw_transactions`, `list_uninterpreted_transactions`,
    `infer_raw_transaction`, `interpret_pending_transactions`,

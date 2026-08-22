@@ -74,9 +74,12 @@ const {
   searchTransactionEmails,
 } = require("../src/gmail/diagnostics");
 const { buildSystemPrompt } = require("../src/agent/prompts");
+const { runAgent } = require("../src/agent/runner");
+const { getVioletModelConfig } = require("../src/agent/model-config");
 const {
   buildContributorSystemPrompt,
   getContributorBalanceView,
+  runContributorAgent,
 } = require("../src/agent/contributor");
 const { formatV2Transaction } = require("../src/telegram/formatter");
 const {
@@ -3895,6 +3898,10 @@ test("health reports the next enabled cron and per-scheduler timing", async () =
   assert.equal(typeof health.next_cron_at, "string");
   assert.equal(health.schedulers.gmail_poll.enabled, true);
   assert.equal(health.schedulers.automatic_inference.enabled, false);
+  assert.deepEqual(health.violet_ai, {
+    model: "gpt-5.6-sol",
+    reasoning_effort: "high",
+  });
   assert.deepEqual(health.telegram_access, {
     webhook_secret_configured: true,
     owner_identity_configured: true,
@@ -3904,6 +3911,202 @@ test("health reports the next enabled cron and per-scheduler timing", async () =
   await app.close();
   db.close();
   resetSchedulerHealthForTests();
+});
+
+test("Violet defaults to the flagship model with high reasoning", () => {
+  const previousModel = process.env.VIOLET_MODEL;
+  const previousEffort = process.env.VIOLET_REASONING_EFFORT;
+  delete process.env.VIOLET_MODEL;
+  delete process.env.VIOLET_REASONING_EFFORT;
+  try {
+    assert.deepEqual(getVioletModelConfig(), {
+      model: "gpt-5.6-sol",
+      reasoning_effort: "high",
+    });
+    process.env.VIOLET_MODEL = "custom-model";
+    process.env.VIOLET_REASONING_EFFORT = "medium";
+    assert.deepEqual(getVioletModelConfig(), {
+      model: "custom-model",
+      reasoning_effort: "medium",
+    });
+  } finally {
+    if (previousModel === undefined) delete process.env.VIOLET_MODEL;
+    else process.env.VIOLET_MODEL = previousModel;
+    if (previousEffort === undefined) delete process.env.VIOLET_REASONING_EFFORT;
+    else process.env.VIOLET_REASONING_EFFORT = previousEffort;
+  }
+});
+
+test("Violet discards a stale balance drafted after a balance-affecting write", async () => {
+  const db = makeDb();
+  setContextFact(db, {
+    scope_type: "person",
+    scope_id: "Rushil",
+    key: "counterparty_payable_existing_dinners",
+    value: JSON.stringify({
+      status: "outstanding",
+      label: "Existing dinners",
+      amount_owed_inr: 1193,
+      occurred_at: "2026-08-19T20:00:00+05:30",
+    }),
+    source: "telegram_user",
+    confidence: 1,
+  });
+
+  const requests = [];
+  const completions = [
+    {
+      choices: [{
+        message: {
+          role: "assistant",
+          content: null,
+          tool_calls: [{
+            id: "call_record_rapido",
+            type: "function",
+            function: {
+              name: "set_context_fact",
+              arguments: JSON.stringify({
+                scope_type: "person",
+                scope_id: "Rushil",
+                key: "counterparty_payable_rapido_2026_08_22",
+                value: JSON.stringify({
+                  status: "outstanding",
+                  label: "Rapido delivery",
+                  amount_owed_inr: 98,
+                  occurred_at: "2026-08-22T14:30:00+05:30",
+                }),
+                source: "telegram_user",
+                confidence: 1,
+              }),
+            },
+          }],
+        },
+      }],
+    },
+    {
+      choices: [{
+        message: {
+          role: "assistant",
+          content: "Updated. Net with Rushil: you owe him ₹1,193.",
+        },
+      }],
+    },
+    {
+      choices: [{
+        message: {
+          role: "assistant",
+          content: "Updated. Net with Rushil: you owe him ₹1,291.",
+        },
+      }],
+    },
+  ];
+
+  const result = await runAgent(
+    db,
+    {
+      user_message: "Rushil paid ₹98 for my Rapido delivery. Approved.",
+      interface: "telegram",
+    },
+    {
+      createCompletion: async (request) => {
+        requests.push(request);
+        return completions[requests.length - 1];
+      },
+    }
+  );
+
+  assert.equal(result, "Updated. Net with Rushil: you owe him ₹1,291.");
+  assert.equal(requests.length, 3);
+  assert.equal(requests[0].model, "gpt-5.6-sol");
+  assert.equal(requests[0].reasoning_effort, "high");
+  assert.equal(requests[0].parallel_tool_calls, false);
+  assert.equal("temperature" in requests[0], false);
+  const refreshMessage = requests[2].messages.find(
+    (message) => message.role === "system" &&
+      typeof message.content === "string" &&
+      message.content.includes("POST-WRITE CANONICAL REFRESH")
+  );
+  assert.ok(refreshMessage);
+  assert.match(refreshMessage.content, /"net_balance_inr":-1291/);
+  assert.equal(getCounterpartyBalance(db, "Rushil").net_balance_inr, -1291);
+  db.close();
+});
+
+test("contributor Violet refreshes the bilateral tab after recording a purchase", async () => {
+  const db = makeDb();
+  const requests = [];
+  const completions = [
+    {
+      choices: [{
+        message: {
+          role: "assistant",
+          content: null,
+          tool_calls: [{
+            id: "call_record_purchase",
+            type: "function",
+            function: {
+              name: "record_purchase_for_aniket",
+              arguments: JSON.stringify({
+                label: "Rapido delivery",
+                occurred_at: "2026-08-22",
+                gross_amount_inr: 98,
+                owner_share_inr: 98,
+                category: "Transport",
+                treatment: "split",
+                flex_classification: "flex",
+              }),
+            },
+          }],
+        },
+      }],
+    },
+    {
+      choices: [{
+        message: {
+          role: "assistant",
+          content: "Recorded, but your tab is settled.",
+        },
+      }],
+    },
+    {
+      choices: [{
+        message: {
+          role: "assistant",
+          content: "Recorded ₹98. Aniket owes you ₹98.",
+        },
+      }],
+    },
+  ];
+
+  const result = await runContributorAgent(
+    db,
+    {
+      identity: { telegram_user_id: "222", name: "Rushil" },
+      conversation_id: "dm:222",
+      message_id: 987,
+      user_message: "I paid ₹98 for Aniket's Rapido delivery today.",
+    },
+    {
+      createCompletion: async (request) => {
+        requests.push(request);
+        return completions[requests.length - 1];
+      },
+    }
+  );
+
+  assert.equal(result.text, "Recorded ₹98. Aniket owes you ₹98.");
+  assert.equal(result.recorded_purchases.length, 1);
+  assert.equal(requests.length, 3);
+  assert.equal(requests[0].model, "gpt-5.6-sol");
+  assert.equal(requests[0].parallel_tool_calls, false);
+  const refreshMessage = requests[2].messages.find(
+    (message) => message.role === "system" &&
+      typeof message.content === "string" &&
+      message.content.includes("POST-WRITE CANONICAL REFRESH")
+  );
+  assert.ok(refreshMessage);
+  assert.match(refreshMessage.content, /"amount_inr":98/);
+  db.close();
 });
 
 test("health degrades without verified Telegram owner access and never exposes identity values", async () => {
