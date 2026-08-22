@@ -1,12 +1,17 @@
 import OpenAI from "openai";
 import type Database from "better-sqlite3";
-import type { ChatCompletionMessageParam, ChatCompletionTool } from "openai/resources/chat/completions";
+import type {
+  ChatCompletion,
+  ChatCompletionCreateParamsNonStreaming,
+  ChatCompletionMessageParam,
+  ChatCompletionTool,
+} from "openai/resources/chat/completions";
 import { buildSystemPrompt } from "./prompts";
 import { v2Tools as tools } from "./v2-tools";
-import { getRawTransaction } from "../db/v2-queries";
+import { getCounterpartyBalance, getRawTransaction } from "../db/v2-queries";
 import { listRecentAgentMessages, insertAgentMessage, getTransaction } from "../db/queries";
+import { getVioletModelConfig } from "./model-config";
 
-const MODEL = "o3";
 const MAX_TOOL_ITERATIONS = 20;
 const MAX_COMPLETION_TOKENS = 8000;
 
@@ -38,7 +43,63 @@ export interface RunAgentPayload {
   replied_to_transaction_id?: string;
 }
 
-export async function runAgent(db: Database.Database, payload: RunAgentPayload): Promise<string> {
+export interface RunAgentOptions {
+  createCompletion?: (
+    request: ChatCompletionCreateParamsNonStreaming
+  ) => Promise<ChatCompletion>;
+}
+
+function successfulToolResult(result: unknown): boolean {
+  return !(
+    typeof result === "object" &&
+    result !== null &&
+    "error" in result &&
+    Boolean((result as { error?: unknown }).error)
+  );
+}
+
+export function counterpartyAffectedByTool(
+  toolName: string,
+  args: Record<string, unknown>,
+  result: unknown
+): string | null {
+  if (!successfulToolResult(result)) return null;
+  if (
+    toolName === "record_counterparty_transfer" ||
+    toolName === "create_receivable" ||
+    toolName === "create_counterparty_balance_checkpoint"
+  ) {
+    return typeof args.counterparty === "string" && args.counterparty.trim()
+      ? args.counterparty.trim()
+      : null;
+  }
+  if (
+    toolName === "set_context_fact" &&
+    args.scope_type === "person" &&
+    typeof args.scope_id === "string" &&
+    typeof args.key === "string" &&
+    (args.key.startsWith("counterparty_payable_") ||
+      args.key.startsWith("counterparty_transfer"))
+  ) {
+    return args.scope_id.trim() || null;
+  }
+  if (toolName === "update_receivable") {
+    const counterparty =
+      typeof result === "object" && result !== null
+        ? (result as { counterparty?: unknown }).counterparty
+        : null;
+    return typeof counterparty === "string" && counterparty.trim()
+      ? counterparty.trim()
+      : null;
+  }
+  return null;
+}
+
+export async function runAgent(
+  db: Database.Database,
+  payload: RunAgentPayload,
+  options: RunAgentOptions = {}
+): Promise<string> {
   const systemPrompt = buildSystemPrompt(db);
 
   const history: ChatCompletionMessageParam[] = listRecentAgentMessages(db, 50)
@@ -71,24 +132,44 @@ export async function runAgent(db: Database.Database, payload: RunAgentPayload):
     { role: "user", content: effectiveUserMessage },
   ];
 
-  const openai = getClient();
   const toolDefs = toOpenAiTools();
   const toolMap = new Map(tools.map((t) => [t.name, t]));
+  const modelConfig = getVioletModelConfig();
+  const pendingCounterpartyRefreshes = new Map<string, string>();
+  const createCompletion =
+    options.createCompletion ??
+    ((request: ChatCompletionCreateParamsNonStreaming) =>
+      getClient().chat.completions.create(request));
 
   let finalText = "";
 
   for (let i = 0; i < MAX_TOOL_ITERATIONS; i++) {
-    const completion = await openai.chat.completions.create({
-      model: MODEL,
-      temperature: 1,
+    const completion = await createCompletion({
+      model: modelConfig.model,
+      reasoning_effort: modelConfig.reasoning_effort,
       messages,
       tools: toolDefs,
+      parallel_tool_calls: false,
       max_completion_tokens: MAX_COMPLETION_TOKENS,
     });
 
     const message = completion.choices[0].message;
 
     if (!message.tool_calls || message.tool_calls.length === 0) {
+      if (pendingCounterpartyRefreshes.size > 0) {
+        const refreshed = [...pendingCounterpartyRefreshes.values()].map((counterparty) =>
+          getCounterpartyBalance(db, counterparty, { view: "current" })
+        );
+        pendingCounterpartyRefreshes.clear();
+        messages.push({
+          role: "system",
+          content:
+            "POST-WRITE CANONICAL REFRESH: A balance-affecting write occurred in this turn. " +
+            "Discard any balance number drafted before this message. Use only these freshly " +
+            `queried counterparty balances in the final answer: ${JSON.stringify(refreshed)}`,
+        });
+        continue;
+      }
       finalText = message.content ?? "";
       break;
     }
@@ -111,6 +192,22 @@ export async function runAgent(db: Database.Database, payload: RunAgentPayload):
         try {
           const args = toolCall.function.arguments ? JSON.parse(toolCall.function.arguments) : {};
           result = await tool.handler(db, args);
+          if (toolCall.function.name === "get_counterparty_balance") {
+            const counterparty =
+              typeof args.counterparty === "string" ? args.counterparty.trim() : "";
+            if (counterparty) pendingCounterpartyRefreshes.delete(counterparty.toLowerCase());
+          }
+          const affectedCounterparty = counterpartyAffectedByTool(
+            toolCall.function.name,
+            args,
+            result
+          );
+          if (affectedCounterparty) {
+            pendingCounterpartyRefreshes.set(
+              affectedCounterparty.toLowerCase(),
+              affectedCounterparty
+            );
+          }
         } catch (err) {
           result = { error: err instanceof Error ? err.message : String(err) };
         }

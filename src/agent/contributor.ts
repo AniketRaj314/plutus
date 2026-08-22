@@ -1,14 +1,19 @@
 import OpenAI from "openai";
 import type Database from "better-sqlite3";
-import type { ChatCompletionMessageParam, ChatCompletionTool } from "openai/resources/chat/completions";
+import type {
+  ChatCompletion,
+  ChatCompletionCreateParamsNonStreaming,
+  ChatCompletionMessageParam,
+  ChatCompletionTool,
+} from "openai/resources/chat/completions";
 import {
   getCounterpartyBalance,
   recordContributorPurchase,
   type FlexBudgetClassification,
   type RecordContributorPurchaseResult,
 } from "../db/v2-queries";
+import { getVioletModelConfig } from "./model-config";
 
-const MODEL = "o3";
 const MAX_TOOL_ITERATIONS = 8;
 const MAX_COMPLETION_TOKENS = 1800;
 
@@ -51,6 +56,12 @@ export interface ContributorPurchaseReceipt {
 export interface ContributorAgentResult {
   text: string;
   recorded_purchases: ContributorPurchaseReceipt[];
+}
+
+export interface RunContributorAgentOptions {
+  createCompletion?: (
+    request: ChatCompletionCreateParamsNonStreaming
+  ) => Promise<ChatCompletion>;
 }
 
 function currentIst(): string {
@@ -237,7 +248,8 @@ function toReceipt(
 
 export async function runContributorAgent(
   db: Database.Database,
-  payload: ContributorAgentPayload
+  payload: ContributorAgentPayload,
+  options: RunContributorAgentOptions = {}
 ): Promise<ContributorAgentResult> {
   const messages: ChatCompletionMessageParam[] = [
     { role: "system", content: buildContributorSystemPrompt(payload.identity) },
@@ -245,18 +257,37 @@ export async function runContributorAgent(
     { role: "user", content: payload.user_message },
   ];
   const receipts: ContributorPurchaseReceipt[] = [];
+  const modelConfig = getVioletModelConfig();
+  const createCompletion =
+    options.createCompletion ??
+    ((request: ChatCompletionCreateParamsNonStreaming) =>
+      getClient().chat.completions.create(request));
+  let needsBalanceRefresh = false;
   let finalText = "";
 
   for (let i = 0; i < MAX_TOOL_ITERATIONS; i++) {
-    const completion = await getClient().chat.completions.create({
-      model: MODEL,
-      temperature: 1,
+    const completion = await createCompletion({
+      model: modelConfig.model,
+      reasoning_effort: modelConfig.reasoning_effort,
       messages,
       tools: [CONTRIBUTOR_TOOL, CONTRIBUTOR_BALANCE_TOOL],
+      parallel_tool_calls: false,
       max_completion_tokens: MAX_COMPLETION_TOKENS,
     });
     const message = completion.choices[0].message;
     if (!message.tool_calls || message.tool_calls.length === 0) {
+      if (needsBalanceRefresh) {
+        const refreshed = getContributorBalanceView(db, payload.identity, "current");
+        needsBalanceRefresh = false;
+        messages.push({
+          role: "system",
+          content:
+            "POST-WRITE CANONICAL REFRESH: A purchase was recorded in this turn. " +
+            "Discard any balance number drafted before this message. Use only this freshly " +
+            `queried bilateral balance in the final answer: ${JSON.stringify(refreshed)}`,
+        });
+        continue;
+      }
       finalText = message.content ?? "";
       break;
     }
@@ -279,6 +310,7 @@ export async function runContributorAgent(
             payload.identity,
             args.view === "full" ? "full" : "current"
           );
+          needsBalanceRefresh = false;
         } else if (toolCall.function.name === "record_purchase_for_aniket") {
           const args = JSON.parse(toolCall.function.arguments || "{}") as {
             label: string;
@@ -305,6 +337,7 @@ export async function runContributorAgent(
           });
           const receipt = toReceipt(result, payload.identity.name);
           receipts.push(receipt);
+          needsBalanceRefresh = true;
           toolResult = {
             recorded: true,
             raw_transaction_id: receipt.raw_transaction_id,

@@ -9,6 +9,7 @@ import {
   type TelegramUpdate,
 } from "../telegram/bot";
 import { runAgent } from "../agent/runner";
+import { getVioletModelConfig } from "../agent/model-config";
 import { todayIst, daysUntilSalaryDay } from "../agent/prompts";
 import { tools as agentTools } from "../agent/tools";
 import {
@@ -90,6 +91,7 @@ export function registerRoutes(app: FastifyInstance, db: Database.Database): voi
       poll_interval: process.env.POLL_INTERVAL_MINS,
       auto_inference_enabled: process.env.AUTO_INFERENCE_ENABLED !== "false",
       auto_inference_interval: process.env.AUTO_INFERENCE_INTERVAL_MINS ?? "5",
+      violet_ai: getVioletModelConfig(),
       degraded_components: degradedComponents,
       telegram_access: {
         ...telegramAccess,
