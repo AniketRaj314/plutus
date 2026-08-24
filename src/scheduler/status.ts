@@ -1,4 +1,8 @@
-export type SchedulerName = "gmail_poll" | "receipt_enrichment" | "automatic_inference";
+export type SchedulerName =
+  | "gmail_poll"
+  | "receipt_enrichment"
+  | "automatic_inference"
+  | "sms_ingestion";
 
 interface SchedulerState {
   name: SchedulerName;

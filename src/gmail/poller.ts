@@ -36,6 +36,10 @@ import {
   normalizeCronInterval,
   runSchedulerCycle,
 } from "../scheduler/status";
+import {
+  findIdfcUpiCrossChannelMatch,
+  recordTransactionEvidence,
+} from "../db/evidence";
 
 const WATCHED_SENDERS = [
   "noreply@idfcfirstbank.com",
@@ -353,9 +357,27 @@ export async function processMessage(
   }
 
   const enrich = options.enrich ?? enrichTransaction;
+  const receivedAt = getGmailReceivedAt(message);
+  const bankReference = parsed.notes?.match(/\bupi_ref:([A-Za-z0-9-]+)/i)?.[1] ?? null;
+  const evidencePayload = JSON.stringify({
+    from,
+    subject,
+    snippet,
+    gmail_received_at: receivedAt,
+    direction: parsed.direction,
+  });
 
   const existing = getTransactionByRawEmailId(db, parsed.raw_email_id);
   if (existing) {
+    recordTransactionEvidence(db, {
+      raw_transaction_id: existing.id,
+      channel: "gmail",
+      external_id: parsed.raw_email_id,
+      received_at: receivedAt,
+      sender_label: from,
+      bank_reference: bankReference,
+      raw_payload: evidencePayload,
+    });
     if (getMessageIdForTransaction(db, existing.id)) {
       console.log(`[gmail] transaction already completed for raw_email_id=${parsed.raw_email_id}, skipping`);
       return "duplicate";
@@ -364,6 +386,31 @@ export async function processMessage(
     if (!existing.merchant_clean) await enrich(db, existing);
     await finalizeTransaction(db, getTransaction(db, existing.id) ?? existing, options);
     return "recorded";
+  }
+
+  const crossChannelMatch =
+    parsed.source === "idfc_upi"
+      ? findIdfcUpiCrossChannelMatch(db, {
+          amount: parsed.amount,
+          datetime: parsed.datetime,
+          direction: parsed.direction,
+          notes: parsed.notes,
+        })
+      : undefined;
+  if (crossChannelMatch) {
+    recordTransactionEvidence(db, {
+      raw_transaction_id: crossChannelMatch.id,
+      channel: "gmail",
+      external_id: parsed.raw_email_id,
+      received_at: receivedAt,
+      sender_label: from,
+      bank_reference: bankReference,
+      raw_payload: evidencePayload,
+    });
+    console.log(
+      `[gmail] matched ${parsed.raw_email_id} to existing ${crossChannelMatch.id} across ingestion channels`
+    );
+    return "duplicate";
   }
 
   const minuteKey = parsed.datetime.slice(0, 16);
@@ -375,6 +422,15 @@ export async function processMessage(
     minuteKey
   );
   if (contentDuplicate) {
+    recordTransactionEvidence(db, {
+      raw_transaction_id: contentDuplicate.id,
+      channel: "gmail",
+      external_id: parsed.raw_email_id,
+      received_at: receivedAt,
+      sender_label: from,
+      bank_reference: bankReference,
+      raw_payload: evidencePayload,
+    });
     console.log(
       `[gmail] duplicate transaction content (same amount/merchant/minute) already recorded as ${contentDuplicate.id}, skipping raw_email_id=${parsed.raw_email_id}`
     );
@@ -418,7 +474,7 @@ export async function processMessage(
       from,
       subject,
       snippet,
-      gmail_received_at: getGmailReceivedAt(message),
+      gmail_received_at: receivedAt,
       timestamp_source:
         parsed.source === "amex"
           ? "issuer_date_plus_gmail_received_time"
@@ -427,6 +483,15 @@ export async function processMessage(
           : "issuer_alert",
       direction: parsed.direction,
     }),
+  });
+  recordTransactionEvidence(db, {
+    raw_transaction_id: transaction.id,
+    channel: "gmail",
+    external_id: parsed.raw_email_id,
+    received_at: receivedAt,
+    sender_label: from,
+    bank_reference: bankReference,
+    raw_payload: evidencePayload,
   });
 
   console.log(
@@ -466,7 +531,7 @@ export function isLikelyTransactionAlert(message: gmail_v1.Schema$Message): bool
   return false;
 }
 
-async function finalizeTransaction(
+export async function finalizeTransaction(
   db: Database.Database,
   transaction: NonNullable<ReturnType<typeof getTransaction>>,
   options: ProcessMessageOptions

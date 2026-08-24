@@ -103,6 +103,38 @@ export function runMigrations(db: Database.Database): void {
       reasoning_effort TEXT
     );
 
+    CREATE TABLE IF NOT EXISTS transaction_evidence (
+      id TEXT PRIMARY KEY,
+      raw_transaction_id TEXT NOT NULL,
+      channel TEXT NOT NULL CHECK (channel IN ('gmail', 'sms', 'manual')),
+      external_id TEXT NOT NULL,
+      received_at TEXT,
+      sender_label TEXT,
+      bank_reference TEXT,
+      raw_payload TEXT NOT NULL,
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      FOREIGN KEY (raw_transaction_id) REFERENCES raw_transactions(id),
+      UNIQUE (channel, external_id)
+    );
+
+    CREATE TABLE IF NOT EXISTS sms_ingestion_events (
+      id TEXT PRIMARY KEY,
+      message_hash TEXT NOT NULL,
+      received_at TEXT NOT NULL,
+      device_label TEXT,
+      shortcut_version TEXT,
+      status TEXT NOT NULL
+        CHECK (status IN ('stored', 'processed', 'duplicate', 'rejected', 'error')),
+      raw_transaction_id TEXT,
+      attempts INTEGER NOT NULL DEFAULT 0,
+      error_ref TEXT UNIQUE,
+      safe_message TEXT,
+      last_attempt_at TEXT,
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+      FOREIGN KEY (raw_transaction_id) REFERENCES raw_transactions(id)
+    );
+
     CREATE TABLE IF NOT EXISTS contributor_agent_messages (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       telegram_user_id TEXT NOT NULL,
@@ -365,6 +397,10 @@ export function runMigrations(db: Database.Database): void {
     CREATE INDEX IF NOT EXISTS idx_transactions_source ON transactions (source);
     CREATE INDEX IF NOT EXISTS idx_agent_error_logs_occurred_at
       ON agent_error_logs (occurred_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_transaction_evidence_raw
+      ON transaction_evidence (raw_transaction_id, channel);
+    CREATE INDEX IF NOT EXISTS idx_sms_ingestion_events_status
+      ON sms_ingestion_events (status, attempts, created_at);
     CREATE INDEX IF NOT EXISTS idx_contributor_messages_scope
       ON contributor_agent_messages (telegram_user_id, conversation_id, id DESC);
     CREATE INDEX IF NOT EXISTS idx_telegram_contributors_status
@@ -414,6 +450,7 @@ export function runMigrations(db: Database.Database): void {
   ensureColumn(db, "transactions", "direction", "TEXT NOT NULL DEFAULT 'debit'");
   ensureColumn(db, "raw_transactions", "is_preauth", "INTEGER NOT NULL DEFAULT 0");
   ensureColumn(db, "raw_transactions", "direction", "TEXT NOT NULL DEFAULT 'debit'");
+  ensureColumn(db, "transaction_evidence", "bank_reference", "TEXT");
   db.exec(`CREATE INDEX IF NOT EXISTS idx_transactions_raw_email_id ON transactions (raw_email_id);`);
 
   seedEnvelope(db);
