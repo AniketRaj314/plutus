@@ -11,6 +11,7 @@ import {
   claimTelegramContributorInvite,
   getActiveTelegramContributor,
 } from "./access";
+import { agentErrorLogLine, recordAgentError } from "../agent/diagnostics";
 
 const MESSAGE_MAP_KEY = "telegram_message_map";
 const PENDING_REBALANCE_KEY = "pending_rebalance_message";
@@ -382,10 +383,16 @@ export async function handleTelegramUpdate(
       reply_to_message_id: message.message_id,
     });
   } catch (err) {
-    console.error("[telegram] agent run failed:", err);
+    const diagnostic = recordAgentError(db, {
+      interface: "telegram",
+      actor_role: actor.role,
+      stage: actor.role === "owner" ? "owner_agent" : "contributor_agent",
+      error: err,
+    });
+    console.error(`[telegram] agent run failed: ${agentErrorLogLine(diagnostic)}`);
     await (dependencies.sendToIncomingChat ?? sendMessageToChat)(
       message.chat.id,
-      "Something went wrong on my end — try again in a bit.",
+      `Something went wrong. Error ID: ${diagnostic.error_ref}\nSend me this ID and I can inspect it.`,
       {
         thread_id: message.message_thread_id,
         reply_to_message_id: message.message_id,

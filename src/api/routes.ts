@@ -10,6 +10,12 @@ import {
 } from "../telegram/bot";
 import { runAgent } from "../agent/runner";
 import { getVioletModelConfig } from "../agent/model-config";
+import {
+  agentErrorLogLine,
+  getAgentErrorDiagnostic,
+  recordAgentError,
+  sanitizeAgentErrorMessage,
+} from "../agent/diagnostics";
 import { todayIst, daysUntilSalaryDay } from "../agent/prompts";
 import { tools as agentTools } from "../agent/tools";
 import {
@@ -148,7 +154,17 @@ export function registerApiRoutes(app: FastifyInstance, db: Database.Database): 
           });
           return { response, timestamp: new Date().toISOString() };
         } catch (err) {
-          return handleInternalError(reply, err, "agent run failed");
+          const diagnostic = recordAgentError(db, {
+            interface: "api",
+            actor_role: "owner",
+            stage: "owner_agent",
+            error: err,
+          });
+          console.error(`[api] agent run failed: ${agentErrorLogLine(diagnostic)}`);
+          return reply.status(500).send({
+            error: "Violet agent failed",
+            error_ref: diagnostic.error_ref,
+          });
         }
       }
     );
@@ -527,6 +543,31 @@ export function buildMcpToolSpecs(): McpToolSpec[] {
   });
 
   specs.push({
+    name: "get_agent_error",
+    description:
+      "Look up one sanitized Violet failure diagnostic by the copyable VLT error ID shown to the user. Never returns prompts, financial data, credentials, headers, or stack traces.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        error_ref: {
+          type: "string",
+          pattern: "^VLT-[0-9]{8}-[A-Z0-9]{6}$",
+          description: "The exact VLT error ID shown by Violet.",
+        },
+      },
+      required: ["error_ref"],
+      additionalProperties: false,
+    },
+    run: (db, args) => {
+      const errorRef = typeof args.error_ref === "string" ? args.error_ref : "";
+      const diagnostic = getAgentErrorDiagnostic(db, errorRef);
+      return diagnostic
+        ? { found: true, diagnostic }
+        : { found: false, error_ref: errorRef.trim().toUpperCase() };
+    },
+  });
+
+  specs.push({
     name: "post_agent_message",
     description: "Send a message to the Plutus finance agent and get its response.",
     inputSchema: {
@@ -534,7 +575,20 @@ export function buildMcpToolSpecs(): McpToolSpec[] {
       properties: { message: { type: "string" } },
       required: ["message"],
     },
-    run: (db, args) => runAgent(db, { user_message: args.message as string, interface: "api" }),
+    run: async (db, args) => {
+      try {
+        return await runAgent(db, { user_message: args.message as string, interface: "api" });
+      } catch (error) {
+        const diagnostic = recordAgentError(db, {
+          interface: "api",
+          actor_role: "owner",
+          stage: "owner_agent",
+          error,
+        });
+        console.error(`[mcp] post_agent_message failed: ${agentErrorLogLine(diagnostic)}`);
+        return { error: "Violet agent failed", error_ref: diagnostic.error_ref };
+      }
+    },
   });
 
   return specs;
@@ -560,7 +614,7 @@ function buildMcpServer(db: Database.Database): McpServer {
       const text = typeof result === "string" ? result : JSON.stringify(result);
       return { content: [{ type: "text", text }] };
     } catch (err) {
-      console.error(`[mcp] tool "${spec.name}" failed:`, err);
+      console.error(`[mcp] tool "${spec.name}" failed: ${sanitizeAgentErrorMessage(err)}`);
       return { content: [{ type: "text", text: "Internal server error" }], isError: true };
     }
   });

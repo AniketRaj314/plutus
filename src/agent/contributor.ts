@@ -1,11 +1,12 @@
 import OpenAI from "openai";
 import type Database from "better-sqlite3";
 import type {
-  ChatCompletion,
-  ChatCompletionCreateParamsNonStreaming,
-  ChatCompletionMessageParam,
-  ChatCompletionTool,
-} from "openai/resources/chat/completions";
+  FunctionTool,
+  Response,
+  ResponseCreateParamsNonStreaming,
+  ResponseFunctionToolCall,
+  ResponseInputItem,
+} from "openai/resources/responses/responses";
 import {
   getCounterpartyBalance,
   recordContributorPurchase,
@@ -59,9 +60,9 @@ export interface ContributorAgentResult {
 }
 
 export interface RunContributorAgentOptions {
-  createCompletion?: (
-    request: ChatCompletionCreateParamsNonStreaming
-  ) => Promise<ChatCompletion>;
+  createResponse?: (
+    request: ResponseCreateParamsNonStreaming
+  ) => Promise<Response>;
 }
 
 function currentIst(): string {
@@ -108,13 +109,12 @@ RECORDING RULES:
 - Keep replies to 2-6 short lines. Show a compact net first and only the bilateral items needed to answer; expand only when asked.`;
 }
 
-const CONTRIBUTOR_TOOL: ChatCompletionTool = {
+const CONTRIBUTOR_TOOL: FunctionTool = {
   type: "function",
-  function: {
-    name: "record_purchase_for_aniket",
-    description:
-      "Record one purchase the authenticated contributor personally paid for on Aniket's behalf. The authenticated reporter identity is injected by the server and cannot be selected by the model.",
-    parameters: {
+  name: "record_purchase_for_aniket",
+  description:
+    "Record one purchase the authenticated contributor personally paid for on Aniket's behalf. The authenticated reporter identity is injected by the server and cannot be selected by the model.",
+  parameters: {
       type: "object",
       properties: {
         label: { type: "string" },
@@ -144,17 +144,16 @@ const CONTRIBUTOR_TOOL: ChatCompletionTool = {
         "treatment",
         "flex_classification",
       ],
-    },
   },
+  strict: false,
 };
 
-const CONTRIBUTOR_BALANCE_TOOL: ChatCompletionTool = {
+const CONTRIBUTOR_BALANCE_TOOL: FunctionTool = {
   type: "function",
-  function: {
-    name: "get_my_tab_with_aniket",
-    description:
-      "Get the authenticated contributor's own bilateral tab with Aniket. Identity is injected by the server; no counterparty can be selected.",
-    parameters: {
+  name: "get_my_tab_with_aniket",
+  description:
+    "Get the authenticated contributor's own bilateral tab with Aniket. Identity is injected by the server; no counterparty can be selected.",
+  parameters: {
       type: "object",
       properties: {
         view: {
@@ -164,8 +163,8 @@ const CONTRIBUTOR_BALANCE_TOOL: ChatCompletionTool = {
         },
       },
       required: [],
-    },
   },
+  strict: false,
 };
 
 export function getContributorBalanceView(
@@ -204,7 +203,7 @@ function listHistory(
   db: Database.Database,
   telegramUserId: string,
   conversationId: string
-): ChatCompletionMessageParam[] {
+): ResponseInputItem[] {
   const rows = db
     .prepare(
       `SELECT role, content FROM contributor_agent_messages
@@ -251,36 +250,41 @@ export async function runContributorAgent(
   payload: ContributorAgentPayload,
   options: RunContributorAgentOptions = {}
 ): Promise<ContributorAgentResult> {
-  const messages: ChatCompletionMessageParam[] = [
-    { role: "system", content: buildContributorSystemPrompt(payload.identity) },
+  const systemPrompt = buildContributorSystemPrompt(payload.identity);
+  const input: ResponseInputItem[] = [
     ...listHistory(db, payload.identity.telegram_user_id, payload.conversation_id),
     { role: "user", content: payload.user_message },
   ];
   const receipts: ContributorPurchaseReceipt[] = [];
   const modelConfig = getVioletModelConfig();
-  const createCompletion =
-    options.createCompletion ??
-    ((request: ChatCompletionCreateParamsNonStreaming) =>
-      getClient().chat.completions.create(request));
+  const createResponse =
+    options.createResponse ??
+    ((request: ResponseCreateParamsNonStreaming) => getClient().responses.create(request));
   let needsBalanceRefresh = false;
   let finalText = "";
 
   for (let i = 0; i < MAX_TOOL_ITERATIONS; i++) {
-    const completion = await createCompletion({
+    const response = await createResponse({
       model: modelConfig.model,
-      reasoning_effort: modelConfig.reasoning_effort,
-      messages,
+      reasoning: { effort: modelConfig.reasoning_effort },
+      instructions: systemPrompt,
+      input,
       tools: [CONTRIBUTOR_TOOL, CONTRIBUTOR_BALANCE_TOOL],
       parallel_tool_calls: false,
-      max_completion_tokens: MAX_COMPLETION_TOKENS,
+      max_output_tokens: MAX_COMPLETION_TOKENS,
+      store: false,
+      include: ["reasoning.encrypted_content"],
     });
-    const message = completion.choices[0].message;
-    if (!message.tool_calls || message.tool_calls.length === 0) {
+    const toolCalls = response.output.filter(
+      (item): item is ResponseFunctionToolCall => item.type === "function_call"
+    );
+    input.push(...(response.output as ResponseInputItem[]));
+    if (toolCalls.length === 0) {
       if (needsBalanceRefresh) {
         const refreshed = getContributorBalanceView(db, payload.identity, "current");
         needsBalanceRefresh = false;
-        messages.push({
-          role: "system",
+        input.push({
+          role: "developer",
           content:
             "POST-WRITE CANONICAL REFRESH: A purchase was recorded in this turn. " +
             "Discard any balance number drafted before this message. Use only this freshly " +
@@ -288,21 +292,15 @@ export async function runContributorAgent(
         });
         continue;
       }
-      finalText = message.content ?? "";
+      finalText = response.output_text ?? "";
       break;
     }
 
-    messages.push({
-      role: "assistant",
-      content: message.content,
-      tool_calls: message.tool_calls,
-    });
-    for (const toolCall of message.tool_calls) {
-      if (toolCall.type !== "function") continue;
+    for (const toolCall of toolCalls) {
       let toolResult: unknown;
       try {
-        if (toolCall.function.name === "get_my_tab_with_aniket") {
-          const args = JSON.parse(toolCall.function.arguments || "{}") as {
+        if (toolCall.name === "get_my_tab_with_aniket") {
+          const args = JSON.parse(toolCall.arguments || "{}") as {
             view?: "current" | "full";
           };
           toolResult = getContributorBalanceView(
@@ -311,8 +309,8 @@ export async function runContributorAgent(
             args.view === "full" ? "full" : "current"
           );
           needsBalanceRefresh = false;
-        } else if (toolCall.function.name === "record_purchase_for_aniket") {
-          const args = JSON.parse(toolCall.function.arguments || "{}") as {
+        } else if (toolCall.name === "record_purchase_for_aniket") {
+          const args = JSON.parse(toolCall.arguments || "{}") as {
             label: string;
             occurred_at: string;
             gross_amount_inr: number;
@@ -353,10 +351,10 @@ export async function runContributorAgent(
       } catch (error) {
         toolResult = { error: error instanceof Error ? error.message : String(error) };
       }
-      messages.push({
-        role: "tool",
-        tool_call_id: toolCall.id,
-        content: JSON.stringify(toolResult),
+      input.push({
+        type: "function_call_output",
+        call_id: toolCall.call_id,
+        output: JSON.stringify(toolResult),
       });
     }
   }
