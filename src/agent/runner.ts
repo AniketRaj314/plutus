@@ -1,11 +1,12 @@
 import OpenAI from "openai";
 import type Database from "better-sqlite3";
 import type {
-  ChatCompletion,
-  ChatCompletionCreateParamsNonStreaming,
-  ChatCompletionMessageParam,
-  ChatCompletionTool,
-} from "openai/resources/chat/completions";
+  FunctionTool,
+  Response,
+  ResponseCreateParamsNonStreaming,
+  ResponseFunctionToolCall,
+  ResponseInputItem,
+} from "openai/resources/responses/responses";
 import { buildSystemPrompt } from "./prompts";
 import { v2Tools as tools } from "./v2-tools";
 import { getCounterpartyBalance, getRawTransaction } from "../db/v2-queries";
@@ -26,14 +27,13 @@ function getClient(): OpenAI {
   return client;
 }
 
-function toOpenAiTools(): ChatCompletionTool[] {
+function toOpenAiTools(): FunctionTool[] {
   return tools.map((t) => ({
     type: "function",
-    function: {
-      name: t.name,
-      description: t.description,
-      parameters: t.parameters,
-    },
+    name: t.name,
+    description: t.description,
+    parameters: t.parameters,
+    strict: false,
   }));
 }
 
@@ -44,9 +44,9 @@ export interface RunAgentPayload {
 }
 
 export interface RunAgentOptions {
-  createCompletion?: (
-    request: ChatCompletionCreateParamsNonStreaming
-  ) => Promise<ChatCompletion>;
+  createResponse?: (
+    request: ResponseCreateParamsNonStreaming
+  ) => Promise<Response>;
 }
 
 function successfulToolResult(result: unknown): boolean {
@@ -102,7 +102,7 @@ export async function runAgent(
 ): Promise<string> {
   const systemPrompt = buildSystemPrompt(db);
 
-  const history: ChatCompletionMessageParam[] = listRecentAgentMessages(db, 50)
+  const history: ResponseInputItem[] = listRecentAgentMessages(db, 50)
     .slice()
     .reverse()
     .map((m) => ({
@@ -126,8 +126,7 @@ export async function runAgent(
     }
   }
 
-  const messages: ChatCompletionMessageParam[] = [
-    { role: "system", content: systemPrompt },
+  const input: ResponseInputItem[] = [
     ...history,
     { role: "user", content: effectiveUserMessage },
   ];
@@ -136,33 +135,38 @@ export async function runAgent(
   const toolMap = new Map(tools.map((t) => [t.name, t]));
   const modelConfig = getVioletModelConfig();
   const pendingCounterpartyRefreshes = new Map<string, string>();
-  const createCompletion =
-    options.createCompletion ??
-    ((request: ChatCompletionCreateParamsNonStreaming) =>
-      getClient().chat.completions.create(request));
+  const createResponse =
+    options.createResponse ??
+    ((request: ResponseCreateParamsNonStreaming) => getClient().responses.create(request));
 
   let finalText = "";
 
   for (let i = 0; i < MAX_TOOL_ITERATIONS; i++) {
-    const completion = await createCompletion({
+    const response = await createResponse({
       model: modelConfig.model,
-      reasoning_effort: modelConfig.reasoning_effort,
-      messages,
+      reasoning: { effort: modelConfig.reasoning_effort },
+      instructions: systemPrompt,
+      input,
       tools: toolDefs,
       parallel_tool_calls: false,
-      max_completion_tokens: MAX_COMPLETION_TOKENS,
+      max_output_tokens: MAX_COMPLETION_TOKENS,
+      store: false,
+      include: ["reasoning.encrypted_content"],
     });
+    const toolCalls = response.output.filter(
+      (item): item is ResponseFunctionToolCall => item.type === "function_call"
+    );
 
-    const message = completion.choices[0].message;
+    input.push(...(response.output as ResponseInputItem[]));
 
-    if (!message.tool_calls || message.tool_calls.length === 0) {
+    if (toolCalls.length === 0) {
       if (pendingCounterpartyRefreshes.size > 0) {
         const refreshed = [...pendingCounterpartyRefreshes.values()].map((counterparty) =>
           getCounterpartyBalance(db, counterparty, { view: "current" })
         );
         pendingCounterpartyRefreshes.clear();
-        messages.push({
-          role: "system",
+        input.push({
+          role: "developer",
           content:
             "POST-WRITE CANONICAL REFRESH: A balance-affecting write occurred in this turn. " +
             "Discard any balance number drafted before this message. Use only these freshly " +
@@ -170,35 +174,27 @@ export async function runAgent(
         });
         continue;
       }
-      finalText = message.content ?? "";
+      finalText = response.output_text ?? "";
       break;
     }
 
-    messages.push({
-      role: "assistant",
-      content: message.content,
-      tool_calls: message.tool_calls,
-    });
-
-    for (const toolCall of message.tool_calls) {
-      if (toolCall.type !== "function") continue;
-
-      const tool = toolMap.get(toolCall.function.name);
+    for (const toolCall of toolCalls) {
+      const tool = toolMap.get(toolCall.name);
       let result: unknown;
 
       if (!tool) {
-        result = { error: `unknown tool: ${toolCall.function.name}` };
+        result = { error: `unknown tool: ${toolCall.name}` };
       } else {
         try {
-          const args = toolCall.function.arguments ? JSON.parse(toolCall.function.arguments) : {};
+          const args = toolCall.arguments ? JSON.parse(toolCall.arguments) : {};
           result = await tool.handler(db, args);
-          if (toolCall.function.name === "get_counterparty_balance") {
+          if (toolCall.name === "get_counterparty_balance") {
             const counterparty =
               typeof args.counterparty === "string" ? args.counterparty.trim() : "";
             if (counterparty) pendingCounterpartyRefreshes.delete(counterparty.toLowerCase());
           }
           const affectedCounterparty = counterpartyAffectedByTool(
-            toolCall.function.name,
+            toolCall.name,
             args,
             result
           );
@@ -213,10 +209,10 @@ export async function runAgent(
         }
       }
 
-      messages.push({
-        role: "tool",
-        tool_call_id: toolCall.id,
-        content: JSON.stringify(result),
+      input.push({
+        type: "function_call_output",
+        call_id: toolCall.call_id,
+        output: JSON.stringify(result),
       });
     }
 

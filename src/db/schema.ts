@@ -88,6 +88,21 @@ export function runMigrations(db: Database.Database): void {
       created_at TEXT DEFAULT (datetime('now'))
     );
 
+    CREATE TABLE IF NOT EXISTS agent_error_logs (
+      error_ref TEXT PRIMARY KEY,
+      occurred_at TEXT NOT NULL,
+      interface TEXT NOT NULL,
+      actor_role TEXT NOT NULL,
+      stage TEXT NOT NULL,
+      error_type TEXT NOT NULL,
+      status_code INTEGER,
+      error_code TEXT,
+      provider_request_id TEXT,
+      safe_message TEXT NOT NULL,
+      model TEXT,
+      reasoning_effort TEXT
+    );
+
     CREATE TABLE IF NOT EXISTS contributor_agent_messages (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       telegram_user_id TEXT NOT NULL,
@@ -348,6 +363,8 @@ export function runMigrations(db: Database.Database): void {
 
     CREATE INDEX IF NOT EXISTS idx_transactions_datetime ON transactions (datetime);
     CREATE INDEX IF NOT EXISTS idx_transactions_source ON transactions (source);
+    CREATE INDEX IF NOT EXISTS idx_agent_error_logs_occurred_at
+      ON agent_error_logs (occurred_at DESC);
     CREATE INDEX IF NOT EXISTS idx_contributor_messages_scope
       ON contributor_agent_messages (telegram_user_id, conversation_id, id DESC);
     CREATE INDEX IF NOT EXISTS idx_telegram_contributors_status

@@ -77,6 +77,11 @@ const { buildSystemPrompt } = require("../src/agent/prompts");
 const { runAgent } = require("../src/agent/runner");
 const { getVioletModelConfig } = require("../src/agent/model-config");
 const {
+  getAgentErrorDiagnostic,
+  recordAgentError,
+  sanitizeAgentErrorMessage,
+} = require("../src/agent/diagnostics");
+const {
   buildContributorSystemPrompt,
   getContributorBalanceView,
   runContributorAgent,
@@ -2928,7 +2933,7 @@ test("Telegram invite claims authorize the immutable sender identity without inv
   const invite = createTelegramContributorInvite(db, {
     contributor_name: "Nishidha",
     created_by: "telegram_owner",
-    now: new Date("2026-08-22T10:00:00.000Z"),
+    now: new Date(),
   });
   assert.equal(parseTelegramContributorClaim(`/join ${invite.claim_token}`), invite.claim_token);
   assert.equal(
@@ -3954,18 +3959,15 @@ test("Violet discards a stale balance drafted after a balance-affecting write", 
   });
 
   const requests = [];
-  const completions = [
+  const responses = [
     {
-      choices: [{
-        message: {
-          role: "assistant",
-          content: null,
-          tool_calls: [{
-            id: "call_record_rapido",
-            type: "function",
-            function: {
-              name: "set_context_fact",
-              arguments: JSON.stringify({
+      output_text: "",
+      output: [{
+        id: "fc_record_rapido",
+        call_id: "call_record_rapido",
+        type: "function_call",
+        name: "set_context_fact",
+        arguments: JSON.stringify({
                 scope_type: "person",
                 scope_id: "Rushil",
                 key: "counterparty_payable_rapido_2026_08_22",
@@ -3978,26 +3980,15 @@ test("Violet discards a stale balance drafted after a balance-affecting write", 
                 source: "telegram_user",
                 confidence: 1,
               }),
-            },
-          }],
-        },
       }],
     },
     {
-      choices: [{
-        message: {
-          role: "assistant",
-          content: "Updated. Net with Rushil: you owe him ₹1,193.",
-        },
-      }],
+      output_text: "Updated. Net with Rushil: you owe him ₹1,193.",
+      output: [],
     },
     {
-      choices: [{
-        message: {
-          role: "assistant",
-          content: "Updated. Net with Rushil: you owe him ₹1,291.",
-        },
-      }],
+      output_text: "Updated. Net with Rushil: you owe him ₹1,291.",
+      output: [],
     },
   ];
 
@@ -4008,9 +3999,9 @@ test("Violet discards a stale balance drafted after a balance-affecting write", 
       interface: "telegram",
     },
     {
-      createCompletion: async (request) => {
+      createResponse: async (request) => {
         requests.push(request);
-        return completions[requests.length - 1];
+        return responses[requests.length - 1];
       },
     }
   );
@@ -4018,11 +4009,14 @@ test("Violet discards a stale balance drafted after a balance-affecting write", 
   assert.equal(result, "Updated. Net with Rushil: you owe him ₹1,291.");
   assert.equal(requests.length, 3);
   assert.equal(requests[0].model, "gpt-5.6-sol");
-  assert.equal(requests[0].reasoning_effort, "high");
+  assert.equal(requests[0].reasoning.effort, "high");
   assert.equal(requests[0].parallel_tool_calls, false);
   assert.equal("temperature" in requests[0], false);
-  const refreshMessage = requests[2].messages.find(
-    (message) => message.role === "system" &&
+  assert.equal("reasoning_effort" in requests[0], false);
+  assert.equal(requests[0].store, false);
+  assert.deepEqual(requests[0].include, ["reasoning.encrypted_content"]);
+  const refreshMessage = requests[2].input.find(
+    (message) => message.role === "developer" &&
       typeof message.content === "string" &&
       message.content.includes("POST-WRITE CANONICAL REFRESH")
   );
@@ -4035,18 +4029,15 @@ test("Violet discards a stale balance drafted after a balance-affecting write", 
 test("contributor Violet refreshes the bilateral tab after recording a purchase", async () => {
   const db = makeDb();
   const requests = [];
-  const completions = [
+  const responses = [
     {
-      choices: [{
-        message: {
-          role: "assistant",
-          content: null,
-          tool_calls: [{
-            id: "call_record_purchase",
-            type: "function",
-            function: {
-              name: "record_purchase_for_aniket",
-              arguments: JSON.stringify({
+      output_text: "",
+      output: [{
+        id: "fc_record_purchase",
+        call_id: "call_record_purchase",
+        type: "function_call",
+        name: "record_purchase_for_aniket",
+        arguments: JSON.stringify({
                 label: "Rapido delivery",
                 occurred_at: "2026-08-22",
                 gross_amount_inr: 98,
@@ -4055,26 +4046,15 @@ test("contributor Violet refreshes the bilateral tab after recording a purchase"
                 treatment: "split",
                 flex_classification: "flex",
               }),
-            },
-          }],
-        },
       }],
     },
     {
-      choices: [{
-        message: {
-          role: "assistant",
-          content: "Recorded, but your tab is settled.",
-        },
-      }],
+      output_text: "Recorded, but your tab is settled.",
+      output: [],
     },
     {
-      choices: [{
-        message: {
-          role: "assistant",
-          content: "Recorded ₹98. Aniket owes you ₹98.",
-        },
-      }],
+      output_text: "Recorded ₹98. Aniket owes you ₹98.",
+      output: [],
     },
   ];
 
@@ -4087,9 +4067,9 @@ test("contributor Violet refreshes the bilateral tab after recording a purchase"
       user_message: "I paid ₹98 for Aniket's Rapido delivery today.",
     },
     {
-      createCompletion: async (request) => {
+      createResponse: async (request) => {
         requests.push(request);
-        return completions[requests.length - 1];
+        return responses[requests.length - 1];
       },
     }
   );
@@ -4098,14 +4078,89 @@ test("contributor Violet refreshes the bilateral tab after recording a purchase"
   assert.equal(result.recorded_purchases.length, 1);
   assert.equal(requests.length, 3);
   assert.equal(requests[0].model, "gpt-5.6-sol");
+  assert.equal(requests[0].reasoning.effort, "high");
   assert.equal(requests[0].parallel_tool_calls, false);
-  const refreshMessage = requests[2].messages.find(
-    (message) => message.role === "system" &&
+  assert.equal("reasoning_effort" in requests[0], false);
+  const refreshMessage = requests[2].input.find(
+    (message) => message.role === "developer" &&
       typeof message.content === "string" &&
       message.content.includes("POST-WRITE CANONICAL REFRESH")
   );
   assert.ok(refreshMessage);
   assert.match(refreshMessage.content, /"amount_inr":98/);
+  db.close();
+});
+
+test("Violet error diagnostics are copyable, retrievable, and sanitized", () => {
+  const db = makeDb();
+  const error = new Error(
+    "Request failed for aniket@example.com with sk-test_12345678901234567890 and Bearer secret-token"
+  );
+  error.status = 400;
+  error.code = "unsupported_parameter";
+  error.request_id = "req_test_123";
+
+  const recorded = recordAgentError(db, {
+    interface: "telegram",
+    actor_role: "owner",
+    stage: "owner_agent",
+    error,
+    now: new Date("2026-08-24T16:15:00.000Z"),
+  });
+  assert.match(recorded.error_ref, /^VLT-20260824-[A-Z0-9]{6}$/);
+  const diagnostic = getAgentErrorDiagnostic(db, recorded.error_ref.toLowerCase());
+  assert.equal(diagnostic.status_code, 400);
+  assert.equal(diagnostic.error_code, "unsupported_parameter");
+  assert.equal(diagnostic.provider_request_id, "req_test_123");
+  assert.equal(diagnostic.model, "gpt-5.6-sol");
+  assert.equal(diagnostic.reasoning_effort, "high");
+  assert.doesNotMatch(diagnostic.safe_message, /aniket@example\.com|sk-test|secret-token/);
+  assert.match(diagnostic.safe_message, /\[redacted-email\]/);
+  assert.match(diagnostic.safe_message, /\[redacted-api-key\]/);
+  assert.match(diagnostic.safe_message, /Bearer \[redacted\]/);
+  assert.equal(sanitizeAgentErrorMessage({ message: "not trusted" }), "[object Object]");
+  db.close();
+});
+
+test("Telegram agent failures return a VLT reference that the MCP diagnostic tool can read", async () => {
+  const db = makeDb();
+  const replies = [];
+  await handleTelegramUpdate(
+    db,
+    {
+      update_id: 999,
+      message: {
+        message_id: 88,
+        chat: { id: -100123456, type: "supergroup" },
+        message_thread_id: 77,
+        from: { id: 111, first_name: "Aniket" },
+        text: "What are all my spends today?",
+      },
+    },
+    {
+      runOwnerAgent: async () => {
+        const error = new Error("Upstream reasoning/tool compatibility failure");
+        error.status = 400;
+        throw error;
+      },
+      sendToIncomingChat: async (_chatId, text) => {
+        replies.push(text);
+        return 1;
+      },
+      sendTyping: async () => {},
+    }
+  );
+
+  assert.equal(replies.length, 1);
+  const errorRef = replies[0].match(/VLT-[0-9]{8}-[A-Z0-9]{6}/)?.[0];
+  assert.ok(errorRef);
+  assert.match(replies[0], /Send me this ID and I can inspect it/);
+  const diagnosticTool = buildMcpToolSpecs().find((spec) => spec.name === "get_agent_error");
+  assert.ok(diagnosticTool);
+  const lookup = diagnosticTool.run(db, { error_ref: errorRef });
+  assert.equal(lookup.found, true);
+  assert.equal(lookup.diagnostic.stage, "owner_agent");
+  assert.equal(lookup.diagnostic.status_code, 400);
   db.close();
 });
 
