@@ -81,6 +81,25 @@ VIOLET_REASONING_EFFORT=high
 5. Reply to the Telegram alert with a correction/context and verify the clean
    entry is superseded rather than duplicated.
 
+### IDFC savings-account SMS ingestion
+
+Set `SMS_INGEST_TOKEN` to a new strong random value in Railway. The iPhone
+Shortcut sends matching transaction messages to `POST /webhook/idfc-sms` with
+that value in the `x-plutus-sms-token` header. `/health` then reports the
+sanitized SMS queue status and the retry worker runs every five minutes.
+
+Create two Message automations on the iPhone. One matches the exact phrase
+`debited by Rs.` and the other matches `is credited with INR`. Each automation
+sends only the matched message text and the current date to the webhook. Do not
+use a sender-only rule: IDFC's sender prefixes rotate and the credit sender also
+carries statements, standing-instruction notices, and security messages.
+
+The service independently accepts only the observed full debit/credit formats.
+Anything else—including OTP, PIN, CVV, standing-instruction and statement
+messages—is rejected before raw financial storage. Rejections retain only a
+one-way message hash and a copyable `SMS-...` diagnostic reference. Accepted
+SMS and future Gmail evidence deduplicate into one transaction.
+
 ### Telegram owner and contributor access
 
 Violet authorizes people by Telegram's immutable numeric user ID, not by name,

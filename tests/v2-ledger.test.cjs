@@ -110,6 +110,18 @@ const {
   listTelegramContributors,
   revokeTelegramContributor,
 } = require("../src/telegram/access");
+const {
+  hashSmsMessage,
+  parseIdfcTransactionSms,
+} = require("../src/sms/idfc");
+const {
+  acceptIdfcSms,
+  completeSmsIngestion,
+  getSmsIngestionError,
+  getSmsIngestionStatus,
+  isValidSmsIngestToken,
+  processPendingSmsIngestions,
+} = require("../src/sms/ingestion");
 
 process.env.TELEGRAM_CHAT_ID ||= "-100123456";
 process.env.TELEGRAM_THREAD_ID ||= "77";
@@ -794,6 +806,180 @@ test("IDFC UPI parser preserves incoming-credit direction, sender, and exact tim
   assert.equal(parsed.amount, 800);
   assert.equal(parsed.merchant_raw, "Nishidha");
   assert.equal(parsed.datetime, "2026-07-15T07:35:00.000Z");
+});
+
+test("IDFC SMS parser accepts only the observed debit and credit transaction formats", () => {
+  const debitMessage =
+    "Your A/c XX3029 debited by Rs. 1,291.00 on 24/08/26; RUSHIL RAJ credited. RRN 612774969279. Available balance Rs. 2,13,645.36. Team IDFC FIRST Bank";
+  const debit = parseIdfcTransactionSms(debitMessage, "2026-08-24T06:42:00.000Z");
+  assert.ok(debit);
+  assert.equal(debit.kind, "debit");
+  assert.equal(debit.parsed.amount, 1291);
+  assert.equal(debit.parsed.merchant_raw, "RUSHIL RAJ");
+  assert.equal(debit.parsed.datetime, "2026-08-24T06:42:00.000Z");
+  assert.equal(debit.parsed.card_last4, "3029");
+  assert.equal(debit.parsed.notes, "upi_ref:612774969279");
+
+  const creditMessage =
+    "Your A/C XXXXX773029 is credited with INR 890.00 on 21/08/26 15:34. Your new balance is INR 2,10,137.36. Team IDFC FIRST Bank";
+  const credit = parseIdfcTransactionSms(creditMessage, "2026-08-21T10:05:00.000Z");
+  assert.ok(credit);
+  assert.equal(credit.kind, "credit");
+  assert.equal(credit.parsed.amount, 890);
+  assert.equal(credit.parsed.direction, "credit");
+  assert.equal(credit.parsed.datetime, "2026-08-21T10:04:00.000Z");
+  assert.equal(credit.parsed.merchant_raw, "Incoming IDFC credit");
+
+  assert.equal(
+    parseIdfcTransactionSms(
+      "Your account OTP is 123456. Do not share it with anyone.",
+      "2026-08-24T06:42:00.000Z"
+    ),
+    null
+  );
+  assert.equal(
+    parseIdfcTransactionSms(
+      "INR 499.00 for NETFLIX will be deducted from IDFC FIRST Bank Credit Card XX6198 on 26/08/2026 basis standing instruction (SI).",
+      "2026-08-24T06:42:00.000Z"
+    ),
+    null
+  );
+  assert.equal(
+    parseIdfcTransactionSms(
+      "You have successfully set the UPI PIN with the UPI app.",
+      "2026-08-24T06:42:00.000Z"
+    ),
+    null
+  );
+});
+
+test("IDFC SMS ingestion is authenticated, idempotent, and preserves accepted evidence", () => {
+  const previousToken = process.env.SMS_INGEST_TOKEN;
+  process.env.SMS_INGEST_TOKEN = "test-sms-secret";
+  const db = makeDb();
+  try {
+    assert.equal(isValidSmsIngestToken("test-sms-secret"), true);
+    assert.equal(isValidSmsIngestToken("wrong-secret"), false);
+
+    const input = {
+      message:
+        "Your A/c XX3029 debited by Rs. 78.00 on 22/08/26; JEROME AGNELO credited. RRN 312982719666. Available balance Rs. 2,08,963.36. Team IDFC FIRST Bank",
+      received_at: "2026-08-22T06:33:12.000Z",
+      device_label: "Aniket iPhone",
+      shortcut_version: "1",
+    };
+    const accepted = acceptIdfcSms(db, input);
+    assert.equal(accepted.status, "accepted");
+    assert.equal(accepted.should_process, true);
+
+    const duplicate = acceptIdfcSms(db, input);
+    assert.equal(duplicate.status, "duplicate");
+    assert.equal(duplicate.event_id, accepted.event_id);
+    assert.equal(duplicate.raw_transaction_id, accepted.raw_transaction_id);
+    assert.equal(db.prepare("SELECT COUNT(*) AS count FROM raw_transactions").get().count, 1);
+    assert.equal(db.prepare("SELECT COUNT(*) AS count FROM sms_ingestion_events").get().count, 1);
+
+    const evidence = db.prepare("SELECT * FROM transaction_evidence").get();
+    assert.equal(evidence.channel, "sms");
+    assert.equal(evidence.bank_reference, "312982719666");
+    assert.match(evidence.raw_payload, /JEROME AGNELO/);
+  } finally {
+    db.close();
+    if (previousToken === undefined) delete process.env.SMS_INGEST_TOKEN;
+    else process.env.SMS_INGEST_TOKEN = previousToken;
+  }
+});
+
+test("the same IDFC UPI alert from SMS and Gmail remains one transaction", async () => {
+  const db = makeDb();
+  const sms = acceptIdfcSms(db, {
+    message:
+      "Your A/c XX3029 debited by Rs. 78.00 on 22/08/26; JEROME AGNELO credited. RRN 312982719666. Available balance Rs. 2,08,963.36. Team IDFC FIRST Bank",
+    received_at: "2026-08-22T06:33:00.000Z",
+  });
+  assert.equal(sms.status, "accepted");
+
+  const gmailBody =
+    "INR 78.00 debited from your IDFC FIRST Bank Account ending 3029 via UPI on 22-AUG-2026 at 12:03 PM. UPI Ref: 312982719666. VPA: jerome@upi";
+  const outcome = await processMessage(
+    db,
+    {
+      id: "gmail-idfc-upi-312982719666",
+      internalDate: String(new Date("2026-08-22T06:33:30.000Z").getTime()),
+      snippet: gmailBody,
+      payload: {
+        headers: [
+          { name: "From", value: "noreply@idfcfirstbank.com" },
+          { name: "Subject", value: "UPI Transaction Alert" },
+        ],
+        mimeType: "text/plain",
+        body: { data: Buffer.from(gmailBody).toString("base64url") },
+      },
+    },
+    { enrich: async () => {}, sendTelegram: async () => 1234 }
+  );
+  assert.equal(outcome, "duplicate");
+  assert.equal(db.prepare("SELECT COUNT(*) AS count FROM raw_transactions").get().count, 1);
+  assert.deepEqual(
+    db
+      .prepare("SELECT channel FROM transaction_evidence ORDER BY channel")
+      .all()
+      .map((row) => row.channel),
+    ["gmail", "sms"]
+  );
+  db.close();
+});
+
+test("rejected SMS payloads retain only a safe diagnostic and message hash", () => {
+  const db = makeDb();
+  const secretMessage = "Your IDFC OTP is 739201. Do not share this OTP or your UPI PIN.";
+  const result = acceptIdfcSms(db, {
+    message: secretMessage,
+    received_at: "2026-08-24T06:42:00.000Z",
+    device_label: "Aniket iPhone",
+  });
+  assert.equal(result.status, "rejected");
+  assert.match(result.error_ref, /^SMS-\d{8}-[A-Z0-9]{6}$/);
+  assert.equal(db.prepare("SELECT COUNT(*) AS count FROM raw_transactions").get().count, 0);
+  assert.equal(db.prepare("SELECT COUNT(*) AS count FROM transaction_evidence").get().count, 0);
+
+  const storedEvent = db.prepare("SELECT * FROM sms_ingestion_events").get();
+  assert.equal(storedEvent.message_hash, hashSmsMessage(secretMessage));
+  assert.equal(JSON.stringify(storedEvent).includes("739201"), false);
+  assert.equal(JSON.stringify(storedEvent).includes("UPI PIN"), false);
+  const diagnostic = getSmsIngestionError(db, result.error_ref);
+  assert.equal(diagnostic.error_ref, result.error_ref);
+  assert.equal("message" in diagnostic, false);
+  db.close();
+});
+
+test("accepted debit SMS reaches Violet and clears the retry queue", async () => {
+  const db = makeDb();
+  const result = acceptIdfcSms(db, {
+    message:
+      "Your A/c XX3029 debited by Rs. 222.00 on 22/08/26; MANJUNATH A P credited. RRN 312991572391. Available balance Rs. 2,07,791.36. Team IDFC FIRST Bank",
+    received_at: "2026-08-22T07:12:00.000Z",
+  });
+  assert.equal(result.status, "accepted");
+
+  const messages = [];
+  await completeSmsIngestion(db, result.event_id, {
+    enrich: async () => {},
+    sendTelegram: async (text) => {
+      messages.push(text);
+      return 90210;
+    },
+  });
+  assert.equal(messages.length, 1);
+  assert.match(messages[0], /UPI Transfer · IDFC/);
+  assert.match(messages[0], /₹222/);
+  assert.equal(getMessageIdForTransaction(db, result.raw_transaction_id), 90210);
+  assert.equal(getSmsIngestionStatus(db).pending_count, 0);
+  assert.equal(
+    db.prepare("SELECT status FROM sms_ingestion_events WHERE id = ?").get(result.event_id).status,
+    "processed"
+  );
+  db.close();
 });
 
 test("live debit alerts enter receipt enrichment without delaying credits or reversals", () => {
@@ -3869,6 +4055,8 @@ test("production MCP surface exposes v2 finance tools and no legacy envelope mut
   assert.equal(names.includes("list_flex_recovery_reserves"), true);
   assert.equal(names.includes("cancel_flex_recovery_reserve"), true);
   assert.equal(names.includes("search_transaction_emails"), true);
+  assert.equal(names.includes("get_sms_ingestion_status"), true);
+  assert.equal(names.includes("get_sms_ingestion_error"), true);
   assert.equal(names.includes("post_agent_message"), true);
   assert.equal(names.includes("get_envelope"), false);
   assert.equal(names.includes("recalculate_envelope"), false);
@@ -3877,6 +4065,48 @@ test("production MCP surface exposes v2 finance tools and no legacy envelope mut
 
 test("health metadata reads the deployed package version", () => {
   assert.equal(PACKAGE_VERSION, require("../package.json").version);
+});
+
+test("IDFC SMS webhook rejects unauthenticated and non-transaction messages", async () => {
+  const previousToken = process.env.SMS_INGEST_TOKEN;
+  process.env.SMS_INGEST_TOKEN = "test-sms-secret";
+  const db = makeDb();
+  const app = require("fastify")();
+  registerRoutes(app, db);
+  try {
+    const unauthorized = await app.inject({
+      method: "POST",
+      url: "/webhook/idfc-sms",
+      payload: {
+        message: "Your account OTP is 739201.",
+        received_at: "2026-08-24T06:42:00.000Z",
+      },
+    });
+    assert.equal(unauthorized.statusCode, 401);
+    assert.deepEqual(unauthorized.json(), { error: "Unauthorized" });
+
+    const rejected = await app.inject({
+      method: "POST",
+      url: "/webhook/idfc-sms",
+      headers: { "x-plutus-sms-token": "test-sms-secret" },
+      payload: {
+        message: "Your account OTP is 739201.",
+        received_at: "2026-08-24T06:42:00.000Z",
+      },
+    });
+    assert.equal(rejected.statusCode, 422);
+    assert.equal(rejected.json().status, "rejected");
+    assert.match(rejected.json().error_ref, /^SMS-\d{8}-[A-Z0-9]{6}$/);
+
+    const health = await app.inject({ method: "GET", url: "/health" });
+    assert.equal(health.statusCode, 200);
+    assert.equal(health.json().sms_ingestion.configured, true);
+  } finally {
+    await app.close();
+    db.close();
+    if (previousToken === undefined) delete process.env.SMS_INGEST_TOKEN;
+    else process.env.SMS_INGEST_TOKEN = previousToken;
+  }
 });
 
 test("health reports the next enabled cron and per-scheduler timing", async () => {

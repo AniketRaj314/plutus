@@ -33,12 +33,21 @@ import { getRemainingWeeksInMonth, parseIstDateOnly, getBillingWindow } from "..
 import { getSchedulerHealth } from "../scheduler/status";
 import { describeGmailDiagnosticError, searchTransactionEmails } from "../gmail/diagnostics";
 import { countActiveTelegramContributors } from "../telegram/access";
+import {
+  acceptIdfcSms,
+  completeSmsIngestion,
+  getSmsIngestionError,
+  getSmsIngestionStatus,
+  isValidSmsIngestToken,
+} from "../sms/ingestion";
 
 const VALID_SOURCES = ["idfc_cc", "icici_cc", "bobcard", "amex", "idfc_upi"];
 const MAX_TRANSACTIONS_LIMIT = 100;
 const AGENT_TIMEOUT_MS = 120_000;
 const AGENT_RATE_LIMIT_MAX = 10;
 const AGENT_RATE_LIMIT_WINDOW_MS = 60_000;
+const SMS_RATE_LIMIT_MAX = 30;
+const SMS_RATE_LIMIT_WINDOW_MS = 60_000;
 export const PACKAGE_VERSION = (require("../../package.json") as { version?: string }).version ?? "unknown";
 
 // -- webhook + health (unchanged, no auth) --
@@ -65,6 +74,57 @@ export function registerRoutes(app: FastifyInstance, db: Database.Database): voi
     });
   });
 
+  app.post(
+    "/webhook/idfc-sms",
+    { preHandler: smsRateLimit },
+    async (request, reply) => {
+      if (!process.env.SMS_INGEST_TOKEN) {
+        return reply.status(503).send({ error: "SMS ingestion is not configured" });
+      }
+      const tokenHeader = request.headers["x-plutus-sms-token"];
+      const token = Array.isArray(tokenHeader) ? tokenHeader[0] : tokenHeader;
+      if (!isValidSmsIngestToken(token)) {
+        console.warn(`[sms] rejected unauthorized ingestion request from ${request.ip}`);
+        return reply.status(401).send({ error: "Unauthorized" });
+      }
+
+      const body = request.body as
+        | {
+            message?: unknown;
+            received_at?: unknown;
+            device_label?: unknown;
+            shortcut_version?: unknown;
+          }
+        | undefined;
+      if (typeof body?.message !== "string" || typeof body.received_at !== "string") {
+        return reply.status(400).send({ error: "message and received_at are required strings" });
+      }
+      const result = acceptIdfcSms(db, {
+        message: body.message,
+        received_at: body.received_at,
+        device_label: typeof body.device_label === "string" ? body.device_label : undefined,
+        shortcut_version:
+          typeof body.shortcut_version === "string" ? body.shortcut_version : undefined,
+      });
+      if (result.status === "rejected") {
+        return reply.status(422).send(result);
+      }
+      if (result.should_process) {
+        void completeSmsIngestion(db, result.event_id).catch((error) => {
+          console.error(
+            `[sms] background processing failed for event ${result.event_id}: ` +
+              sanitizeAgentErrorMessage(error)
+          );
+        });
+      }
+      return reply.status(result.status === "duplicate" ? 200 : 202).send({
+        status: result.status,
+        event_id: result.event_id,
+        raw_transaction_id: result.raw_transaction_id,
+      });
+    }
+  );
+
   app.get("/health", async (_request, reply) => {
     try {
       db.prepare("SELECT 1").get();
@@ -80,9 +140,11 @@ export function registerRoutes(app: FastifyInstance, db: Database.Database): voi
       .filter((scheduler) => scheduler.enabled && scheduler.last_outcome === "error")
       .map((scheduler) => scheduler.name);
     const telegramAccess = getTelegramAccessStatus();
+    const smsIngestion = getSmsIngestionStatus(db);
     const degradedComponents = [
       ...failedSchedulers,
       ...(telegramAccess.valid ? [] : ["telegram_access_control"]),
+      ...(smsIngestion.failed_count > 0 ? ["sms_ingestion_failed_events"] : []),
     ];
     const status = degradedComponents.length > 0 ? "degraded" : "ok";
     if (status === "degraded") reply.status(503);
@@ -103,6 +165,7 @@ export function registerRoutes(app: FastifyInstance, db: Database.Database): voi
         ...telegramAccess,
         active_contributor_count: countActiveTelegramContributors(db),
       },
+      sms_ingestion: smsIngestion,
       ...schedulerHealth,
     };
   });
@@ -543,6 +606,42 @@ export function buildMcpToolSpecs(): McpToolSpec[] {
   });
 
   specs.push({
+    name: "get_sms_ingestion_status",
+    description:
+      "Get sanitized IDFC SMS ingestion health and queue counts. Never returns SMS bodies, account details, tokens, or counterparties.",
+    inputSchema: {
+      type: "object",
+      properties: {},
+      additionalProperties: false,
+    },
+    run: (db) => getSmsIngestionStatus(db),
+  });
+
+  specs.push({
+    name: "get_sms_ingestion_error",
+    description:
+      "Look up one sanitized IDFC SMS ingestion diagnostic by its copyable SMS error ID. Never returns the original SMS body or authentication data.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        error_ref: {
+          type: "string",
+          pattern: "^SMS-[0-9]{8}-[A-Z0-9]{6}$",
+        },
+      },
+      required: ["error_ref"],
+      additionalProperties: false,
+    },
+    run: (db, args) => {
+      const errorRef = typeof args.error_ref === "string" ? args.error_ref : "";
+      const diagnostic = getSmsIngestionError(db, errorRef);
+      return diagnostic
+        ? { found: true, diagnostic }
+        : { found: false, error_ref: errorRef.trim().toUpperCase() };
+    },
+  });
+
+  specs.push({
     name: "get_agent_error",
     description:
       "Look up one sanitized Violet failure diagnostic by the copyable VLT error ID shown to the user. Never returns prompts, financial data, credentials, headers, or stack traces.",
@@ -651,6 +750,7 @@ function getWeekStartFallback(): Date {
 }
 
 const rateLimitMap = new Map<string, number[]>();
+const smsRateLimitMap = new Map<string, number[]>();
 
 async function agentRateLimit(request: FastifyRequest, reply: FastifyReply): Promise<FastifyReply | undefined> {
   const ip = request.ip;
@@ -664,5 +764,20 @@ async function agentRateLimit(request: FastifyRequest, reply: FastifyReply): Pro
 
   timestamps.push(now);
   rateLimitMap.set(ip, timestamps);
+  return undefined;
+}
+
+async function smsRateLimit(request: FastifyRequest, reply: FastifyReply): Promise<FastifyReply | undefined> {
+  const ip = request.ip;
+  const now = Date.now();
+  const timestamps = (smsRateLimitMap.get(ip) ?? []).filter(
+    (timestamp) => now - timestamp < SMS_RATE_LIMIT_WINDOW_MS
+  );
+  if (timestamps.length >= SMS_RATE_LIMIT_MAX) {
+    smsRateLimitMap.set(ip, timestamps);
+    return sendError(reply, 429, "Too many requests");
+  }
+  timestamps.push(now);
+  smsRateLimitMap.set(ip, timestamps);
   return undefined;
 }

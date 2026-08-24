@@ -7,6 +7,7 @@ import { registerRoutes, registerApiRoutes } from "./api/routes";
 import { startCorrelator } from "./enrichment/correlator";
 import { startInferenceCron } from "./agent/inference";
 import { registerFrontendRoutes } from "./frontend";
+import { startSmsIngestionRetry } from "./sms/ingestion";
 
 async function main() {
   console.log("Plutus starting...");
@@ -21,6 +22,7 @@ async function main() {
 
   startCorrelator(db);
   startInferenceCron(db);
+  startSmsIngestionRetry(db);
 
   const app = Fastify();
   registerFrontendRoutes(app);
