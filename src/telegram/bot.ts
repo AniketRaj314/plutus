@@ -12,11 +12,27 @@ import {
   getActiveTelegramContributor,
 } from "./access";
 import { agentErrorLogLine, recordAgentError } from "../agent/diagnostics";
+import { renderTelegramChunks, telegramHtmlToPlainText } from "./render";
 
 const MESSAGE_MAP_KEY = "telegram_message_map";
 const PENDING_REBALANCE_KEY = "pending_rebalance_message";
 
 let botInstance: TelegramBot | null = null;
+
+export function isTelegramFormattingError(error: unknown): boolean {
+  if (!error || typeof error !== "object") return false;
+  const candidate = error as {
+    message?: string;
+    response?: { statusCode?: number; body?: { description?: string } };
+  };
+  const message = [candidate.message, candidate.response?.body?.description]
+    .filter(Boolean)
+    .join(" ");
+  return (
+    candidate.response?.statusCode === 400 &&
+    /(?:can(?:not|'t) parse entities|unsupported start tag|can't find end tag)/i.test(message)
+  );
+}
 
 function getBot(): TelegramBot {
   if (!botInstance) {
@@ -75,11 +91,34 @@ export async function sendMessageToChat(
   text: string,
   options: { thread_id?: number; reply_to_message_id?: number } = {}
 ): Promise<number> {
-  const message = await getBot().sendMessage(chatId, text, {
-    message_thread_id: options.thread_id,
-    reply_to_message_id: options.reply_to_message_id,
-  });
-  return message.message_id;
+  const bot = getBot();
+  const chunks = renderTelegramChunks(text);
+  let firstMessageId: number | null = null;
+
+  for (const [index, chunk] of chunks.entries()) {
+    const sendOptions = {
+      message_thread_id: options.thread_id,
+      reply_to_message_id: index === 0 ? options.reply_to_message_id : undefined,
+    };
+    try {
+      const message = await bot.sendMessage(chatId, chunk, {
+        ...sendOptions,
+        parse_mode: "HTML",
+      });
+      firstMessageId ??= message.message_id;
+    } catch (err) {
+      if (!isTelegramFormattingError(err)) throw err;
+      console.warn(
+        "[telegram] HTML formatting rejected; retrying as plain text:",
+        err instanceof Error ? err.message : err
+      );
+      const message = await bot.sendMessage(chatId, telegramHtmlToPlainText(chunk), sendOptions);
+      firstMessageId ??= message.message_id;
+    }
+  }
+
+  if (firstMessageId === null) throw new Error("Telegram message was empty");
+  return firstMessageId;
 }
 
 export async function sendTypingAction(): Promise<void> {
@@ -101,11 +140,25 @@ export async function editMessage(messageId: number, newText: string): Promise<v
   try {
     const bot = getBot();
     const chatId = getChatId();
+    const [rendered] = renderTelegramChunks(newText);
 
-    await bot.editMessageText(newText, {
-      chat_id: chatId,
-      message_id: messageId,
-    });
+    try {
+      await bot.editMessageText(rendered, {
+        chat_id: chatId,
+        message_id: messageId,
+        parse_mode: "HTML",
+      });
+    } catch (err) {
+      if (!isTelegramFormattingError(err)) throw err;
+      console.warn(
+        "[telegram] HTML formatting rejected for edit; retrying as plain text:",
+        err instanceof Error ? err.message : err
+      );
+      await bot.editMessageText(telegramHtmlToPlainText(rendered), {
+        chat_id: chatId,
+        message_id: messageId,
+      });
+    }
   } catch (err) {
     // Telegram rejects edits on messages older than 48h, and the original
     // message may have been deleted by the user — neither should crash the caller.

@@ -83,6 +83,8 @@ export function buildContributorSystemPrompt(identity: ContributorIdentity): str
 CURRENT TIME: ${currentIst()} IST
 
 YOUR ONLY JOBS:
+- Never use an em dash (—). Use a comma, colon, parentheses, or a regular hyphen instead.
+- Write simple Markdown-style text, never raw HTML. Use **bold**, short lists, and compact Markdown tables only when they make the answer easier to scan.
 - Help ${identity.name} record a purchase or payment they personally made on Aniket's behalf.
 - Help ${identity.name} review only the two-way tab between ${identity.name} and Aniket: what they covered for each other, direct transfers between them, and their net balance.
 - You have no access to Aniket's financial history, transactions, balances, cards, income, budgets, reimbursements, or other people's activity.
