@@ -4547,6 +4547,8 @@ test("Violet is required to query raw storage for recent transaction questions",
   assert.match(prompt, /cashflow_impact=0/);
   assert.match(prompt, /independent opposite-side event/);
   assert.match(prompt, /Never blame the user's phrasing/);
+  assert.match(prompt, /Never use an em dash/);
+  assert.match(prompt, /compact Markdown table/);
   assert.doesNotMatch(prompt, /slightly witty/);
   db.close();
 });
