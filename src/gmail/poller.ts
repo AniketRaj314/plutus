@@ -538,27 +538,6 @@ export async function finalizeTransaction(
 ): Promise<void> {
   const sendTelegram = options.sendTelegram ?? sendMessage;
 
-  if (
-    transaction.source === "idfc_upi" &&
-    transaction.direction !== "credit" &&
-    transaction.correlation_status === "pending"
-  ) {
-    // Envelope apply and final formatting are deferred to the correlation
-    // engine (src/enrichment/correlator.ts) — it edits this same message
-    // in-place once a matching merchant receipt is found or the 30-minute
-    // window expires.
-    const pendingText = formatV2Transaction(transaction, { status: "correlating" });
-    try {
-      const messageId = await sendTelegram(pendingText);
-      recordTransactionMessage(db, messageId, transaction.id);
-      console.log(`[telegram] sent pending UPI message ${messageId} for transaction ${transaction.id}`);
-    } catch (err) {
-      console.error(`[telegram] failed to send pending UPI message for transaction ${transaction.id}:`, err);
-      throw err;
-    }
-    return;
-  }
-
   let inference: InferenceOutcome = {
     status: "failed",
     raw_transaction_id: transaction.id,
@@ -570,6 +549,10 @@ export async function finalizeTransaction(
       minConfidence: options.minConfidence,
     });
   }
+
+  // Receipt correlation is enrichment, not a gate for financial interpretation.
+  // A later receipt match can revise merchant/category details and edit this same
+  // Telegram message without delaying an otherwise clear transaction now.
 
   const spendMonth = inference.entry ? getSpendMonthForEntry(inference.entry) : null;
   const summary = spendMonth ? aggregateSpendMonth(db, { spend_month: spendMonth }) : undefined;

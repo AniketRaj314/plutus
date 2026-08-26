@@ -953,32 +953,78 @@ test("rejected SMS payloads retain only a safe diagnostic and message hash", () 
   db.close();
 });
 
-test("accepted debit SMS reaches Violet and clears the retry queue", async () => {
+test("accepted debit SMS is inferred immediately while receipt enrichment stays pending", async () => {
   const db = makeDb();
   const result = acceptIdfcSms(db, {
     message:
-      "Your A/c XX3029 debited by Rs. 222.00 on 22/08/26; MANJUNATH A P credited. RRN 312991572391. Available balance Rs. 2,07,791.36. Team IDFC FIRST Bank",
-    received_at: "2026-08-22T07:12:00.000Z",
+      "Your A/c XX3029 debited by Rs. 297.30 on 26/08/26; APOLLO PHARMACY credited. RRN 313270117513. Available balance Rs. 2,12,329.06. Team IDFC FIRST Bank",
+    received_at: "2026-08-26T07:03:02.000Z",
   });
   assert.equal(result.status, "accepted");
 
   const messages = [];
   await completeSmsIngestion(db, result.event_id, {
     enrich: async () => {},
+    inferenceGenerator: async () =>
+      inferenceProposal({
+        merchant_clean: "Apollo Pharmacy",
+        category: "Health",
+        gross_amount_inr: 297.3,
+        personal_impact: 297.3,
+        cashflow_impact: 297.3,
+        flex_classification: "flex",
+        flex_reason: "Ordinary personal pharmacy purchase.",
+      }),
     sendTelegram: async (text) => {
       messages.push(text);
       return 90210;
     },
   });
   assert.equal(messages.length, 1);
-  assert.match(messages[0], /UPI Transfer · IDFC/);
-  assert.match(messages[0], /₹222/);
+  assert.match(messages[0], /Apollo Pharmacy/i);
+  assert.match(messages[0], /normal · Personal ₹297/);
+  assert.doesNotMatch(messages[0], /Matching receipt|interpretation is pending/);
   assert.equal(getMessageIdForTransaction(db, result.raw_transaction_id), 90210);
+  assert.equal(getTransaction(db, result.raw_transaction_id).correlation_status, "pending");
+  const entry = listEnvelopeEntries(db, { raw_transaction_id: result.raw_transaction_id })[0];
+  assert.equal(entry.merchant_clean, "Apollo Pharmacy");
+  assert.equal(entry.personal_impact, 297.3);
   assert.equal(getSmsIngestionStatus(db).pending_count, 0);
   assert.equal(
     db.prepare("SELECT status FROM sms_ingestion_events WHERE id = ?").get(result.event_id).status,
     "processed"
   );
+  db.close();
+});
+
+test("automatic inference queue does not wait for receipt correlation", async () => {
+  const db = makeDb();
+  const transaction = insertTestTransaction(db, {
+    source: "idfc_upi",
+    amount: 297.3,
+    merchant_raw: "APOLLO PHARMACY",
+    datetime: "2026-08-26T07:03:02.000Z",
+    currency: "INR",
+    raw_email_id: "sms:idfc:rrn:313270117513",
+    correlation_status: "pending",
+  });
+
+  const outcomes = await processInferenceQueue(db, {
+    generate: async () =>
+      inferenceProposal({
+        merchant_clean: "Apollo Pharmacy",
+        category: "Health",
+        gross_amount_inr: 297.3,
+        personal_impact: 297.3,
+        cashflow_impact: 297.3,
+      }),
+  });
+
+  assert.equal(outcomes.length, 1);
+  assert.equal(outcomes[0].status, "interpreted");
+  assert.equal(outcomes[0].raw_transaction_id, transaction.id);
+  assert.equal(getTransaction(db, transaction.id).correlation_status, "pending");
+  assert.equal(listEnvelopeEntries(db, { raw_transaction_id: transaction.id }).length, 1);
   db.close();
 });
 
