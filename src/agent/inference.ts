@@ -604,8 +604,6 @@ export async function processInferenceQueue(
       if (outcomes.length >= requestedLimit) break;
       const state = getStoredInferenceState(db, raw.id);
       if (state?.status === "needs_context" || (state?.status === "failed" && state.attempts >= 3)) continue;
-      const legacy = getTransaction(db, raw.id);
-      if (legacy?.correlation_status === "pending") continue;
       outcomes.push(
         await inferRawTransaction(db, raw.id, {
           generate: options.generate,
