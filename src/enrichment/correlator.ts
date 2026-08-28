@@ -81,6 +81,8 @@ export interface CorrelationOptions {
   force?: boolean;
 }
 
+type ReceiptPaymentRail = "card" | "upi";
+
 let client: OpenAI | null = null;
 
 function getClient(): OpenAI {
@@ -169,13 +171,32 @@ export async function attemptCorrelation(
   const result = await (options.generate ?? runCorrelationCheck)(transaction, candidates);
   if (!result) return false;
 
-  if (!isSafeReceiptMatch(transaction, candidates, result)) {
-    recordCandidateAttempt(db, transaction.id, candidates, result);
+  const matchedCandidate = candidates.find((candidate) => candidate.id === result.matched_email_id);
+  const competingTransaction = matchedCandidate
+    ? findDominantCompetingTransaction(db, transaction, matchedCandidate, result)
+    : null;
+  const receiptRail = matchedCandidate ? inferReceiptPaymentRail(matchedCandidate) : null;
+  const railMismatch =
+    receiptRail !== null &&
+    !isTransactionCompatibleWithRail(transaction, receiptRail) &&
+    result.amount_gap_kind !== "split_payment";
+
+  if (!isSafeReceiptMatch(transaction, candidates, result) || competingTransaction || railMismatch) {
+    const rejectionReason = competingTransaction
+      ? `A nearby ${competingTransaction.source ?? "unknown-source"} transaction ` +
+        `${competingTransaction.id} is an exact amount/vendor/payment-rail match for this receipt.`
+      : railMismatch
+      ? `The receipt explicitly uses ${receiptRail}, which conflicts with transaction source ${transaction.source}.`
+      : result.reasoning;
+    recordCandidateAttempt(db, transaction.id, candidates, {
+      ...result,
+      matched: false,
+      reasoning: rejectionReason,
+    });
     console.log(`[correlator] no safe receipt match yet for transaction ${transaction.id}`);
     return false;
   }
 
-  const matchedCandidate = candidates.find((candidate) => candidate.id === result.matched_email_id);
   if (!matchedCandidate) return false;
 
   const evidence = {
@@ -438,6 +459,14 @@ in time with no plausible competing receipt, even when a modest amount gap has a
 explanation. Use 0.85-0.94 when the match is strong but has meaningful unresolved ambiguity, and return
 matched=false below 0.85.
 
+receipt_total means the final amount charged to the identified payment rail when the email shows it.
+For example, "Paid via Credit/Debit card ₹427" means receipt_total=427 even if the pre-discount item
+total is higher. A discount already included above that final paid line cannot explain a difference
+between ₹427 and the bank debit. Only use a pre-credit order total when the email does not expose the
+actual tendered amount, and explain the missing coupon, wallet credit, loyalty credit, or split tender.
+Never award a strong merchant match merely because a receipt is the only candidate: a named UPI
+counterparty and an unrelated branded receipt are a merchant mismatch.
+
 Return ONLY valid JSON:
 {
   "matched": boolean,
@@ -653,6 +682,130 @@ export function isSafeReceiptMatch(
     scores.uniqueness >= 0.8 &&
     directionallyValidGap &&
     Boolean(result.amount_match_explanation?.trim())
+  );
+}
+
+function inferReceiptPaymentRail(candidate: CandidateReceipt): ReceiptPaymentRail | null {
+  const text = `${candidate.subject} ${candidate.snippet} ${candidate.body}`.toLowerCase();
+  if (
+    /paid\s+via\s+(?:credit\s*\/\s*debit|debit\s*\/\s*credit|credit|debit)?\s*card\b/.test(text) ||
+    /payment\s+(?:method|mode)\s*:?\s*(?:credit\s*\/\s*debit|credit|debit)?\s*card\b/.test(text)
+  ) {
+    return "card";
+  }
+  if (/paid\s+via\s+upi\b/.test(text) || /payment\s+(?:method|mode)\s*:?\s*upi\b/.test(text)) {
+    return "upi";
+  }
+  return null;
+}
+
+function isTransactionCompatibleWithRail(
+  transaction: Pick<Transaction, "source">,
+  rail: ReceiptPaymentRail
+): boolean {
+  if (rail === "upi") return transaction.source === "idfc_upi";
+  return ["amex", "bobcard", "idfc_cc", "icici_cc"].includes(transaction.source ?? "");
+}
+
+function comparableTransactionAmount(transaction: Transaction, receiptCurrency: string): number | null {
+  const transactionCurrency = (transaction.currency || "INR").toUpperCase();
+  if (receiptCurrency === transactionCurrency) return transaction.amount;
+  if (receiptCurrency === "INR") return transaction.amount_inr;
+  return null;
+}
+
+const MERCHANT_NOISE_TOKENS = new Set([
+  "limited",
+  "private",
+  "india",
+  "payment",
+  "payments",
+  "payu",
+  "razorpay",
+  "gateway",
+  "order",
+  "receipt",
+  "noreply",
+]);
+
+function merchantTokens(value: string): Set<string> {
+  return new Set(
+    value
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, " ")
+      .split(/\s+/)
+      .filter((token) => token.length >= 4 && !MERCHANT_NOISE_TOKENS.has(token))
+  );
+}
+
+function hasMerchantOverlap(transaction: Transaction, candidate: CandidateReceipt, merchant: string | null): boolean {
+  const transactionTokens = merchantTokens(
+    `${transaction.merchant_raw ?? ""} ${transaction.merchant_clean ?? ""}`
+  );
+  const receiptTokens = merchantTokens(
+    `${merchant ?? ""} ${candidate.sender} ${candidate.subject}`
+  );
+  return [...transactionTokens].some((token) => receiptTokens.has(token));
+}
+
+function findDominantCompetingTransaction(
+  db: Database.Database,
+  transaction: Transaction,
+  candidate: CandidateReceipt,
+  result: ReceiptCorrelationResult
+): Transaction | null {
+  if (result.receipt_total === null || !result.receipt_currency) return null;
+  const receiptTime = new Date(candidate.datetime).getTime();
+  if (!Number.isFinite(receiptTime)) return null;
+
+  const receiptCurrency = result.receipt_currency.toUpperCase();
+  const receiptRail = inferReceiptPaymentRail(candidate);
+  const currentAmount = comparableTransactionAmount(transaction, receiptCurrency);
+  const currentTolerance = Math.max(1, Math.abs(currentAmount ?? 0) * 0.02);
+  const currentExact =
+    currentAmount !== null && Math.abs(result.receipt_total - currentAmount) <= currentTolerance;
+  const currentVendorMatch = hasMerchantOverlap(transaction, candidate, result.merchant_clean);
+  const currentRailMatch =
+    receiptRail === null || isTransactionCompatibleWithRail(transaction, receiptRail);
+  const currentDistance = transaction.datetime
+    ? Math.abs(receiptTime - new Date(transaction.datetime).getTime())
+    : Number.POSITIVE_INFINITY;
+
+  const competitors = db
+    .prepare(
+      `SELECT * FROM transactions
+       WHERE id != ? AND direction = 'debit' AND is_reversal = 0 AND correlation_status != 'matched'`
+    )
+    .all(transaction.id) as Transaction[];
+
+  return (
+    competitors
+      .filter((other) => {
+        if (!other.datetime) return false;
+        const otherTime = new Date(other.datetime).getTime();
+        if (!Number.isFinite(otherTime) || Math.abs(receiptTime - otherTime) > RECEIPT_WINDOW_MS) {
+          return false;
+        }
+        const otherAmount = comparableTransactionAmount(other, receiptCurrency);
+        if (otherAmount === null) return false;
+        const tolerance = Math.max(1, Math.abs(otherAmount) * 0.02);
+        if (Math.abs(result.receipt_total! - otherAmount) > tolerance) return false;
+        if (!hasMerchantOverlap(other, candidate, result.merchant_clean)) return false;
+        if (receiptRail !== null && !isTransactionCompatibleWithRail(other, receiptRail)) return false;
+
+        const otherDistance = Math.abs(receiptTime - otherTime);
+        return (
+          !currentExact ||
+          !currentVendorMatch ||
+          !currentRailMatch ||
+          otherDistance < currentDistance
+        );
+      })
+      .sort((a, b) => {
+        const aDistance = Math.abs(receiptTime - new Date(a.datetime as string).getTime());
+        const bDistance = Math.abs(receiptTime - new Date(b.datetime as string).getTime());
+        return aDistance - bDistance;
+      })[0] ?? null
   );
 }
 

@@ -1338,6 +1338,234 @@ test("receipt correlation uses auditable multi-signal confidence for amount mism
   );
 });
 
+test("receipt correlation prefers an exact nearby card and vendor match over an older UPI mismatch", async () => {
+  const db = makeDb();
+  const upi = insertTestTransaction(db, {
+    source: "idfc_upi",
+    amount: 245,
+    merchant_raw: "MAHENDRA R",
+    datetime: "2026-08-27T09:37:03.000Z",
+    currency: "INR",
+    raw_email_id: "sms:idfc:rrn:upi-245",
+    correlation_status: "pending",
+  });
+  const amex = insertTestTransaction(db, {
+    source: "amex",
+    amount: 427,
+    merchant_raw: "PAYU SWIGGY",
+    datetime: "2026-08-27T09:58:56.000Z",
+    currency: "INR",
+    raw_email_id: "amex-alert-427",
+    correlation_status: "pending",
+  });
+  createEnvelopeEntry(db, {
+    raw_transaction_id: amex.id,
+    funding_month: "2026-10",
+    occurred_at: amex.datetime,
+    source: "amex",
+    merchant_clean: "Swiggy",
+    category: "Food & Dining",
+    treatment: "normal",
+    state: "actual",
+    gross_amount_inr: 427,
+    personal_impact: 427,
+    cashflow_impact: 427,
+    receivable_amount: 0,
+    confidence: 0.95,
+    created_by: "automatic_inference",
+  });
+
+  const receiptId = "swiggy-receipt-427";
+  const receipt = {
+    id: receiptId,
+    internalDate: String(Date.parse("2026-08-27T10:23:58.000Z")),
+    snippet: "Your Swiggy order invoice",
+    payload: {
+      headers: [
+        { name: "From", value: "Swiggy <noreply@swiggy.in>" },
+        { name: "Subject", value: "Your Swiggy order invoice" },
+      ],
+      mimeType: "text/html",
+      body: {
+        data: Buffer.from(
+          "<p>Order total ₹747</p><p>Discount Applied -₹320</p>" +
+            "<strong>Paid Via Credit/Debit card ₹427</strong>"
+        ).toString("base64url"),
+      },
+    },
+  };
+  const gmail = {
+    users: {
+      messages: {
+        list: async () => ({ data: { messages: [{ id: receiptId }] } }),
+        get: async () => ({ data: receipt }),
+      },
+    },
+  };
+
+  const unsafeMismatch = {
+    matched: true,
+    matched_email_id: receiptId,
+    merchant_clean: "Swiggy",
+    category: "Food & Dining",
+    order_id: null,
+    receipt_total: 427,
+    receipt_currency: "INR",
+    item_summary: ["Burger meal"],
+    signal_scores: {
+      merchant_match: 0.9,
+      timing_match: 0.95,
+      amount_match: 0.7,
+      receipt_quality: 1,
+      uniqueness: 0.95,
+    },
+    amount_gap_kind: "coupon_or_credit",
+    amount_match_explanation: "A discount may explain the difference.",
+    confidence: 0.95,
+    reasoning: "The only nearby receipt may belong to this UPI debit.",
+  };
+  assert.equal(
+    await attemptCorrelation(db, upi, {
+      gmail,
+      updateTelegram: false,
+      generate: async () => unsafeMismatch,
+    }),
+    false
+  );
+  assert.equal(getTransaction(db, upi.id).correlation_status, "pending");
+  assert.equal(
+    listContextFacts(db, {
+      scope_type: "transaction",
+      scope_id: upi.id,
+      key: "receipt_enrichment",
+    }).length,
+    0
+  );
+  const rejectedAttempt = JSON.parse(
+    listContextFacts(db, {
+      scope_type: "transaction",
+      scope_id: upi.id,
+      key: "receipt_correlation_attempt",
+    })[0].value
+  );
+  assert.equal(rejectedAttempt.matched, false);
+  assert.match(rejectedAttempt.reasoning, /nearby amex transaction/i);
+
+  const exactMatch = {
+    ...unsafeMismatch,
+    amount_gap_kind: "none",
+    amount_match_explanation: null,
+    signal_scores: {
+      merchant_match: 1,
+      timing_match: 0.98,
+      amount_match: 1,
+      receipt_quality: 1,
+      uniqueness: 1,
+    },
+    confidence: 0.99,
+    reasoning: "Exact final card amount, merchant, payment rail, and time window.",
+  };
+  assert.equal(
+    await attemptCorrelation(db, amex, {
+      gmail,
+      updateTelegram: false,
+      generate: async () => exactMatch,
+    }),
+    true
+  );
+  assert.equal(getTransaction(db, amex.id).correlation_status, "matched");
+  assert.equal(getTransaction(db, amex.id).correlated_with, `gmail:${receiptId}`);
+  db.close();
+});
+
+test("receipt correlation still accepts a vendor-confirmed coupon or wallet-credit mismatch", async () => {
+  const db = makeDb();
+  const transaction = insertTestTransaction(db, {
+    source: "amex",
+    amount: 354,
+    merchant_raw: "PAYU SWIGGY",
+    datetime: "2026-07-31T08:15:00.000Z",
+    currency: "INR",
+    raw_email_id: "amex-alert-354",
+    correlation_status: "pending",
+  });
+  createEnvelopeEntry(db, {
+    raw_transaction_id: transaction.id,
+    funding_month: "2026-09",
+    occurred_at: transaction.datetime,
+    source: "amex",
+    merchant_clean: "Swiggy",
+    category: "Groceries",
+    treatment: "normal",
+    state: "actual",
+    gross_amount_inr: 354,
+    personal_impact: 354,
+    cashflow_impact: 354,
+    receivable_amount: 0,
+    confidence: 0.95,
+    created_by: "automatic_inference",
+  });
+
+  const receiptId = "instamart-wallet-receipt";
+  const receipt = {
+    id: receiptId,
+    internalDate: String(Date.parse("2026-07-31T08:28:00.000Z")),
+    snippet: "Your Instamart order was delivered",
+    payload: {
+      headers: [
+        { name: "From", value: "Swiggy Instamart <noreply@instamart.in>" },
+        { name: "Subject", value: "Your Instamart order was delivered" },
+      ],
+      mimeType: "text/html",
+      body: {
+        data: Buffer.from(
+          "<p>Order total ₹402</p><p>Wallet credits applied ₹48</p><p>Groceries delivered</p>"
+        ).toString("base64url"),
+      },
+    },
+  };
+  const gmail = {
+    users: {
+      messages: {
+        list: async () => ({ data: { messages: [{ id: receiptId }] } }),
+        get: async () => ({ data: receipt }),
+      },
+    },
+  };
+  const result = {
+    matched: true,
+    matched_email_id: receiptId,
+    merchant_clean: "Swiggy Instamart",
+    category: "Groceries",
+    order_id: null,
+    receipt_total: 402,
+    receipt_currency: "INR",
+    item_summary: ["Groceries"],
+    signal_scores: {
+      merchant_match: 0.99,
+      timing_match: 0.98,
+      amount_match: 0.7,
+      receipt_quality: 0.99,
+      uniqueness: 0.99,
+    },
+    amount_gap_kind: "coupon_or_credit",
+    amount_match_explanation: "The receipt explicitly shows ₹48 of wallet credits.",
+    confidence: 0.97,
+    reasoning: "Same vendor, thirteen-minute window, and an explicit wallet-credit explanation.",
+  };
+
+  assert.equal(
+    await attemptCorrelation(db, transaction, {
+      gmail,
+      updateTelegram: false,
+      generate: async () => result,
+    }),
+    true
+  );
+  assert.equal(getTransaction(db, transaction.id).correlation_status, "matched");
+  db.close();
+});
+
 test("receipt enrichment does not resend an unchanged candidate set to the AI", async () => {
   const db = makeDb();
   const transaction = insertTestTransaction(db, {
