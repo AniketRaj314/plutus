@@ -12,6 +12,11 @@ import { v2Tools as tools } from "./v2-tools";
 import { getCounterpartyBalance, getRawTransaction } from "../db/v2-queries";
 import { listRecentAgentMessages, insertAgentMessage, getTransaction } from "../db/queries";
 import { getVioletModelConfig } from "./model-config";
+import {
+  buildUserInputItem,
+  persistedImageMessage,
+  type AgentImageInput,
+} from "./image-input";
 
 const MAX_TOOL_ITERATIONS = 20;
 const MAX_COMPLETION_TOKENS = 8000;
@@ -41,6 +46,7 @@ export interface RunAgentPayload {
   user_message: string;
   interface: "telegram" | "api";
   replied_to_transaction_id?: string;
+  images?: AgentImageInput[];
 }
 
 export interface RunAgentOptions {
@@ -128,7 +134,7 @@ export async function runAgent(
 
   const input: ResponseInputItem[] = [
     ...history,
-    { role: "user", content: effectiveUserMessage },
+    buildUserInputItem(effectiveUserMessage, payload.images),
   ];
 
   const toolDefs = toOpenAiTools();
@@ -221,7 +227,11 @@ export async function runAgent(
     }
   }
 
-  insertAgentMessage(db, { role: "user", content: effectiveUserMessage, interface: payload.interface });
+  insertAgentMessage(db, {
+    role: "user",
+    content: persistedImageMessage(effectiveUserMessage, payload.images?.length ?? 0),
+    interface: payload.interface,
+  });
   insertAgentMessage(db, { role: "assistant", content: finalText, interface: payload.interface });
 
   return finalText;

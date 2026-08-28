@@ -14,6 +14,11 @@ import {
   type RecordContributorPurchaseResult,
 } from "../db/v2-queries";
 import { getVioletModelConfig } from "./model-config";
+import {
+  buildUserInputItem,
+  persistedImageMessage,
+  type AgentImageInput,
+} from "./image-input";
 
 const MAX_TOOL_ITERATIONS = 8;
 const MAX_COMPLETION_TOKENS = 1800;
@@ -39,6 +44,7 @@ export interface ContributorAgentPayload {
   conversation_id: string;
   message_id: number;
   user_message: string;
+  images?: AgentImageInput[];
 }
 
 export interface ContributorPurchaseReceipt {
@@ -255,7 +261,7 @@ export async function runContributorAgent(
   const systemPrompt = buildContributorSystemPrompt(payload.identity);
   const input: ResponseInputItem[] = [
     ...listHistory(db, payload.identity.telegram_user_id, payload.conversation_id),
-    { role: "user", content: payload.user_message },
+    buildUserInputItem(payload.user_message, payload.images),
   ];
   const receipts: ContributorPurchaseReceipt[] = [];
   const modelConfig = getVioletModelConfig();
@@ -364,7 +370,12 @@ export async function runContributorAgent(
   if (!finalText) {
     finalText = "I couldn't safely finish that entry. Please send one payment with the amount, date, and what it was for.";
   }
-  insertHistory(db, payload, "user", payload.user_message);
+  insertHistory(
+    db,
+    payload,
+    "user",
+    persistedImageMessage(payload.user_message, payload.images?.length ?? 0)
+  );
   insertHistory(db, payload, "assistant", finalText);
   return { text: finalText, recorded_purchases: receipts };
 }

@@ -13,6 +13,13 @@ import {
 } from "./access";
 import { agentErrorLogLine, recordAgentError } from "../agent/diagnostics";
 import { renderTelegramChunks, telegramHtmlToPlainText } from "./render";
+import {
+  loadTelegramImage,
+  TelegramImageError,
+  type TelegramImageDocument,
+  type TelegramPhotoSize,
+} from "./media";
+import type { AgentImageInput } from "../agent/image-input";
 
 const MESSAGE_MAP_KEY = "telegram_message_map";
 const PENDING_REBALANCE_KEY = "pending_rebalance_message";
@@ -269,6 +276,9 @@ export interface TelegramIncomingMessage {
   };
   message_thread_id?: number;
   text?: string;
+  caption?: string;
+  photo?: TelegramPhotoSize[];
+  document?: TelegramImageDocument;
   reply_to_message?: { message_id: number };
 }
 
@@ -314,6 +324,7 @@ interface TelegramHandlerDependencies {
   sendToIncomingChat?: typeof sendMessageToChat;
   sendOwnerMessage?: typeof sendMessage;
   sendTyping?: typeof sendTypingActionToChat;
+  loadImages?: (message: TelegramIncomingMessage) => Promise<AgentImageInput[]>;
 }
 
 function contributorAuditMessage(receipt: ContributorAgentResult["recorded_purchases"][number]): string {
@@ -343,9 +354,10 @@ export async function handleTelegramUpdate(
 ): Promise<void> {
   const message = update.message;
   if (!message) return;
-  if (!message.text) return;
+  const hasImage = Boolean(message.photo?.length || message.document);
+  if (!message.text && !message.caption && !hasImage) return;
 
-  const claimToken = parseTelegramContributorClaim(message.text);
+  const claimToken = message.text ? parseTelegramContributorClaim(message.text) : null;
   if (claimToken) {
     const senderId = message.from?.id;
     const sendIncoming = dependencies.sendToIncomingChat ?? sendMessageToChat;
@@ -384,6 +396,31 @@ export async function handleTelegramUpdate(
     return;
   }
 
+  const userMessage =
+    message.text?.trim() ||
+    message.caption?.trim() ||
+    "Please examine this image and help me with anything financially relevant. If the context is ambiguous, ask one concise question.";
+
+  let images: AgentImageInput[] = [];
+  if (hasImage) {
+    try {
+      images = await (dependencies.loadImages ?? ((incoming) => loadTelegramImage(getBot(), incoming)))(
+        message
+      );
+    } catch (error) {
+      if (!(error instanceof TelegramImageError)) throw error;
+      await (dependencies.sendToIncomingChat ?? sendMessageToChat)(
+        message.chat.id,
+        error.userMessage,
+        {
+          thread_id: message.message_thread_id,
+          reply_to_message_id: message.message_id,
+        }
+      );
+      return;
+    }
+  }
+
   const replyToId = message.reply_to_message?.message_id;
   const linkedTransactionId =
     actor.role === "owner" && replyToId
@@ -411,9 +448,10 @@ export async function handleTelegramUpdate(
     let reply: string;
     if (actor.role === "owner") {
       reply = await (dependencies.runOwnerAgent ?? runAgent)(db, {
-        user_message: message.text,
+        user_message: userMessage,
         interface: "telegram",
         replied_to_transaction_id: linkedTransactionId,
+        images,
       });
     } else {
       const contributorIdentity: ContributorIdentity = {
@@ -424,7 +462,8 @@ export async function handleTelegramUpdate(
         identity: contributorIdentity,
         conversation_id: String(message.chat.id),
         message_id: message.message_id,
-        user_message: message.text,
+        user_message: userMessage,
+        images,
       });
       reply = result.text;
       for (const receipt of result.recorded_purchases) {
