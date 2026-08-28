@@ -3,6 +3,7 @@ require("ts-node/register");
 const test = require("node:test");
 const assert = require("node:assert/strict");
 const Database = require("better-sqlite3");
+const { Readable } = require("node:stream");
 
 const { runMigrations } = require("../src/db/schema");
 const {
@@ -103,6 +104,12 @@ const {
   recordTransactionMessage,
   resolveTelegramActor,
 } = require("../src/telegram/bot");
+const {
+  MAX_TELEGRAM_IMAGE_BYTES,
+  TelegramImageError,
+  loadTelegramImage,
+  selectTelegramImage,
+} = require("../src/telegram/media");
 const {
   claimTelegramContributorInvite,
   createTelegramContributorInvite,
@@ -3518,6 +3525,154 @@ test("Telegram handler gives only the owner the full agent path", async () => {
   db.close();
 });
 
+test("Telegram handler sends an authorized photo and caption to the owner agent", async () => {
+  const db = makeDb();
+  const replies = [];
+  let ownerPayload;
+  let loaderCalls = 0;
+
+  await handleTelegramUpdate(
+    db,
+    {
+      update_id: 903,
+      message: {
+        message_id: 45,
+        chat: { id: -100123456, type: "supergroup" },
+        message_thread_id: 77,
+        from: { id: 111, first_name: "Aniket" },
+        caption: "Which transaction does this receipt belong to?",
+        photo: [
+          { file_id: "small", width: 320, height: 240, file_size: 1000 },
+          { file_id: "large", width: 1600, height: 1200, file_size: 4000 },
+        ],
+      },
+    },
+    {
+      loadImages: async (message) => {
+        loaderCalls++;
+        assert.equal(message.photo.at(-1).file_id, "large");
+        return [{ data_url: "data:image/jpeg;base64,/9j/" }];
+      },
+      runOwnerAgent: async (_db, payload) => {
+        ownerPayload = payload;
+        return "That is the ₹427 Swiggy receipt.";
+      },
+      sendToIncomingChat: async (chatId, text, options) => {
+        replies.push({ chatId, text, options });
+        return 1;
+      },
+      sendTyping: async () => {},
+    }
+  );
+
+  assert.equal(loaderCalls, 1);
+  assert.equal(ownerPayload.user_message, "Which transaction does this receipt belong to?");
+  assert.deepEqual(ownerPayload.images, [{ data_url: "data:image/jpeg;base64,/9j/" }]);
+  assert.equal(replies[0].text, "That is the ₹427 Swiggy receipt.");
+  db.close();
+});
+
+test("Telegram image-only messages use a useful prompt and stay behind access control", async () => {
+  const db = makeDb();
+  let loaderCalls = 0;
+  let agentCalls = 0;
+
+  await handleTelegramUpdate(
+    db,
+    {
+      update_id: 904,
+      message: {
+        message_id: 46,
+        chat: { id: 333, type: "private" },
+        from: { id: 333, first_name: "Unknown" },
+        photo: [{ file_id: "private-image", width: 800, height: 600 }],
+      },
+    },
+    {
+      loadImages: async () => {
+        loaderCalls++;
+        return [{ data_url: "data:image/jpeg;base64,/9j/" }];
+      },
+      runOwnerAgent: async () => {
+        agentCalls++;
+        return "wrong";
+      },
+      sendTyping: async () => {},
+    }
+  );
+
+  assert.equal(loaderCalls, 0);
+  assert.equal(agentCalls, 0);
+
+  let ownerPayload;
+  await handleTelegramUpdate(
+    db,
+    {
+      update_id: 905,
+      message: {
+        message_id: 47,
+        chat: { id: 111, type: "private" },
+        from: { id: 111, first_name: "Aniket" },
+        photo: [{ file_id: "owner-image", width: 800, height: 600 }],
+      },
+    },
+    {
+      loadImages: async () => [{ data_url: "data:image/jpeg;base64,/9j/" }],
+      runOwnerAgent: async (_db, payload) => {
+        ownerPayload = payload;
+        return "I can read it.";
+      },
+      sendToIncomingChat: async () => 1,
+      sendTyping: async () => {},
+    }
+  );
+  assert.match(ownerPayload.user_message, /examine this image/i);
+  assert.equal(ownerPayload.images.length, 1);
+  db.close();
+});
+
+test("Telegram image intake validates type, bytes, and actual file contents", async () => {
+  const selected = selectTelegramImage({
+    photo: [
+      { file_id: "wide", width: 1200, height: 500 },
+      { file_id: "large", width: 1000, height: 1000 },
+    ],
+  });
+  assert.equal(selected.file_id, "large");
+
+  assert.throws(
+    () => selectTelegramImage({
+      document: { file_id: "pdf", mime_type: "application/pdf", file_size: 100 },
+    }),
+    (error) => error instanceof TelegramImageError && /PNG, JPEG, or WebP/.test(error.message)
+  );
+  assert.throws(
+    () => selectTelegramImage({
+      document: {
+        file_id: "large-image",
+        mime_type: "image/png",
+        file_size: MAX_TELEGRAM_IMAGE_BYTES + 1,
+      },
+    }),
+    (error) => error instanceof TelegramImageError && /over 10 MB/.test(error.message)
+  );
+
+  const jpegBytes = Buffer.from([0xff, 0xd8, 0xff, 0xdb, 0x00, 0x01]);
+  const images = await loadTelegramImage(
+    { getFileStream: () => Readable.from([jpegBytes]) },
+    { photo: [{ file_id: "jpeg", width: 100, height: 100 }] }
+  );
+  assert.deepEqual(images, [{ data_url: `data:image/jpeg;base64,${jpegBytes.toString("base64")}` }]);
+
+  await assert.rejects(
+    loadTelegramImage(
+      { getFileStream: () => Readable.from([Buffer.from("not really an image")]) },
+      { document: { file_id: "spoofed", mime_type: "image/png" } }
+    ),
+    (error) => error instanceof TelegramImageError && /verify that image/.test(error.message)
+  );
+});
+
 test("flex budget status reproduces daily slices, split shares, and period rollover deterministically", () => {
   const db = makeDb();
   const plan = createFlexBudgetPlan(db, {
@@ -4444,6 +4599,77 @@ test("Violet defaults to the flagship model with high reasoning", () => {
     if (previousEffort === undefined) delete process.env.VIOLET_REASONING_EFFORT;
     else process.env.VIOLET_REASONING_EFFORT = previousEffort;
   }
+});
+
+test("Violet sends images to OpenAI for one turn without retaining their bytes", async () => {
+  const db = makeDb();
+  const requests = [];
+  const dataUrl = "data:image/png;base64,iVBORw0KGgo=";
+
+  const result = await runAgent(
+    db,
+    {
+      user_message: "Read this receipt and identify the total.",
+      interface: "telegram",
+      images: [{ data_url: dataUrl }],
+    },
+    {
+      createResponse: async (request) => {
+        requests.push(request);
+        return { output_text: "The total is ₹427.", output: [] };
+      },
+    }
+  );
+
+  assert.equal(result, "The total is ₹427.");
+  const userInput = requests[0].input.at(-1);
+  assert.equal(userInput.role, "user");
+  assert.deepEqual(userInput.content, [
+    { type: "input_text", text: "Read this receipt and identify the total." },
+    { type: "input_image", image_url: dataUrl, detail: "high" },
+  ]);
+  const stored = db
+    .prepare("SELECT content FROM agent_messages WHERE role = 'user' ORDER BY id DESC LIMIT 1")
+    .get();
+  assert.match(stored.content, /1 image attached for this turn/);
+  assert.doesNotMatch(stored.content, /data:image|iVBOR/);
+  db.close();
+});
+
+test("contributor Violet accepts an image while retaining only a marker in bilateral history", async () => {
+  const db = makeDb();
+  const requests = [];
+  const dataUrl = "data:image/jpeg;base64,/9j/";
+  const result = await runContributorAgent(
+    db,
+    {
+      identity: { telegram_user_id: "222", name: "Rushil" },
+      conversation_id: "dm:222",
+      message_id: 988,
+      user_message: "This is the receipt for what I paid for Aniket.",
+      images: [{ data_url: dataUrl }],
+    },
+    {
+      createResponse: async (request) => {
+        requests.push(request);
+        return { output_text: "What date was this purchase?", output: [] };
+      },
+    }
+  );
+
+  assert.equal(result.text, "What date was this purchase?");
+  assert.deepEqual(requests[0].input.at(-1).content, [
+    { type: "input_text", text: "This is the receipt for what I paid for Aniket." },
+    { type: "input_image", image_url: dataUrl, detail: "high" },
+  ]);
+  const stored = db
+    .prepare(
+      "SELECT content FROM contributor_agent_messages WHERE role = 'user' ORDER BY id DESC LIMIT 1"
+    )
+    .get();
+  assert.match(stored.content, /1 image attached for this turn/);
+  assert.doesNotMatch(stored.content, /data:image|\/9j\//);
+  db.close();
 });
 
 test("Violet discards a stale balance drafted after a balance-affecting write", async () => {

@@ -128,6 +128,10 @@ Violet or reply to Violet; direct messages work normally. The access model is:
   identity is injected by the server, so they cannot substitute another name.
 - Unknown senders and unverified webhook requests are ignored before an AI or
   financial query runs.
+- Authorized owners and contributors can attach one Telegram photo or a PNG,
+  JPEG, or WebP image (up to 10 MB), with an optional caption. Violet receives
+  the caption and image in the same turn. The image bytes are held only in
+  memory for that request and are not stored in Plutus chat history or logs.
 - Each accepted contributor purchase creates one manual raw record, one owner
   expense at the reported share with zero owner cashflow, and one payable to the
   contributor. The owner receives a separate audit alert.
