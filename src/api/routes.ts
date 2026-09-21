@@ -20,6 +20,7 @@ import { todayIst, daysUntilSalaryDay } from "../agent/prompts";
 import { tools as agentTools } from "../agent/tools";
 import {
   queryTransactions,
+  getContext,
   getTransaction,
   getEnvelope,
   listAllSplits,
@@ -32,6 +33,7 @@ import {
 import { getRemainingWeeksInMonth, parseIstDateOnly, getBillingWindow } from "../envelope/engine";
 import { getSchedulerHealth } from "../scheduler/status";
 import { describeGmailDiagnosticError, searchTransactionEmails } from "../gmail/diagnostics";
+import { getUnparseableIds } from "../gmail/poller";
 import { countActiveTelegramContributors } from "../telegram/access";
 import {
   acceptIdfcSms,
@@ -49,6 +51,11 @@ const AGENT_RATE_LIMIT_WINDOW_MS = 60_000;
 const SMS_RATE_LIMIT_MAX = 30;
 const SMS_RATE_LIMIT_WINDOW_MS = 60_000;
 export const PACKAGE_VERSION = (require("../../package.json") as { version?: string }).version ?? "unknown";
+
+function contextTimestamp(db: Database.Database, key: string): string | null {
+  const seconds = Number(getContext(db, key)?.value);
+  return Number.isFinite(seconds) && seconds > 0 ? new Date(seconds * 1000).toISOString() : null;
+}
 
 // -- webhook + health (unchanged, no auth) --
 
@@ -136,12 +143,26 @@ export function registerRoutes(app: FastifyInstance, db: Database.Database): voi
 
     const checkedAt = new Date();
     const schedulerHealth = getSchedulerHealth(checkedAt);
+    const gmailScheduler = schedulerHealth.schedulers.gmail_poll;
+    const pendingUnparseableCount = getUnparseableIds(db).size;
+    const gmailSyncStatus =
+      gmailScheduler?.last_outcome === "error"
+        ? "connection_failure"
+        : gmailScheduler?.last_outcome === "degraded" || pendingUnparseableCount > 0
+          ? "parser_backlog"
+          : "healthy";
     const failedSchedulers = Object.values(schedulerHealth.schedulers)
-      .filter((scheduler) => scheduler.enabled && scheduler.last_outcome === "error")
+      .filter(
+        (scheduler) =>
+          scheduler.name !== "gmail_poll" &&
+          scheduler.enabled &&
+          (scheduler.last_outcome === "error" || scheduler.last_outcome === "degraded")
+      )
       .map((scheduler) => scheduler.name);
     const telegramAccess = getTelegramAccessStatus();
     const smsIngestion = getSmsIngestionStatus(db);
     const degradedComponents = [
+      ...(gmailSyncStatus === "healthy" ? [] : [`gmail_${gmailSyncStatus}`]),
       ...failedSchedulers,
       ...(telegramAccess.valid ? [] : ["telegram_access_control"]),
       ...(smsIngestion.failed_count > 0 ? ["sms_ingestion_failed_events"] : []),
@@ -161,6 +182,13 @@ export function registerRoutes(app: FastifyInstance, db: Database.Database): voi
       auto_inference_interval: process.env.AUTO_INFERENCE_INTERVAL_MINS ?? "5",
       violet_ai: getVioletModelConfig(),
       degraded_components: degradedComponents,
+      gmail_sync: {
+        status: gmailSyncStatus,
+        connection: gmailSyncStatus === "connection_failure" ? "failed" : "healthy",
+        pending_unparseable_count: pendingUnparseableCount,
+        last_successful_connection_at: contextTimestamp(db, "last_gmail_poll"),
+        last_successful_processing_at: contextTimestamp(db, "last_clean_gmail_poll"),
+      },
       telegram_access: {
         ...telegramAccess,
         active_contributor_count: countActiveTelegramContributors(db),

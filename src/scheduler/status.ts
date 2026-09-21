@@ -15,7 +15,18 @@ interface SchedulerState {
   last_completed_at: string | null;
   last_failed_at: string | null;
   last_error: string | null;
-  last_outcome: "success" | "error" | null;
+  last_error_code: string | null;
+  last_outcome: "success" | "degraded" | "error" | null;
+}
+
+export class SchedulerDegradedError extends Error {
+  readonly healthCode: string;
+
+  constructor(healthCode: string, message: string) {
+    super(message);
+    this.name = "SchedulerDegradedError";
+    this.healthCode = healthCode;
+  }
 }
 
 export interface SchedulerHealth extends SchedulerState {
@@ -64,6 +75,7 @@ export function configureScheduler(
     last_completed_at: previous?.last_completed_at ?? options.last_completed_at ?? null,
     last_failed_at: previous?.last_failed_at ?? null,
     last_error: previous?.last_error ?? null,
+    last_error_code: previous?.last_error_code ?? null,
     last_outcome: previous?.last_outcome ?? null,
   });
 }
@@ -78,12 +90,15 @@ export async function runSchedulerCycle(name: SchedulerName, task: () => Promise
     await task();
     state.last_completed_at = new Date().toISOString();
     state.last_error = null;
+    state.last_error_code = null;
     state.last_outcome = "success";
   } catch (error) {
-    state.last_failed_at = new Date().toISOString();
+    const degraded = error instanceof SchedulerDegradedError;
+    if (!degraded) state.last_failed_at = new Date().toISOString();
     state.last_error = error instanceof Error ? error.message : String(error);
-    state.last_outcome = "error";
-    console.error(`[scheduler:${name}] cycle failed:`, error);
+    state.last_error_code = degraded ? error.healthCode : null;
+    state.last_outcome = degraded ? "degraded" : "error";
+    console.error(`[scheduler:${name}] cycle ${degraded ? "degraded" : "failed"}:`, error);
   } finally {
     state.running = false;
   }

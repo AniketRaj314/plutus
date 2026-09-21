@@ -35,6 +35,7 @@ import {
   configureScheduler,
   normalizeCronInterval,
   runSchedulerCycle,
+  SchedulerDegradedError,
 } from "../scheduler/status";
 import {
   findIdfcUpiCrossChannelMatch,
@@ -49,10 +50,11 @@ const WATCHED_SENDERS = [
 ];
 
 const LAST_POLL_KEY = "last_gmail_poll";
+const LAST_CLEAN_POLL_KEY = "last_clean_gmail_poll";
 const PROCESSED_IDS_KEY = "processed_message_ids";
 const UNPARSEABLE_IDS_KEY = "unparseable_gmail_message_ids";
 const PARSER_REVISION_KEY = "gmail_parser_revision";
-const PARSER_REVISION = "icici-credit-card-v1";
+const PARSER_REVISION = "amex-sgd-v1";
 const GMAIL_SYNC_ALERT_STATE_KEY = "gmail_sync_alert_state";
 const PARSER_REPLAY_WINDOW_SECONDS = 48 * 60 * 60;
 const MAX_PROCESSED_IDS = 2000;
@@ -78,12 +80,16 @@ export function startPoller(db: Database.Database): void {
   const schedule = `*/${intervalMins} * * * *`;
 
   const lastPollSeconds = Number(getContext(db, LAST_POLL_KEY)?.value);
+  const lastCleanPollSeconds = Number(getContext(db, LAST_CLEAN_POLL_KEY)?.value);
+  const hasParserBacklog = getUnparseableIds(db).size > 0;
   configureScheduler("gmail_poll", {
     label: "Gmail transaction poller",
     interval_minutes: intervalMins,
     enabled: true,
-    last_completed_at: Number.isFinite(lastPollSeconds)
-      ? new Date(lastPollSeconds * 1000).toISOString()
+    last_completed_at: Number.isFinite(lastCleanPollSeconds)
+      ? new Date(lastCleanPollSeconds * 1000).toISOString()
+      : !hasParserBacklog && Number.isFinite(lastPollSeconds)
+        ? new Date(lastPollSeconds * 1000).toISOString()
       : null,
   });
 
@@ -99,8 +105,34 @@ interface GmailPollCycleOptions {
   sendTelegram?: (text: string, replyToMessageId?: number) => Promise<number>;
 }
 
+interface UnparseableGmailAlert {
+  message_id: string;
+  provider: string;
+  subject: string;
+  received_at: string | null;
+}
+
+export class GmailParserBacklogError extends SchedulerDegradedError {
+  readonly alerts: UnparseableGmailAlert[];
+
+  constructor(alerts: UnparseableGmailAlert[]) {
+    const count = alerts.length;
+    super(
+      "gmail_parser_backlog",
+      `${count} likely transaction alert(s) remain unparseable and will be retried`
+    );
+    this.name = "GmailParserBacklogError";
+    this.alerts = alerts;
+  }
+}
+
+type GmailIncidentKind = "parser_backlog" | "connection_failure";
+
 interface GmailSyncAlertState {
   status: "healthy" | "failed";
+  incident_kind: GmailIncidentKind | null;
+  pending_count: number;
+  provider: string | null;
   updated_at: string;
 }
 
@@ -110,8 +142,23 @@ function getGmailSyncAlertState(db: Database.Database): GmailSyncAlertState | nu
   try {
     const parsed = JSON.parse(value) as Partial<GmailSyncAlertState>;
     if (parsed.status !== "healthy" && parsed.status !== "failed") return null;
+    const retryCount = getUnparseableIds(db).size;
+    const incidentKind =
+      parsed.incident_kind === "parser_backlog" || parsed.incident_kind === "connection_failure"
+        ? parsed.incident_kind
+        : parsed.status === "failed"
+          ? retryCount > 0
+            ? "parser_backlog"
+            : "connection_failure"
+          : null;
     return {
       status: parsed.status,
+      incident_kind: incidentKind,
+      pending_count:
+        typeof parsed.pending_count === "number" && parsed.pending_count > 0
+          ? Math.floor(parsed.pending_count)
+          : retryCount,
+      provider: typeof parsed.provider === "string" ? parsed.provider : null,
       updated_at: typeof parsed.updated_at === "string" ? parsed.updated_at : "",
     };
   } catch {
@@ -119,12 +166,71 @@ function getGmailSyncAlertState(db: Database.Database): GmailSyncAlertState | nu
   }
 }
 
-function setGmailSyncAlertState(db: Database.Database, status: GmailSyncAlertState["status"]): void {
+function setGmailSyncAlertState(
+  db: Database.Database,
+  state: Omit<GmailSyncAlertState, "updated_at">
+): void {
   setContext(
     db,
     GMAIL_SYNC_ALERT_STATE_KEY,
-    JSON.stringify({ status, updated_at: new Date().toISOString() } satisfies GmailSyncAlertState)
+    JSON.stringify({ ...state, updated_at: new Date().toISOString() } satisfies GmailSyncAlertState)
   );
+}
+
+function header(message: gmail_v1.Schema$Message, name: string): string {
+  return (
+    message.payload?.headers?.find((item) => item.name?.toLowerCase() === name.toLowerCase())?.value ?? ""
+  );
+}
+
+function providerLabel(from: string): string {
+  const normalized = from.toLowerCase();
+  if (normalized.includes("americanexpress.com")) return "AmEx";
+  if (normalized.includes("getonecard.app")) return "BOBCARD";
+  if (normalized.includes("idfcfirstbank.com")) return "IDFC FIRST Bank";
+  if (normalized.includes("icici.bank.in")) return "ICICI Bank";
+  return "Bank or card issuer";
+}
+
+function summarizeUnparseableAlert(message: gmail_v1.Schema$Message): UnparseableGmailAlert {
+  return {
+    message_id: message.id ?? "unknown",
+    provider: providerLabel(header(message, "From")),
+    subject: header(message, "Subject").replace(/\s+/g, " ").trim().slice(0, 120) || "Unknown subject",
+    received_at: getGmailReceivedAt(message),
+  };
+}
+
+function formatIstTimestamp(value: string | null): string | null {
+  if (!value) return null;
+  const parsed = new Date(value);
+  if (Number.isNaN(parsed.getTime())) return null;
+  return new Intl.DateTimeFormat("en-IN", {
+    timeZone: "Asia/Kolkata",
+    day: "numeric",
+    month: "short",
+    hour: "numeric",
+    minute: "2-digit",
+    hour12: true,
+  }).format(parsed);
+}
+
+function formatParserBacklogAlert(error: GmailParserBacklogError): string {
+  const count = error.alerts.length;
+  const first = error.alerts[0];
+  const lines = [
+    `⚠️ ${count} transaction email${count === 1 ? "" : "s"} could not be parsed.`,
+    "Gmail is connected and other emails continue syncing.",
+  ];
+  if (first) {
+    lines.push(`Provider: ${first.provider}`);
+    lines.push(`Subject: ${first.subject}`);
+    const receivedAt = formatIstTimestamp(first.received_at);
+    if (receivedAt) lines.push(`Received: ${receivedAt} IST`);
+  }
+  lines.push(`Status: Not recorded yet, retrying every ${normalizeCronInterval(process.env.POLL_INTERVAL_MINS, 10)} minutes.`);
+  lines.push("Use search_transaction_emails for diagnostics.");
+  return lines.join("\n");
 }
 
 function formatGmailFailureReason(error: unknown): string {
@@ -149,14 +255,35 @@ async function notifyGmailFailure(
   error: unknown,
   sendTelegram: (text: string, replyToMessageId?: number) => Promise<number>
 ): Promise<void> {
-  if (getGmailSyncAlertState(db)?.status === "failed") return;
+  const incidentKind: GmailIncidentKind =
+    error instanceof GmailParserBacklogError ? "parser_backlog" : "connection_failure";
+  const current = getGmailSyncAlertState(db);
+  if (current?.status === "failed" && current.incident_kind === incidentKind) {
+    if (error instanceof GmailParserBacklogError && current.pending_count !== error.alerts.length) {
+      setGmailSyncAlertState(db, {
+        status: "failed",
+        incident_kind: incidentKind,
+        pending_count: error.alerts.length,
+        provider: error.alerts[0]?.provider ?? current.provider,
+      });
+    }
+    return;
+  }
   try {
-    await sendTelegram(
-      `⚠️ Gmail transaction sync is down.\n` +
-        `Violet cannot read new bank/card emails right now. ${formatGmailFailureReason(error)}\n` +
-        `Transactions may be missing until sync recovers. Check /health for scheduler details.`
-    );
-    setGmailSyncAlertState(db, "failed");
+    const message =
+      error instanceof GmailParserBacklogError
+        ? formatParserBacklogAlert(error)
+        : `⚠️ Gmail transaction sync is down.\n` +
+          `Violet cannot read new bank/card emails right now. ${formatGmailFailureReason(error)}\n` +
+          `Transactions may be missing until sync recovers. Check /health for scheduler details.`;
+    await sendTelegram(message);
+    const firstAlert = error instanceof GmailParserBacklogError ? error.alerts[0] : undefined;
+    setGmailSyncAlertState(db, {
+      status: "failed",
+      incident_kind: incidentKind,
+      pending_count: error instanceof GmailParserBacklogError ? error.alerts.length : 0,
+      provider: firstAlert?.provider ?? null,
+    });
   } catch (alertError) {
     console.error("[gmail] failed to send sync failure alert:", alertError);
   }
@@ -164,15 +291,27 @@ async function notifyGmailFailure(
 
 async function notifyGmailRecovery(
   db: Database.Database,
-  sendTelegram: (text: string, replyToMessageId?: number) => Promise<number>
+  sendTelegram: (text: string, replyToMessageId?: number) => Promise<number>,
+  previousState?: GmailSyncAlertState | null
 ): Promise<void> {
-  if (getGmailSyncAlertState(db)?.status !== "failed") return;
+  const previous = previousState ?? getGmailSyncAlertState(db);
+  if (previous?.status !== "failed") return;
   try {
-    await sendTelegram(
-      `✅ Gmail transaction sync recovered.\n` +
-        `Violet can read transaction emails again and is catching up from the last successful checkpoint.`
-    );
-    setGmailSyncAlertState(db, "healthy");
+    const message =
+      previous.incident_kind === "parser_backlog"
+        ? `✅ Gmail parser backlog cleared.\n` +
+          `${previous.pending_count === 1 ? "The previously pending" : `${previous.pending_count} previously pending`} ` +
+          `${previous.provider ? `${previous.provider} ` : ""}transaction email${previous.pending_count === 1 ? " was" : "s were"} processed successfully.\n` +
+          `Gmail transaction processing is healthy.`
+        : `✅ Gmail transaction sync recovered.\n` +
+          `Violet can read transaction emails again and is catching up from the last successful checkpoint.`;
+    await sendTelegram(message);
+    setGmailSyncAlertState(db, {
+      status: "healthy",
+      incident_kind: null,
+      pending_count: 0,
+      provider: null,
+    });
   } catch (alertError) {
     console.error("[gmail] failed to send sync recovery alert:", alertError);
   }
@@ -183,13 +322,14 @@ export async function runGmailPollCycle(
   options: GmailPollCycleOptions = {}
 ): Promise<void> {
   const sendTelegram = options.sendTelegram ?? sendMessage;
+  const previousState = getGmailSyncAlertState(db);
   try {
     await (options.poll ?? (() => pollOnce(db)))();
   } catch (error) {
     await notifyGmailFailure(db, error, sendTelegram);
     throw error;
   }
-  await notifyGmailRecovery(db, sendTelegram);
+  await notifyGmailRecovery(db, sendTelegram, previousState);
 }
 
 export async function pollOnce(db: Database.Database, options: PollOnceOptions = {}): Promise<void> {
@@ -222,6 +362,7 @@ export async function pollOnce(db: Database.Database, options: PollOnceOptions =
       ignored: 0,
       unparseable: 0,
     };
+    const unparseableAlerts: UnparseableGmailAlert[] = [];
 
     for (const id of idsToProcess) {
       const message = await gmail.users.messages.get({
@@ -235,6 +376,7 @@ export async function pollOnce(db: Database.Database, options: PollOnceOptions =
       if (outcome === "unparseable") {
         processedIds.delete(id);
         unparseableIds.add(id);
+        unparseableAlerts.push(summarizeUnparseableAlert(message.data));
       } else {
         processedIds.add(id);
         unparseableIds.delete(id);
@@ -243,7 +385,8 @@ export async function pollOnce(db: Database.Database, options: PollOnceOptions =
 
     saveProcessedIds(db, processedIds);
     saveUnparseableIds(db, unparseableIds);
-    setContext(db, LAST_POLL_KEY, String(Math.floor(Date.now() / 1000)));
+    const pollCompletedSeconds = Math.floor(Date.now() / 1000);
+    setContext(db, LAST_POLL_KEY, String(pollCompletedSeconds));
     setContext(db, PARSER_REVISION_KEY, PARSER_REVISION);
 
     console.log(
@@ -253,10 +396,9 @@ export async function pollOnce(db: Database.Database, options: PollOnceOptions =
     );
     await notifyPendingCreditInferences(db);
     if (outcomes.unparseable > 0) {
-      throw new Error(
-        `${outcomes.unparseable} likely transaction alert(s) remain unparseable and will be retried`
-      );
+      throw new GmailParserBacklogError(unparseableAlerts);
     }
+    setContext(db, LAST_CLEAN_POLL_KEY, String(pollCompletedSeconds));
   } catch (err) {
     console.error("[gmail] poll cycle failed:", err);
     throw err;

@@ -19,6 +19,7 @@ const MONTHS: Record<string, number> = {
 const IST_OFFSET_MS = 5.5 * 60 * 60 * 1000;
 
 const CURRENCY_SYMBOLS: Record<string, string> = {
+  "S$": "SGD",
   "$": "USD",
   "₹": "INR",
   "€": "EUR",
@@ -94,9 +95,9 @@ function parseAmount(value: string): { currency: string; amountDigits: string } 
     return { currency: codeMatch[1].toUpperCase(), amountDigits: codeMatch[2] };
   }
 
-  const symbolMatch = value.match(/^\s*([$₹€£¥])\s*([\d,.]+)\s*$/);
+  const symbolMatch = value.match(/^\s*(S\$|[$₹€£¥])\s*([\d,.]+)\s*$/i);
   if (!symbolMatch) return null;
-  const currency = CURRENCY_SYMBOLS[symbolMatch[1]];
+  const currency = CURRENCY_SYMBOLS[symbolMatch[1].toUpperCase()];
   return currency ? { currency, amountDigits: symbolMatch[2] } : null;
 }
 
