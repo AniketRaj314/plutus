@@ -1048,6 +1048,7 @@ export function createReceivable(
   if (!Number.isFinite(received) || received < 0 || received > input.amount_inr) {
     throw new Error("received_inr must be between 0 and amount_inr");
   }
+  const label = normalizeReceivableLabel(input.label);
   const status: ReceivableStatus = received === 0 ? "pending" : received >= input.amount_inr ? "received" : "partial";
   const id = newId();
   db.prepare(
@@ -1062,7 +1063,7 @@ export function createReceivable(
     id,
     envelope_entry_id: input.envelope_entry_id ?? null,
     counterparty: input.counterparty,
-    label: input.label,
+    label,
     amount_inr: input.amount_inr,
     received_inr: received,
     status,
@@ -1076,7 +1077,13 @@ export function createReceivable(
 export function updateReceivable(
   db: Database.Database,
   id: string,
-  updates: { received_inr?: number; status?: ReceivableStatus; expected_at?: string | null; notes?: string | null }
+  updates: {
+    label?: string;
+    received_inr?: number;
+    status?: ReceivableStatus;
+    expected_at?: string | null;
+    notes?: string | null;
+  }
 ): Receivable | undefined {
   const current = db.prepare("SELECT * FROM receivables WHERE id = ?").get(id) as Receivable | undefined;
   if (!current) return undefined;
@@ -1084,9 +1091,12 @@ export function updateReceivable(
   if (!Number.isFinite(received) || received < 0 || received > current.amount_inr) {
     throw new Error("received_inr must be between 0 and amount_inr");
   }
+  const label = updates.label === undefined ? current.label : normalizeReceivableLabel(updates.label);
   const derivedStatus: ReceivableStatus =
     updates.status === "written_off"
       ? "written_off"
+      : updates.status === undefined && updates.received_inr === undefined
+      ? current.status
       : received === 0
       ? "pending"
       : received >= current.amount_inr
@@ -1094,6 +1104,7 @@ export function updateReceivable(
       : "partial";
   db.prepare(
     `UPDATE receivables SET
+      label = @label,
       received_inr = @received_inr,
       status = @status,
       expected_at = @expected_at,
@@ -1102,12 +1113,20 @@ export function updateReceivable(
      WHERE id = @id`
   ).run({
     id,
+    label,
     received_inr: received,
     status: derivedStatus,
     expected_at: updates.expected_at === undefined ? current.expected_at : updates.expected_at,
     notes: updates.notes === undefined ? current.notes : updates.notes,
   });
   return db.prepare("SELECT * FROM receivables WHERE id = ?").get(id) as Receivable;
+}
+
+function normalizeReceivableLabel(label: string): string {
+  if (typeof label !== "string" || !label.trim()) {
+    throw new Error("label must be a non-empty string");
+  }
+  return label.trim();
 }
 
 export function listReceivables(
