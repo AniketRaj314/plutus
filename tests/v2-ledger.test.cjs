@@ -2758,6 +2758,81 @@ test("receivables support pending, partial, and received states", () => {
   db.close();
 });
 
+test("receivable labels can be corrected without changing unrelated fields", async () => {
+  const db = makeDb();
+  const entry = createEnvelopeEntry(db, {
+    funding_month: "2026-10",
+    treatment: "reimbursable",
+    personal_impact: 0,
+    cashflow_impact: 2360,
+    receivable_amount: 2360,
+    created_by: "codex",
+  });
+  const original = createReceivable(db, {
+    envelope_entry_id: entry.id,
+    counterparty: "Devfolio",
+    label: "  Kaha Mind reimbursement, 25 Aug 2026  ",
+    amount_inr: 2360,
+    expected_at: "2026-10-15",
+    notes: "Employer wellness reimbursement",
+    created_by: "codex",
+  });
+  assert.equal(original.label, "Kaha Mind reimbursement, 25 Aug 2026");
+
+  const labelOnly = await findTool("update_receivable").handler(db, {
+    id: original.id,
+    label: "  Kaha Mind reimbursement, 15 Sep 2026  ",
+  });
+  assert.equal(labelOnly.label, "Kaha Mind reimbursement, 15 Sep 2026");
+  for (const field of [
+    "envelope_entry_id",
+    "counterparty",
+    "amount_inr",
+    "received_inr",
+    "status",
+    "expected_at",
+    "notes",
+    "created_by",
+    "created_at",
+  ]) {
+    assert.equal(labelOnly[field], original[field], `${field} should remain unchanged`);
+  }
+
+  const combined = updateReceivable(db, original.id, {
+    label: "Kaha Mind reimbursement, September 2026",
+    received_inr: 1000,
+  });
+  assert.equal(combined.label, "Kaha Mind reimbursement, September 2026");
+  assert.equal(combined.received_inr, 1000);
+  assert.equal(combined.status, "partial");
+  assert.equal(combined.counterparty, "Devfolio");
+  assert.equal(combined.amount_inr, 2360);
+
+  assert.throws(
+    () => updateReceivable(db, original.id, { label: "   " }),
+    /label must be a non-empty string/
+  );
+  assert.equal(listReceivables(db, { include_closed: true })[0].label, "Kaha Mind reimbursement, September 2026");
+
+  const writtenOff = updateReceivable(db, original.id, { status: "written_off" });
+  assert.equal(writtenOff.status, "written_off");
+  const relabeledWrittenOff = updateReceivable(db, original.id, { label: "Archived Kaha Mind reimbursement" });
+  assert.equal(relabeledWrittenOff.status, "written_off");
+  assert.equal(relabeledWrittenOff.received_inr, 1000);
+
+  assert.throws(
+    () =>
+      createReceivable(db, {
+        counterparty: "Devfolio",
+        label: "\t",
+        amount_inr: 100,
+        created_by: "codex",
+      }),
+    /label must be a non-empty string/
+  );
+  db.close();
+});
+
 test("correcting an interpretation preserves and reattributes its open receivable", () => {
   const db = makeDb();
   const original = createEnvelopeEntry(db, {
@@ -4469,10 +4544,12 @@ test("all v2 MCP tools are registered for external agents", () => {
     findTool("create_raw_transaction").parameters.properties.source.enum.includes("manual"),
     true
   );
+  assert.equal(findTool("update_receivable").parameters.properties.label.type, "string");
 });
 
 test("production MCP surface exposes v2 finance tools and no legacy envelope mutators", () => {
-  const names = buildMcpToolSpecs().map((spec) => spec.name);
+  const specs = buildMcpToolSpecs();
+  const names = specs.map((spec) => spec.name);
   assert.equal(names.includes("create_telegram_contributor_invite"), true);
   assert.equal(names.includes("list_telegram_contributors"), true);
   assert.equal(names.includes("revoke_telegram_contributor"), true);
@@ -4490,6 +4567,8 @@ test("production MCP surface exposes v2 finance tools and no legacy envelope mut
   assert.equal(names.includes("get_envelope"), false);
   assert.equal(names.includes("recalculate_envelope"), false);
   assert.equal(names.includes("create_transaction"), false);
+  const updateReceivableSpec = specs.find((spec) => spec.name === "update_receivable");
+  assert.equal(updateReceivableSpec.inputSchema.properties.label.type, "string");
 });
 
 test("health metadata reads the deployed package version", () => {

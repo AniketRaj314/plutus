@@ -817,11 +817,12 @@ export const v2Tools: V2ToolDefinition[] = [
   },
   {
     name: "update_receivable",
-    description: "Record partial/full receipt, write-off, expected date, or notes for money owed back.",
+    description: "Correct the label or record partial/full receipt, write-off, expected date, or notes for money owed back.",
     parameters: {
       type: "object",
       properties: {
         id: { type: "string" },
+        label: { type: "string" },
         received_inr: { type: "number" },
         status: { type: "string", enum: RECEIVABLE_STATES },
         expected_at: { type: ["string", "null"] },
@@ -831,6 +832,7 @@ export const v2Tools: V2ToolDefinition[] = [
     },
     handler: (db, args) =>
       updateReceivable(db, args.id as string, {
+        label: args.label as string | undefined,
         received_inr: args.received_inr as number | undefined,
         status: args.status as ReceivableStatus | undefined,
         expected_at: args.expected_at as string | null | undefined,
