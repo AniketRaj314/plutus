@@ -539,7 +539,9 @@ function backfillContextFacts(db: Database.Database): void {
     "processed_message_ids",
     "unparseable_gmail_message_ids",
     "last_gmail_poll",
+    "last_clean_gmail_poll",
     "gmail_parser_revision",
+    "gmail_sync_alert_state",
   ]);
   const legacy = db.prepare("SELECT key, value FROM context WHERE value IS NOT NULL").all() as Array<{
     key: string;

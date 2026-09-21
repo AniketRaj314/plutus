@@ -56,6 +56,7 @@ const { buildMcpToolSpecs, PACKAGE_VERSION, registerRoutes } = require("../src/a
 const {
   isLikelyTransactionAlert,
   getInitialCorrelationStatus,
+  GmailParserBacklogError,
   notifyPendingCreditInferences,
   pollOnce,
   processMessage,
@@ -494,6 +495,36 @@ test("AmEx parses dollar-symbol transaction alerts as pending USD transactions",
   assert.equal(parsed.merchant_raw, "Points a Plusgrade Co.");
 });
 
+test("AmEx parses Singapore-dollar transaction alerts as pending SGD transactions", () => {
+  const html = [
+    "<p>Date:</p><p>21 September 2026</p>",
+    "<p>Merchant:</p><p>iShopChangi</p>",
+    "<p>Amount:</p><p>S$173.40</p>",
+    "<p>Account Ending: 41001</p>",
+  ].join("");
+  const message = {
+    id: "amex-singapore-dollar-symbol",
+    internalDate: String(Date.parse("2026-09-21T13:16:01.000Z")),
+    payload: {
+      headers: [
+        { name: "From", value: "American Express <AmericanExpress@welcome.americanexpress.com>" },
+        { name: "Subject", value: "Your transaction update" },
+      ],
+      mimeType: "text/html",
+      body: { data: Buffer.from(html).toString("base64url") },
+    },
+  };
+
+  const parsed = parseGmailMessage(message);
+  assert.ok(parsed);
+  assert.equal(parsed.amount, 173.4);
+  assert.equal(parsed.currency, "SGD");
+  assert.equal(parsed.amount_inr, null);
+  assert.equal(parsed.is_international, true);
+  assert.equal(parsed.notes, "pending_forex_resolution");
+  assert.equal(parsed.merchant_raw, "iShopChangi");
+});
+
 test("Gmail distinguishes ignored mail from an unparseable likely transaction alert", async () => {
   const db = makeDb();
   const unparseable = {
@@ -565,7 +596,7 @@ test("IDFC card payment confirmations clear retry state without degrading Gmail 
     },
   };
   setContext(db, "unparseable_gmail_message_ids", JSON.stringify([message.id]));
-  setContext(db, "gmail_parser_revision", "icici-credit-card-v1");
+  setContext(db, "gmail_parser_revision", "amex-sgd-v1");
   setContext(db, "last_gmail_poll", String(Date.parse("2026-08-01T19:15:00.000Z") / 1000));
   const gmail = {
     users: {
@@ -652,7 +683,12 @@ test("Gmail MCP diagnostics expose parser and storage state without returning em
   });
   setContext(db, "unparseable_gmail_message_ids", JSON.stringify(["broken-alert"]));
   setContext(db, "last_gmail_poll", String(Date.parse("2026-07-20T06:50:00.000Z") / 1000));
-  setContext(db, "gmail_sync_alert_state", JSON.stringify({ status: "healthy" }));
+  setContext(db, "last_clean_gmail_poll", String(Date.parse("2026-07-20T06:45:00.000Z") / 1000));
+  setContext(
+    db,
+    "gmail_sync_alert_state",
+    JSON.stringify({ status: "failed", incident_kind: "parser_backlog" })
+  );
 
   let listQuery = "";
   const gmail = {
@@ -675,8 +711,10 @@ test("Gmail MCP diagnostics expose parser and storage state without returning em
 
   assert.match(listQuery, /^from:\(AmericanExpress@welcome\.americanexpress\.com\) after:\d+ before:\d+$/);
   assert.equal(result.count, 3);
-  assert.equal(result.poller.last_successful_poll_at, "2026-07-20T06:50:00.000Z");
-  assert.equal(result.poller.sync_status, "healthy");
+  assert.equal(result.poller.last_successful_poll_at, "2026-07-20T06:45:00.000Z");
+  assert.equal(result.poller.last_successful_connection_at, "2026-07-20T06:50:00.000Z");
+  assert.equal(result.poller.sync_status, "parser_backlog");
+  assert.equal(result.poller.pending_unparseable_count, 1);
   const matched = result.messages.find((message) => message.message_id === "matched-alert");
   assert.equal(matched.parser_status, "matched");
   assert.equal(matched.storage_status, "ingested");
@@ -778,7 +816,7 @@ test("Gmail parser revision replay recovers a recent alert already marked proces
   assert.equal(raw.amount, 50);
   assert.equal(raw.currency, "USD");
   assert.equal(raw.is_international, 1);
-  assert.equal(getContext(db, "gmail_parser_revision").value, "icici-credit-card-v1");
+  assert.equal(getContext(db, "gmail_parser_revision").value, "amex-sgd-v1");
   db.close();
 });
 
@@ -5037,9 +5075,13 @@ test("health degrades for an enabled failed scheduler and recovers after success
   assert.equal(degradedResponse.statusCode, 503);
   const degraded = degradedResponse.json();
   assert.equal(degraded.status, "degraded");
-  assert.deepEqual(degraded.degraded_components, ["gmail_poll"]);
+  assert.deepEqual(degraded.degraded_components, ["gmail_connection_failure"]);
+  assert.equal(degraded.gmail_sync.status, "connection_failure");
+  assert.equal(degraded.gmail_sync.connection, "failed");
+  assert.equal(degraded.gmail_sync.pending_unparseable_count, 0);
   assert.equal(degraded.schedulers.gmail_poll.last_outcome, "error");
   assert.equal(degraded.schedulers.gmail_poll.last_error, "invalid_grant");
+  assert.equal(degraded.schedulers.gmail_poll.last_error_code, null);
 
   await runSchedulerCycle("gmail_poll", async () => {});
   const recoveredResponse = await app.inject({ method: "GET", url: "/health" });
@@ -5047,8 +5089,53 @@ test("health degrades for an enabled failed scheduler and recovers after success
   const recovered = recoveredResponse.json();
   assert.equal(recovered.status, "ok");
   assert.deepEqual(recovered.degraded_components, []);
+  assert.equal(recovered.gmail_sync.status, "healthy");
+  assert.equal(recovered.gmail_sync.connection, "healthy");
   assert.equal(recovered.schedulers.gmail_poll.last_outcome, "success");
   assert.equal(recovered.schedulers.gmail_poll.last_error, null);
+
+  await app.close();
+  db.close();
+  resetSchedulerHealthForTests();
+});
+
+test("health distinguishes a Gmail parser backlog from a connection failure", async () => {
+  resetSchedulerHealthForTests();
+  configureScheduler("gmail_poll", { label: "Gmail", interval_minutes: 5, enabled: true });
+  const db = makeDb();
+  setContext(db, "unparseable_gmail_message_ids", JSON.stringify(["pending-amex"]));
+  setContext(db, "last_gmail_poll", String(Date.parse("2026-09-21T13:20:00.000Z") / 1000));
+  setContext(db, "last_clean_gmail_poll", String(Date.parse("2026-09-21T13:15:00.000Z") / 1000));
+  await runSchedulerCycle("gmail_poll", async () => {
+    throw new GmailParserBacklogError([
+      {
+        message_id: "pending-amex",
+        provider: "AmEx",
+        subject: "Your transaction update",
+        received_at: "2026-09-21T13:16:01.000Z",
+      },
+    ]);
+  });
+
+  const app = require("fastify")();
+  registerRoutes(app, db);
+  const response = await app.inject({ method: "GET", url: "/health" });
+  assert.equal(response.statusCode, 503);
+  const health = response.json();
+  assert.deepEqual(health.degraded_components, ["gmail_parser_backlog"]);
+  assert.equal(health.gmail_sync.status, "parser_backlog");
+  assert.equal(health.gmail_sync.connection, "healthy");
+  assert.equal(health.gmail_sync.pending_unparseable_count, 1);
+  assert.equal(health.gmail_sync.last_successful_connection_at, "2026-09-21T13:20:00.000Z");
+  assert.equal(health.gmail_sync.last_successful_processing_at, "2026-09-21T13:15:00.000Z");
+  assert.equal(health.schedulers.gmail_poll.last_outcome, "degraded");
+  assert.equal(health.schedulers.gmail_poll.last_error_code, "gmail_parser_backlog");
+
+  setContext(db, "unparseable_gmail_message_ids", JSON.stringify([]));
+  await runSchedulerCycle("gmail_poll", async () => {});
+  const recovered = await app.inject({ method: "GET", url: "/health" });
+  assert.equal(recovered.statusCode, 200);
+  assert.equal(recovered.json().gmail_sync.status, "healthy");
 
   await app.close();
   db.close();
@@ -5096,6 +5183,53 @@ test("Gmail poll failures and recovery send one operational Telegram alert each"
   assert.equal(messages.length, 3);
   assert.match(messages[2], /gmail\.readonly/);
   db.close();
+});
+
+test("Gmail parser backlogs send a specific alert and matching recovery", async () => {
+  const originalPollInterval = process.env.POLL_INTERVAL_MINS;
+  process.env.POLL_INTERVAL_MINS = "5";
+  const db = makeDb();
+  const messages = [];
+  const sendTelegram = async (message) => {
+    messages.push(message);
+    return messages.length;
+  };
+  const parserError = new GmailParserBacklogError([
+    {
+      message_id: "amex-sgd-alert",
+      provider: "AmEx",
+      subject: "Your transaction update",
+      received_at: "2026-09-21T13:16:01.000Z",
+    },
+  ]);
+  const failPoll = async () => {
+    throw parserError;
+  };
+
+  await assert.rejects(runGmailPollCycle(db, { poll: failPoll, sendTelegram }), /remain unparseable/);
+  await assert.rejects(runGmailPollCycle(db, { poll: failPoll, sendTelegram }), /remain unparseable/);
+  assert.equal(messages.length, 1);
+  assert.match(messages[0], /1 transaction email could not be parsed/);
+  assert.match(messages[0], /Gmail is connected and other emails continue syncing/);
+  assert.match(messages[0], /Provider: AmEx/);
+  assert.match(messages[0], /Subject: Your transaction update/);
+  assert.match(messages[0], /Received: 21 Sept, 6:46 pm IST/i);
+  assert.match(messages[0], /Not recorded yet, retrying every 5 minutes/);
+  assert.doesNotMatch(messages[0], /sync is down/);
+  const failedState = JSON.parse(getContext(db, "gmail_sync_alert_state").value);
+  assert.equal(failedState.status, "failed");
+  assert.equal(failedState.incident_kind, "parser_backlog");
+  assert.equal(failedState.pending_count, 1);
+
+  await runGmailPollCycle(db, { poll: async () => {}, sendTelegram });
+  await runGmailPollCycle(db, { poll: async () => {}, sendTelegram });
+  assert.equal(messages.length, 2);
+  assert.match(messages[1], /Gmail parser backlog cleared/);
+  assert.match(messages[1], /pending AmEx transaction email was processed successfully/);
+  assert.equal(JSON.parse(getContext(db, "gmail_sync_alert_state").value).status, "healthy");
+  db.close();
+  if (originalPollInterval === undefined) delete process.env.POLL_INTERVAL_MINS;
+  else process.env.POLL_INTERVAL_MINS = originalPollInterval;
 });
 
 test("Violet is required to query raw storage for recent transaction questions", () => {

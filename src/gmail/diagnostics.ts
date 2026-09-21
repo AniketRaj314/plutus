@@ -70,7 +70,9 @@ export interface SearchTransactionEmailsResult {
   messages: TransactionEmailDiagnostic[];
   poller: {
     last_successful_poll_at: string | null;
-    sync_status: "healthy" | "failed" | "unknown";
+    last_successful_connection_at: string | null;
+    sync_status: "healthy" | "parser_backlog" | "connection_failure" | "unknown";
+    pending_unparseable_count: number;
   };
   privacy: string;
 }
@@ -123,23 +125,40 @@ function parseStringSet(db: Database.Database, key: string): Set<string> {
 }
 
 function getPollerState(db: Database.Database): SearchTransactionEmailsResult["poller"] {
-  const lastPollSeconds = Number(getContext(db, "last_gmail_poll")?.value);
-  let syncStatus: "healthy" | "failed" | "unknown" = "unknown";
+  const lastConnectionSeconds = Number(getContext(db, "last_gmail_poll")?.value);
+  const lastCleanPollSeconds = Number(getContext(db, "last_clean_gmail_poll")?.value);
+  const pendingUnparseableCount = parseStringSet(db, "unparseable_gmail_message_ids").size;
+  let syncStatus: SearchTransactionEmailsResult["poller"]["sync_status"] = "unknown";
   const syncValue = getContext(db, "gmail_sync_alert_state")?.value;
   if (syncValue) {
     try {
-      const parsed = JSON.parse(syncValue) as { status?: unknown };
-      if (parsed.status === "healthy" || parsed.status === "failed") syncStatus = parsed.status;
+      const parsed = JSON.parse(syncValue) as { status?: unknown; incident_kind?: unknown };
+      if (parsed.status === "healthy") syncStatus = "healthy";
+      else if (parsed.status === "failed") {
+        syncStatus =
+          parsed.incident_kind === "parser_backlog" ||
+          (parsed.incident_kind === undefined && pendingUnparseableCount > 0)
+            ? "parser_backlog"
+            : "connection_failure";
+      }
     } catch {
       syncStatus = "unknown";
     }
   }
+  if (syncStatus !== "connection_failure" && pendingUnparseableCount > 0) {
+    syncStatus = "parser_backlog";
+  }
   return {
     last_successful_poll_at:
-      Number.isFinite(lastPollSeconds) && lastPollSeconds > 0
-        ? new Date(lastPollSeconds * 1000).toISOString()
+      Number.isFinite(lastCleanPollSeconds) && lastCleanPollSeconds > 0
+        ? new Date(lastCleanPollSeconds * 1000).toISOString()
+        : null,
+    last_successful_connection_at:
+      Number.isFinite(lastConnectionSeconds) && lastConnectionSeconds > 0
+        ? new Date(lastConnectionSeconds * 1000).toISOString()
         : null,
     sync_status: syncStatus,
+    pending_unparseable_count: pendingUnparseableCount,
   };
 }
 
