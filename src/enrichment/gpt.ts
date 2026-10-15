@@ -98,7 +98,8 @@ export async function enrichTransaction(db: Database.Database, transaction: Tran
 
     const openai = getClient();
     const completion = await openai.chat.completions.create({
-      model: "gpt-4o",
+      model: process.env.INFERENCE_MODEL || "gpt-6-luna",
+      reasoning_effort: "none",
       temperature: 0,
       response_format: { type: "json_object" },
       messages: [

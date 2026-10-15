@@ -29,7 +29,7 @@ import {
   runSchedulerCycle,
 } from "../scheduler/status";
 
-const MODEL = process.env.INFERENCE_MODEL || "gpt-4o";
+const MODEL = process.env.INFERENCE_MODEL || "gpt-6-luna";
 const DEFAULT_MIN_CONFIDENCE = 0.75;
 
 export interface InferenceReceivableProposal {
@@ -287,6 +287,7 @@ export async function generateInferenceWithOpenAI(
   const openai = getClient();
   const completion = await openai.chat.completions.create({
     model: MODEL,
+    reasoning_effort: "none",
     temperature: 0,
     response_format: { type: "json_object" },
     messages: [

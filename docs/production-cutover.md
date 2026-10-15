@@ -18,7 +18,7 @@ Suggested inference settings:
 AUTO_INFERENCE_ENABLED=false
 AUTO_INFERENCE_INTERVAL_MINS=5
 AUTO_INFERENCE_MIN_CONFIDENCE=0.75
-INFERENCE_MODEL=gpt-4o
+INFERENCE_MODEL=gpt-6-luna
 ```
 
 Violet's owner and contributor conversations default to the flagship model at
