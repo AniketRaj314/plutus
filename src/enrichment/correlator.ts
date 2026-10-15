@@ -526,7 +526,8 @@ of: ${CATEGORIES.join(", ")}.`;
 
   try {
     const completion = await getClient().chat.completions.create({
-      model: process.env.RECEIPT_INFERENCE_MODEL || process.env.INFERENCE_MODEL || "gpt-4o",
+      model: process.env.RECEIPT_INFERENCE_MODEL || process.env.INFERENCE_MODEL || "gpt-6-luna",
+      reasoning_effort: "none",
       temperature: 0,
       response_format: { type: "json_object" },
       messages: [
