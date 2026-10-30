@@ -18,11 +18,13 @@ export class DeliveryError extends Error {
 export type SendPaymentMessage = (
   chatId: string,
   message: string,
+  options?: { thread_id?: number; reply_to_message_id?: number },
 ) => Promise<number>;
 
 export const sendPaymentMessage: SendPaymentMessage = async (
   chatId,
   message,
+  options = {},
 ) => {
   const token = process.env.TELEGRAM_BOT_TOKEN;
   if (!token) throw new DeliveryError("bot_not_configured", "failed");
@@ -37,6 +39,13 @@ export const sendPaymentMessage: SendPaymentMessage = async (
       signal: AbortSignal.timeout(20000),
       body: JSON.stringify({
         chat_id: chatId,
+        message_thread_id: options.thread_id,
+        reply_parameters: options.reply_to_message_id
+          ? {
+              message_id: options.reply_to_message_id,
+              allow_sending_without_reply: true,
+            }
+          : undefined,
         text: chunks[0],
         parse_mode: "HTML",
         link_preview_options: { is_disabled: true },
@@ -208,5 +217,22 @@ export function paymentDeliveryHealth(db: Database.Database) {
         "SELECT status,COUNT(*) AS count FROM payment_requests GROUP BY status",
       )
       .all(),
+    conversation_events: db
+      .prepare(
+        "SELECT status,COUNT(*) AS count FROM payment_chat_events GROUP BY status",
+      )
+      .all(),
+    conversation_delivery: db
+      .prepare(
+        "SELECT kind,status,COUNT(*) AS count FROM payment_chat_outbox GROUP BY kind,status",
+      )
+      .all(),
+    awaiting_owner: (
+      db
+        .prepare(
+          "SELECT COUNT(*) AS count FROM payment_chat_events WHERE review_status='pending_owner'",
+        )
+        .get() as { count: number }
+    ).count,
   };
 }

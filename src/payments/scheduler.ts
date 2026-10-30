@@ -2,6 +2,8 @@ import cron from "node-cron";
 import type Database from "better-sqlite3";
 import { configureScheduler, runSchedulerCycle } from "../scheduler/status";
 import { deliverPaymentRequests } from "./delivery";
+import { deliverChatMessages } from "./chat-delivery";
+import { processRecipientConversations } from "./replies";
 
 export function startPaymentRequestDelivery(db: Database.Database): void {
   // Recovery still runs with delivery disabled, but never makes a network call.
@@ -14,6 +16,8 @@ export function startPaymentRequestDelivery(db: Database.Database): void {
     runSchedulerCycle("payment_requests", async () => {
       try {
         await deliverPaymentRequests(db);
+        await processRecipientConversations(db);
+        await deliverChatMessages(db);
       } catch {
         throw new Error(
           "Payment outbox processing failed; inspect persisted request status",

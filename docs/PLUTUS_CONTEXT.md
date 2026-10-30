@@ -30,3 +30,24 @@ receivables. See [v2 ledger](v2-ledger.md) for the financial model.
 
 Implementation on a branch is not evidence of deployment. Do not enable delivery
 or send a live canary without the separately authorized rollout action.
+
+## Bill conversations (approved October 30, 2026)
+
+- Recipient chats remember a selected sent request. Unthreaded follow-ups use that
+  context for up to 24 hours; ambiguous bills require a short choice. `/splits`
+  selects another request. Contributors can return to their broader tab with `/tab`.
+- Explain amounts only on request, from confirmed, recipient-specific bill
+  explanations. Owner discussions are private source material, linked by exact
+  bill identity, never loaded into the recipient assistant. Tentative/private
+  notes and other contacts' explanations are excluded. Historical chat import
+  requires an exact transaction marker; missing context must not be invented.
+- Notify Aniket for disputes, payment claims, unresolved questions and explicit
+  relay requests. Routine supported answers and small talk do not notify him.
+  Acknowledgements reflect actual delivery, not just database persistence.
+- Owner notification replies carry the bill reference. Discussing/correcting a
+  bill stays private. An explicit request to tell the recipient authorizes a
+  tracked reply. Reviewing a concern never settles debt.
+- The conversational inbox and outbox survive restarts and deduplicate updates.
+  Only explicit owner approval permits retry of uncertain Telegram outcomes.
+  The existing delivery gate covers these messages. No historic replies are
+  replayed as notifications during migration.
