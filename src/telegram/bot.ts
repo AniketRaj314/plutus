@@ -11,7 +11,10 @@ import {
   claimTelegramContributorInvite,
   getTelegramRecipient,
 } from "./access";
-import { handleRecipientMessage, isPaymentReply } from "../payments/replies";
+import { handleRecipientMessage, isPaymentReply, activePaymentConversation, processRecipientConversations } from "../payments/replies";
+import { ownerReplyRequest } from "../payments/chat-delivery";
+import type { AnswerRecipient } from "../payments/recipient-agent";
+import type { SendPaymentMessage } from "../payments/delivery";
 import { agentErrorLogLine, recordAgentError } from "../agent/diagnostics";
 import { renderTelegramChunks, telegramHtmlToPlainText } from "./render";
 import {
@@ -327,6 +330,8 @@ interface TelegramHandlerDependencies {
   sendOwnerMessage?: typeof sendMessage;
   sendTyping?: typeof sendTypingActionToChat;
   loadImages?: (message: TelegramIncomingMessage) => Promise<AgentImageInput[]>;
+  answerRecipient?: AnswerRecipient;
+  sendConversationMessage?: SendPaymentMessage;
 }
 
 function contributorAuditMessage(receipt: ContributorAgentResult["recorded_purchases"][number]): string {
@@ -396,6 +401,14 @@ export async function handleTelegramUpdate(
 
   const actor = resolveTelegramActor(db, message);
   if (!actor) {
+    if (/^\/start(?:@[A-Za-z0-9_]+)?\s*$/i.test(message.text ?? "") &&
+        message.chat.type === "private" && message.from && !message.from.is_bot &&
+        String(message.chat.id) === String(message.from.id) && getTelegramAccessStatus().valid) {
+      await (dependencies.sendToIncomingChat ?? sendMessageToChat)(message.chat.id,
+        "Hi, I'm Violet, Aniket's assistant. Ask Aniket for your personal Start Violet invitation link to connect your split requests. Starting this chat alone doesn't link you to any financial records.",
+        { reply_to_message_id: message.message_id });
+      return;
+    }
     console.warn(
       `[telegram] ignored unauthorized message update_id=${update.update_id} sender=${String(message.from?.id ?? "missing")}`
     );
@@ -407,15 +420,21 @@ export async function handleTelegramUpdate(
     message.caption?.trim() ||
     "Please examine this image and help me with anything financially relevant. If the context is ambiguous, ask one concise question.";
 
+  if (actor.role === "contributor" && /^\/tab$/i.test(userMessage)) {
+    db.prepare("DELETE FROM payment_chat_sessions WHERE contact_id=?").run(actor.contact_id);
+  }
+
   if (actor.role !== "owner" && (actor.role === "recipient" ||
-      /^\/(?:stop|stop_requests|resume_requests)$/i.test(userMessage) ||
+      /^\/(?:stop|stop_requests|resume_requests|splits)$/i.test(userMessage) ||
+      activePaymentConversation(db, actor.contact_id) ||
       isPaymentReply(db, actor.contact_id, message.reply_to_message?.message_id))) {
     const result = handleRecipientMessage(db, {
       user_id:actor.telegram_user_id, chat_id:String(message.chat.id), message_id:message.message_id,
       text:message.text ?? message.caption ?? "[Attachment received; please describe the payment or question in text.]",
       reply_to_message_id:message.reply_to_message?.message_id,
     });
-    if (!result.duplicate) await (dependencies.sendToIncomingChat ?? sendMessageToChat)(message.chat.id,result.text,{reply_to_message_id:message.message_id});
+    if (result.text && !result.duplicate) await (dependencies.sendToIncomingChat ?? sendMessageToChat)(message.chat.id,result.text,{reply_to_message_id:message.message_id});
+    if (result.event_id) await processRecipientConversations(db, { answer: dependencies.answerRecipient, send: dependencies.sendConversationMessage });
     return;
   }
 
@@ -470,6 +489,7 @@ export async function handleTelegramUpdate(
         interface: "telegram",
         owner_context: { role:"owner", actor:`telegram:${actor.telegram_user_id}`, source:"telegram", request_id:String(update.update_id) },
         replied_to_transaction_id: linkedTransactionId,
+        replied_to_payment_request_id: ownerReplyRequest(db, String(message.chat.id), message.message_thread_id, message.reply_to_message?.message_id),
         images,
       });
     } else {

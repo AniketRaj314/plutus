@@ -13,6 +13,9 @@ export interface OwnerContext {
   actor: string;
   source: "telegram" | "api" | "mcp";
   request_id: string;
+  // Trusted turn-local scope, populated by the owner agent and Telegram routing.
+  bill_ids?: string[];
+  owner_message_id?: number;
 }
 
 export function requireOwner(context?: OwnerContext): OwnerContext {
@@ -69,6 +72,7 @@ export interface RequestInput {
 export interface MessageFacts {
   name: string;
   context: string;
+  summary?: string;
   amount_paise: number;
   basis: RequestBasis;
   upi: string;
@@ -379,6 +383,14 @@ export async function preparePaymentBatch(
       const message = await compose({
         name: snapshot.contact.name,
         context: input.context,
+        summary:
+          input.context.length <= 140
+            ? input.context
+            : snapshot.basis === "split"
+              ? [...new Set(snapshot.selected.map((row) => row.label))]
+                  .join(", ")
+                  .slice(0, 140)
+              : "your shared tab with Aniket",
         amount_paise: snapshot.amount_paise,
         basis: snapshot.basis,
         upi: snapshot.upi,

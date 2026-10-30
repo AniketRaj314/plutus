@@ -164,3 +164,87 @@ mocked model responses, and mocked Telegram transport. Coverage includes legacy
 migration, aliases, private claims, role layering/revocation, restricted replies,
 no implicit settlement, stale snapshots, overlapping obligations, partial
 failure, rate limiting, duplicate commands, opt-out, and crash recovery.
+
+## Conversational replies (1.15.0)
+
+Recipients can ask about a sent request and then continue without using Telegram
+Reply each time. A session lasts 24 hours. If several requests could apply,
+Violet lists short choices and retains the original question while the recipient
+chooses. A new request makes an older active selection ambiguous. `/splits`
+switches requests; contributors use `/tab` to leave the bill conversation and
+access their existing bilateral tools. A plain `/start` from an unlinked private
+user explains that they need Aniket's personal invitation, without granting access.
+
+The recipient assistant has no tools and never loads owner/contributor history
+or a full financial snapshot. Its input contains the recipient's sent request,
+their conversation, explicitly relayed owner answers, current shareable bill
+explanations, and a change marker. It explains item allocations, discounts,
+fees and credits only when asked. Missing evidence goes to the owner. A sent
+amount is historical, not a fresh balance. Changed financial evidence invalidates
+explanations and requires owner review, rather than silently editing a request.
+
+### Owner discussion and privacy
+
+`get_bill_conversation_context` resolves a raw transaction, interpretation,
+receivable or payment request to stable bill identities. It joins the receipt
+facts, interpretations, receivables and linked owner discussion. Telegram replies
+to transaction notices and recipient alerts attach the owner turn automatically.
+For ordinary follow-ups, the owner agent selects the exact reference with this
+tool. This lets it retain relevant discussion outside its recent-chat window.
+Historic owner messages are imported only with an exact transaction marker and
+their immediately following assistant response. Unlinked old chats are not
+guessed from merchant/person names.
+
+The owner agent uses `save_bill_explanation` to publish a concise explanation for
+each relevant contact after decisions are confirmed. It records source message
+IDs and the financial revision. `tentative` and `private` explanations remain
+owner-only. The recipient model receives only the confirmed explanation for its
+own contact at the current revision. Raw owner conversation, receipt payloads and
+the rest of the bilateral ledger do not cross that boundary. This is an AI-curated
+projection, so review the explanation when resolving an ambiguous allocation.
+Existing requests still work using their originally authorized context; richer
+historical calculations need a linked discussion and a confirmed explanation.
+
+### Notification and reply loop
+
+New recipient events are persisted before model work. The classifier distinguishes
+supported answers/small talk from disputes, payment claims, unresolved questions
+and requests to tell Aniket something. Actionable messages enqueue an owner alert
+with the person, bill and their words. The recipient is told "notified" only after
+Telegram accepts that alert. Queued, failed and uncertain outcomes are described
+honestly. AI failures also escalate the saved question, rather than losing it.
+
+Aniket replies to the alert to discuss the bill privately, or says "Tell them:
+..." to authorize a relay through `reply_to_split_recipient`. The agent reports
+the actual delivery status. `list_split_conversations` exposes recipient messages,
+pending reviews and deliveries. `resolve_split_conversation` marks a concern
+reviewed; it never records a repayment or changes a balance. `manage_split_message`
+cancels queued messages or retries failed/uncertain sends after explicit approval.
+An uncertain retry can duplicate a message, so it is never automatic.
+
+The same one-minute worker handles the durable conversational inbox and outbox.
+HTTP retries, duplicate updates and concurrent ticks do not duplicate committed
+responses. Interrupted sends become uncertain. Only known Telegram rate limits
+retry automatically, at most five attempts. Identity, role and opt-out changes
+are checked during model work and before recipient delivery. In-flight network
+requests cannot be recalled. After an opt-out, already queued recipient messages
+remain cancelled even if the recipient resumes. Owner alerts retain the original
+review evidence. Old `payment_replies` can be read as conversation history but
+are not replayed as alerts by migration.
+
+`/health.payment_requests` adds conversation event/delivery counts and the number
+awaiting owner review, without message content. Use the owner tools to inspect
+failed or uncertain deliveries. Retry failed processing by investigating its
+fixed status and restoring the relevant dependency; do not delete event/outbox
+rows to force a resend. Keep the database when rolling back. Version 1.14.1 will
+ignore the new queues and lose the improved interaction until a forward deploy.
+
+### Release verification
+
+Tests use fresh in-memory databases and mocked model/Telegram calls, including
+privacy projections, unthreaded conversation, multi-bill selection, owner reply
+routing, truthful notification failures, payment-claim isolation, permission
+changes during model work, concurrent processing, migration and recovery.
+No real recipient messages are sent by the tests or by schema migration.
+Deployment remains a separate action. Once deployed, validate a consenting test
+recipient's question, dispute and owner relay; inspect health and delivery IDs.

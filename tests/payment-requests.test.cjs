@@ -381,6 +381,16 @@ test("rendered request has exact server amount, context and inline-code UPI", as
   );
   assert.match(malicious, /₹123\.45/);
   assert.doesNotMatch(malicious, /thief|999|https:|<b>/);
+  const detailed = split(db, "Vee", 120);
+  detailed.context =
+    "District dinner: your items were allocated proportionally with shared fees and the discount. The retained calculation includes the original subtotal, taxes, platform fee, and the discount credit for explanation when requested.";
+  const shortRequest = await draft(db, detailed);
+  assert.match(shortRequest.message, /District Dining/);
+  assert.doesNotMatch(
+    shortRequest.message,
+    /retained calculation|original subtotal/,
+  );
+  assert.equal(shortRequest.context, detailed.context);
 });
 
 test("disabled delivery does nothing, then one authorized send survives duplicate commands", async (t) => {
