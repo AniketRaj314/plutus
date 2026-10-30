@@ -1,5 +1,6 @@
 import type Database from "better-sqlite3";
 import { newId } from "./schema";
+import { ensureContact, counterpartyKey as contactKey } from "../contacts/store";
 import { getSalaryFundingMonthForDate } from "../envelope/engine";
 
 export type EnvelopeEntryState = "forecast" | "actual" | "settled" | "cancelled";
@@ -971,7 +972,18 @@ export function setContextFact(
   assertConfidence(input.confidence);
   const scopeId = input.scope_id ?? "";
   const operation = db.transaction(() => {
-    const existing = db
+    if (input.scope_type === "person" && scopeId.trim()) ensureContact(db, scopeId);
+    if (["counterparty_transfer", "credit_allocation"].includes(input.key)) {
+      let counterparty: unknown;
+      try { counterparty = JSON.parse(input.value).counterparty; } catch { /* Preserve non-JSON evidence. */ }
+      if (typeof counterparty !== "string" && input.scope_type === "transaction") {
+        counterparty = getRawTransaction(db, scopeId)?.merchant_raw;
+      }
+      if (typeof counterparty === "string" && counterparty.trim()) ensureContact(db, counterparty);
+    }
+    const existing = input.scope_type === "person"
+      ? listContextFacts(db, {scope_type:"person",scope_id:scopeId,key:input.key})[0]
+      : db
       .prepare(
         `SELECT * FROM context_facts
          WHERE scope_type = ? AND scope_id = ? AND key = ? AND superseded_at IS NULL`
@@ -992,7 +1004,7 @@ export function setContextFact(
     ).run({
       id,
       scope_type: input.scope_type,
-      scope_id: scopeId,
+      scope_id: existing?.scope_id ?? scopeId,
       key: input.key,
       value: input.value,
       source: input.source,
@@ -1018,7 +1030,8 @@ export function listContextFacts(
     clauses.push("scope_type = @scope_type");
     params.scope_type = filters.scope_type;
   }
-  if (filters.scope_id !== undefined) {
+  const resolvePerson = filters.scope_type === "person" && filters.scope_id !== undefined;
+  if (filters.scope_id !== undefined && !resolvePerson) {
     clauses.push("scope_id = @scope_id");
     params.scope_id = filters.scope_id;
   }
@@ -1027,7 +1040,8 @@ export function listContextFacts(
     params.key = filters.key;
   }
   const where = clauses.length ? `WHERE ${clauses.join(" AND ")}` : "";
-  return db.prepare(`SELECT * FROM context_facts ${where} ORDER BY created_at DESC`).all(params) as ContextFact[];
+  const rows = db.prepare(`SELECT * FROM context_facts ${where} ORDER BY created_at DESC`).all(params) as ContextFact[];
+  return resolvePerson ? rows.filter(row => contactKey(db,row.scope_id) === contactKey(db,filters.scope_id!)) : rows;
 }
 
 export function createReceivable(
@@ -1054,15 +1068,16 @@ export function createReceivable(
   db.prepare(
     `INSERT INTO receivables (
       id, envelope_entry_id, counterparty, label, amount_inr, received_inr,
-      status, expected_at, notes, created_by
+      status, expected_at, notes, created_by, contact_id
     ) VALUES (
       @id, @envelope_entry_id, @counterparty, @label, @amount_inr, @received_inr,
-      @status, @expected_at, @notes, @created_by
+      @status, @expected_at, @notes, @created_by, @contact_id
     )`
   ).run({
     id,
     envelope_entry_id: input.envelope_entry_id ?? null,
     counterparty: input.counterparty,
+    contact_id: ensureContact(db, input.counterparty).id,
     label,
     amount_inr: input.amount_inr,
     received_inr: received,
@@ -1141,16 +1156,15 @@ export function listReceivables(
   } else if (!filters.include_closed) {
     clauses.push("status IN ('pending', 'partial')");
   }
-  if (filters.counterparty) {
-    clauses.push("counterparty = @counterparty");
-    params.counterparty = filters.counterparty;
-  }
   const where = clauses.length ? `WHERE ${clauses.join(" AND ")}` : "";
-  return db.prepare(`SELECT * FROM receivables ${where} ORDER BY created_at DESC`).all(params) as Receivable[];
+  const rows = db.prepare(`SELECT * FROM receivables ${where} ORDER BY created_at DESC`).all(params) as Receivable[];
+  return filters.counterparty
+    ? rows.filter(row => contactKey(db, row.counterparty) === contactKey(db, filters.counterparty!))
+    : rows;
 }
 
-function normalizedCounterparty(value: string | null | undefined): string {
-  return (value ?? "").trim().toLocaleLowerCase("en-IN");
+function normalizedCounterparty(db: Database.Database, value: string | null | undefined): string {
+  return contactKey(db, value ?? "");
 }
 
 function roundedMoney(value: number): number {
@@ -1219,12 +1233,12 @@ export function getCounterpartyBalance(
     throw new Error("view must be current or full");
   }
 
-  const counterpartyKey = normalizedCounterparty(counterparty);
+  const counterpartyKey = normalizedCounterparty(db, counterparty);
   const facts = listContextFacts(db);
   const personFacts = facts.filter(
     (fact) =>
       fact.scope_type === "person" &&
-      normalizedCounterparty(fact.scope_id) === counterpartyKey
+      normalizedCounterparty(db, fact.scope_id) === counterpartyKey
   );
   const view = filters.view ?? "current";
   const checkpointFact = personFacts
@@ -1270,7 +1284,7 @@ export function getCounterpartyBalance(
   const accountedRawTransactions = new Set<string>();
 
   const receivables = listReceivables(db, { include_closed: true }).filter(
-    (receivable) => normalizedCounterparty(receivable.counterparty) === counterpartyKey
+    (receivable) => normalizedCounterparty(db, receivable.counterparty) === counterpartyKey
   );
   for (const receivable of receivables) {
     if (receivable.status === "written_off" || exclusions.has(receivable.id)) continue;
@@ -1356,7 +1370,7 @@ export function getCounterpartyBalance(
     const raw = getRawTransaction(db, fact.scope_id);
     const factCounterparty =
       typeof value.counterparty === "string" ? value.counterparty : raw?.merchant_raw;
-    if (normalizedCounterparty(factCounterparty) !== counterpartyKey) continue;
+    if (normalizedCounterparty(db, factCounterparty) !== counterpartyKey) continue;
     const direction = value.direction;
     if (direction !== "from_counterparty" && direction !== "to_counterparty") continue;
     const amount = Number(value.amount_inr ?? (raw ? rawAmountInr(raw) : NaN));
@@ -1399,7 +1413,7 @@ export function getCounterpartyBalance(
     const value = parseJsonObject(fact.value);
     if (!value || value.status !== "confirmed") continue;
     const raw = getRawTransaction(db, fact.scope_id);
-    if (!raw || normalizedCounterparty(raw.merchant_raw) !== counterpartyKey) continue;
+    if (!raw || normalizedCounterparty(db, raw.merchant_raw) !== counterpartyKey) continue;
     if (rawDirectionFromEvidence(raw) !== "credit") continue;
     if (!inCounterpartyWindow(raw.occurred_at, filters)) continue;
     const amount = Number(value.amount_inr ?? rawAmountInr(raw));
@@ -1529,9 +1543,9 @@ export function createCounterpartyBalanceCheckpoint(
   if (!input.created_by.trim()) throw new Error("created_by is required");
 
   const lifetime = getCounterpartyBalance(db, input.counterparty, { view: "full" });
-  const counterpartyKey = normalizedCounterparty(input.counterparty);
+  const counterpartyKey = normalizedCounterparty(db, input.counterparty);
   const existingPersonFacts = listContextFacts(db, { scope_type: "person" }).filter(
-    (fact) => normalizedCounterparty(fact.scope_id) === counterpartyKey
+    (fact) => normalizedCounterparty(db, fact.scope_id) === counterpartyKey
   );
   const canonicalScopeId =
     existingPersonFacts.find((fact) => fact.key === "counterparty_balance_checkpoint")

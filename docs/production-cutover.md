@@ -112,8 +112,11 @@ TELEGRAM_WEBHOOK_SECRET=<existing strong random secret>
 TELEGRAM_BOT_USERNAME=<Violet's username without @; optional, for invite links>
 ```
 
-Keep BotFather privacy mode enabled. In a group, the contributor should mention
-Violet or reply to Violet; direct messages work normally. The access model is:
+Keep BotFather privacy mode enabled. Contacts and contributors must use a private
+chat with Violet. The owner can continue using the configured private topic.
+For the additive contacts/payment-request rollout, use
+[payment requests](payment-requests.md), not this historical v2 database reset.
+The access model is:
 
 - The owner can use the full financial agent only in a direct chat or the
   configured private Plutus group/topic.

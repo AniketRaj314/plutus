@@ -8,6 +8,7 @@ import { startCorrelator } from "./enrichment/correlator";
 import { startInferenceCron } from "./agent/inference";
 import { registerFrontendRoutes } from "./frontend";
 import { startSmsIngestionRetry } from "./sms/ingestion";
+import { startPaymentRequestDelivery } from "./payments/scheduler";
 
 async function main() {
   console.log("Plutus starting...");
@@ -23,6 +24,7 @@ async function main() {
   startCorrelator(db);
   startInferenceCron(db);
   startSmsIngestionRetry(db);
+  startPaymentRequestDelivery(db);
 
   const app = Fastify();
   registerFrontendRoutes(app);

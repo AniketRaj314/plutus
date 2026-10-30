@@ -14,6 +14,7 @@ import {
   type RecordContributorPurchaseResult,
 } from "../db/v2-queries";
 import { getVioletModelConfig } from "./model-config";
+import { getActiveTelegramContributor } from "../telegram/access";
 import {
   buildUserInputItem,
   persistedImageMessage,
@@ -258,6 +259,17 @@ export async function runContributorAgent(
   payload: ContributorAgentPayload,
   options: RunContributorAgentOptions = {}
 ): Promise<ContributorAgentResult> {
+  const verifyAccess = () => {
+    const current = getActiveTelegramContributor(db, payload.identity.telegram_user_id);
+    if (!current || current.private_chat_id !== payload.conversation_id) {
+      throw new Error("Active private contributor access required");
+    }
+    payload.identity = {
+      telegram_user_id: current.telegram_user_id,
+      name: current.counterparty_name,
+    };
+  };
+  verifyAccess();
   const systemPrompt = buildContributorSystemPrompt(payload.identity);
   const input: ResponseInputItem[] = [
     ...listHistory(db, payload.identity.telegram_user_id, payload.conversation_id),
@@ -286,6 +298,7 @@ export async function runContributorAgent(
     const toolCalls = response.output.filter(
       (item): item is ResponseFunctionToolCall => item.type === "function_call"
     );
+    verifyAccess();
     input.push(...(response.output as ResponseInputItem[]));
     if (toolCalls.length === 0) {
       if (needsBalanceRefresh) {
@@ -370,6 +383,7 @@ export async function runContributorAgent(
   if (!finalText) {
     finalText = "I couldn't safely finish that entry. Please send one payment with the amount, date, and what it was for.";
   }
+  verifyAccess();
   insertHistory(
     db,
     payload,

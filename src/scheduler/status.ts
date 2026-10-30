@@ -2,6 +2,7 @@ export type SchedulerName =
   | "gmail_poll"
   | "receipt_enrichment"
   | "automatic_inference"
+  | "payment_requests"
   | "sms_ingestion";
 
 interface SchedulerState {

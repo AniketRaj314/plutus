@@ -1,4 +1,7 @@
 import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
+import { randomUUID } from "node:crypto";
+import { contactTools } from "../agent/contact-tools";
+import { paymentDeliveryHealth } from "../payments/delivery";
 import type Database from "better-sqlite3";
 import { Server as McpServer } from "@modelcontextprotocol/sdk/server/index.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
@@ -194,6 +197,7 @@ export function registerRoutes(app: FastifyInstance, db: Database.Database): voi
         active_contributor_count: countActiveTelegramContributors(db),
       },
       sms_ingestion: smsIngestion,
+      payment_requests: paymentDeliveryHealth(db),
       ...schedulerHealth,
     };
   });
@@ -242,6 +246,9 @@ export function registerApiRoutes(app: FastifyInstance, db: Database.Database): 
           const response = await runAgent(db, {
             user_message: body.message,
             interface: (body.interface as "telegram" | "api") ?? "api",
+            owner_context: {
+              role: "owner", actor: "owner:api", source: "api", request_id: request.id,
+            },
           });
           return { response, timestamp: new Date().toISOString() };
         } catch (err) {
@@ -544,6 +551,7 @@ interface McpToolSpec {
 // also happens to map more directly onto tools.ts's existing JSON Schema
 // parameter definitions, so most of these are thin passthroughs.
 const MCP_TOOL_NAMES = [
+  ...contactTools.map(tool => tool.name),
   "create_telegram_contributor_invite",
   "list_telegram_contributors",
   "revoke_telegram_contributor",
@@ -591,7 +599,9 @@ export function buildMcpToolSpecs(): McpToolSpec[] {
       name: tool.name,
       description: tool.description,
       inputSchema: tool.parameters,
-      run: (db, args) => tool.handler(db, args),
+      run: (db, args) => tool.handler(db, args, {
+        role: "owner", actor: "owner:mcp", source: "mcp", request_id: randomUUID(),
+      }),
     });
   }
 
@@ -704,7 +714,13 @@ export function buildMcpToolSpecs(): McpToolSpec[] {
     },
     run: async (db, args) => {
       try {
-        return await runAgent(db, { user_message: args.message as string, interface: "api" });
+        return await runAgent(db, {
+          user_message: args.message as string,
+          interface: "api",
+          owner_context: {
+            role: "owner", actor: "owner:mcp", source: "mcp", request_id: randomUUID(),
+          },
+        });
       } catch (error) {
         const diagnostic = recordAgentError(db, {
           interface: "api",

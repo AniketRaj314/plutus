@@ -3383,6 +3383,14 @@ test("Telegram sender authorization is identity-based, dynamic, and fails closed
       ...ownerDirect,
       chat: { id: -999, type: "group" },
       from: { id: 222, first_name: "Rushil" },
+    }),
+    null
+  );
+  assert.equal(
+    resolveTelegramActor(db, {
+      ...ownerDirect,
+      chat: { id: 222, type: "private" },
+      from: { id: 222, first_name: "Rushil" },
     }).role,
     "contributor"
   );
@@ -3419,7 +3427,7 @@ test("Telegram handler keeps contributors on the bilateral path and audits the o
       update_id: 900,
       message: {
         message_id: 42,
-        chat: { id: -900, type: "group" },
+        chat: { id: 222, type: "private" },
         from: { id: 222, first_name: "Rushil" },
         text: "I paid ₹800 for Aniket's dinner today",
       },
@@ -3464,9 +3472,9 @@ test("Telegram handler keeps contributors on the bilateral path and audits the o
   assert.equal(ownerCalls, 0);
   assert.equal(contributorPayload.identity.telegram_user_id, "222");
   assert.equal(contributorPayload.identity.name, "Rushil");
-  assert.equal(contributorPayload.conversation_id, "-900");
+  assert.equal(contributorPayload.conversation_id, "222");
   assert.deepEqual(incoming[0], {
-    chatId: -900,
+    chatId: 222,
     text: "Recorded ₹800 for dinner.",
     options: { thread_id: undefined, reply_to_message_id: 42 },
   });
@@ -3574,22 +3582,23 @@ test("Telegram invite claims authorize the immutable sender identity without inv
 
 test("owner Telegram access tools create, list, and revoke dynamic contributors", async () => {
   const db = makeDb();
+  const owner = {role:"owner",actor:"test",source:"telegram",request_id:"1"};
   const created = await findTool("create_telegram_contributor_invite").handler(db, {
     contributor_name: "Calvin",
     expires_hours: 12,
-  });
+  }, owner);
   assert.equal(created.contributor_name, "Calvin");
   claimTelegramContributorInvite(db, {
     claim_token: created.claim_token,
     telegram_user_id: "555",
     owner_telegram_user_id: "111",
   });
-  const listed = await findTool("list_telegram_contributors").handler(db, {});
+  const listed = await findTool("list_telegram_contributors").handler(db, {}, owner);
   assert.deepEqual(listed.map((row) => row.contributor_name), ["Calvin"]);
   assert.equal(JSON.stringify(listed).includes("555"), false);
   const revoked = await findTool("revoke_telegram_contributor").handler(db, {
     contributor_name: "Calvin",
-  });
+  }, owner);
   assert.equal(revoked.status, "revoked");
   assert.equal(getActiveTelegramContributor(db, "555"), undefined);
   db.close();
@@ -4755,13 +4764,14 @@ test("Violet sends images to OpenAI for one turn without retaining their bytes",
 
 test("contributor Violet accepts an image while retaining only a marker in bilateral history", async () => {
   const db = makeDb();
+  authorizeTelegramContributor(db, "Rushil", "222");
   const requests = [];
   const dataUrl = "data:image/jpeg;base64,/9j/";
   const result = await runContributorAgent(
     db,
     {
       identity: { telegram_user_id: "222", name: "Rushil" },
-      conversation_id: "dm:222",
+      conversation_id: "222",
       message_id: 988,
       user_message: "This is the receipt for what I paid for Aniket.",
       images: [{ data_url: dataUrl }],
@@ -4875,6 +4885,7 @@ test("Violet discards a stale balance drafted after a balance-affecting write", 
 
 test("contributor Violet refreshes the bilateral tab after recording a purchase", async () => {
   const db = makeDb();
+  authorizeTelegramContributor(db, "Rushil", "222");
   const requests = [];
   const responses = [
     {
@@ -4909,7 +4920,7 @@ test("contributor Violet refreshes the bilateral tab after recording a purchase"
     db,
     {
       identity: { telegram_user_id: "222", name: "Rushil" },
-      conversation_id: "dm:222",
+      conversation_id: "222",
       message_id: 987,
       user_message: "I paid ₹98 for Aniket's Rapido delivery today.",
     },

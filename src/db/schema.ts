@@ -1,5 +1,7 @@
 import Database from "better-sqlite3";
 import { nanoid } from "nanoid";
+import { migrateContacts } from "../contacts/store";
+import { migratePaymentRequests } from "../payments/schema";
 
 export function getDb(path: string): Database.Database {
   return new Database(path);
@@ -459,6 +461,8 @@ export function runMigrations(db: Database.Database): void {
   backfillRawTransactions(db);
   backfillContextFacts(db);
   seedCanonicalContextFacts(db);
+  migrateContacts(db);
+  migratePaymentRequests(db);
 }
 
 function seedCreditCards(db: Database.Database): void {
