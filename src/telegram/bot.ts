@@ -9,8 +9,9 @@ import {
 } from "../agent/contributor";
 import {
   claimTelegramContributorInvite,
-  getActiveTelegramContributor,
+  getTelegramRecipient,
 } from "./access";
+import { handleRecipientMessage, isPaymentReply } from "../payments/replies";
 import { agentErrorLogLine, recordAgentError } from "../agent/diagnostics";
 import { renderTelegramChunks, telegramHtmlToPlainText } from "./render";
 import {
@@ -70,7 +71,7 @@ export interface TelegramAccessStatus {
 
 export type TelegramActor =
   | { role: "owner"; telegram_user_id: string; name: "Aniket" }
-  | { role: "contributor"; telegram_user_id: string; name: string };
+  | { role: "contributor" | "recipient"; telegram_user_id: string; name: string; contact_id: string };
 
 export function getTelegramAccessStatus(): TelegramAccessStatus {
   const ownerId = process.env.TELEGRAM_OWNER_USER_ID?.trim() ?? "";
@@ -308,12 +309,13 @@ export function resolveTelegramActor(
       : null;
   }
 
-  const contributor = getActiveTelegramContributor(db, sender);
-  if (contributor)
+  const contributor = getTelegramRecipient(db, sender);
+  if (contributor && message.chat.type === "private" && String(message.chat.id) === contributor.private_chat_id)
     return {
-      role: "contributor",
+      role: contributor.role,
       telegram_user_id: sender,
       name: contributor.counterparty_name,
+      contact_id: contributor.contact_id,
     };
   return null;
 }
@@ -362,20 +364,24 @@ export async function handleTelegramUpdate(
     const senderId = message.from?.id;
     const sendIncoming = dependencies.sendToIncomingChat ?? sendMessageToChat;
     if (senderId === undefined || message.from?.is_bot || !getTelegramAccessStatus().valid) return;
+    if (message.chat.type !== "private" || String(message.chat.id) !== String(senderId)) return;
     try {
       const claim = claimTelegramContributorInvite(db, {
         claim_token: claimToken,
         telegram_user_id: String(senderId),
         owner_telegram_user_id: process.env.TELEGRAM_OWNER_USER_ID as string,
+        username: message.from?.username,
       });
       await sendIncoming(
         message.chat.id,
-        `Access confirmed as ${claim.contributor.counterparty_name}. I can help record what you pay for Aniket and show only your shared tab with him.`,
+        claim.contributor.role === "contributor"
+          ? `Access confirmed as ${claim.contributor.counterparty_name}. You can receive payment requests, record what you pay for Aniket, and see only your shared tab with him. Use /stop_requests to pause payment requests.`
+          : `Connected as ${claim.contributor.counterparty_name}. Violet can now send you payment requests from Aniket. You can reply to a request with questions or payment updates. Use /stop_requests to pause requests.`,
         { thread_id: message.message_thread_id, reply_to_message_id: message.message_id }
       );
       if (!claim.was_existing) {
         await (dependencies.sendOwnerMessage ?? sendMessage)(
-          `🔐 ${claim.contributor.counterparty_name} accepted their Plutus invitation.\nThey can now record payments for you and view only your bilateral tab.`
+          `🔐 ${claim.contributor.counterparty_name} accepted their Plutus invitation with ${claim.contributor.role} access. No pending payment request was sent automatically.`
         );
       }
     } catch {
@@ -400,6 +406,18 @@ export async function handleTelegramUpdate(
     message.text?.trim() ||
     message.caption?.trim() ||
     "Please examine this image and help me with anything financially relevant. If the context is ambiguous, ask one concise question.";
+
+  if (actor.role !== "owner" && (actor.role === "recipient" ||
+      /^\/(?:stop|stop_requests|resume_requests)$/i.test(userMessage) ||
+      isPaymentReply(db, actor.contact_id, message.reply_to_message?.message_id))) {
+    const result = handleRecipientMessage(db, {
+      user_id:actor.telegram_user_id, chat_id:String(message.chat.id), message_id:message.message_id,
+      text:message.text ?? message.caption ?? "[Attachment received; please describe the payment or question in text.]",
+      reply_to_message_id:message.reply_to_message?.message_id,
+    });
+    if (!result.duplicate) await (dependencies.sendToIncomingChat ?? sendMessageToChat)(message.chat.id,result.text,{reply_to_message_id:message.message_id});
+    return;
+  }
 
   let images: AgentImageInput[] = [];
   if (hasImage) {
@@ -450,6 +468,7 @@ export async function handleTelegramUpdate(
       reply = await (dependencies.runOwnerAgent ?? runAgent)(db, {
         user_message: userMessage,
         interface: "telegram",
+        owner_context: { role:"owner", actor:`telegram:${actor.telegram_user_id}`, source:"telegram", request_id:String(update.update_id) },
         replied_to_transaction_id: linkedTransactionId,
         images,
       });
@@ -477,7 +496,7 @@ export async function handleTelegramUpdate(
   } catch (err) {
     const diagnostic = recordAgentError(db, {
       interface: "telegram",
-      actor_role: actor.role,
+      actor_role: actor.role === "owner" ? "owner" : "contributor",
       stage: actor.role === "owner" ? "owner_agent" : "contributor_agent",
       error: err,
     });

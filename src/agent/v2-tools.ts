@@ -51,12 +51,20 @@ import {
   listTelegramContributors,
   revokeTelegramContributor,
 } from "../telegram/access";
+import { contactTools } from "./contact-tools";
+import type { OwnerContext } from "../payments/requests";
+import { requireOwner } from "../payments/requests";
 
-interface V2ToolDefinition {
+export interface V2ToolDefinition {
   name: string;
   description: string;
   parameters: Record<string, unknown>;
-  handler: (db: Database.Database, args: Record<string, unknown>) => unknown | Promise<unknown>;
+  requiresOwner?: boolean;
+  handler: (
+    db: Database.Database,
+    args: Record<string, unknown>,
+    context?: OwnerContext
+  ) => unknown | Promise<unknown>;
 }
 
 const CARD_SOURCES = ["amex", "bobcard", "idfc_cc", "icici_cc"];
@@ -111,8 +119,10 @@ function createEntryHandler(db: Database.Database, args: Record<string, unknown>
 }
 
 export const v2Tools: V2ToolDefinition[] = [
+  ...contactTools,
   {
     name: "create_telegram_contributor_invite",
+    requiresOwner: true,
     description:
       "Owner-only access control: create a secure, one-use, expiring invitation for a named person to record purchases for Aniket and read only their own bilateral tab with him. Return the claim command/link to Aniket so he can share it privately.",
     parameters: {
@@ -126,15 +136,16 @@ export const v2Tools: V2ToolDefinition[] = [
       },
       required: ["contributor_name"],
     },
-    handler: (db, args) =>
+    handler: (db, args, context) =>
       createTelegramContributorInvite(db, {
         contributor_name: args.contributor_name as string,
         expires_hours: args.expires_hours as number | undefined,
-        created_by: "telegram_owner",
+        created_by: requireOwner(context).actor,
       }),
   },
   {
     name: "list_telegram_contributors",
+    requiresOwner: true,
     description:
       "Owner-only access control: list named Telegram contributors and their access status without exposing Telegram user IDs.",
     parameters: {
@@ -142,13 +153,16 @@ export const v2Tools: V2ToolDefinition[] = [
       properties: { include_revoked: { type: "boolean" } },
       required: [],
     },
-    handler: (db, args) =>
-      listTelegramContributors(db, {
+    handler: (db, args, context) => {
+      requireOwner(context);
+      return listTelegramContributors(db, {
         include_revoked: args.include_revoked as boolean | undefined,
-      }),
+      });
+    },
   },
   {
     name: "revoke_telegram_contributor",
+    requiresOwner: true,
     description:
       "Owner-only access control: immediately revoke a named contributor's Telegram access. This preserves their ledger history.",
     parameters: {
@@ -156,10 +170,12 @@ export const v2Tools: V2ToolDefinition[] = [
       properties: { contributor_name: { type: "string" } },
       required: ["contributor_name"],
     },
-    handler: (db, args) =>
-      revokeTelegramContributor(db, {
+    handler: (db, args, context) => {
+      requireOwner(context);
+      return revokeTelegramContributor(db, {
         contributor_name: args.contributor_name as string,
-      }),
+      });
+    },
   },
   {
     name: "create_raw_transaction",

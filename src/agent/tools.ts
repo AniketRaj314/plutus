@@ -32,6 +32,7 @@ import {
 } from "../envelope/engine";
 import { enrichTransaction } from "../enrichment/gpt";
 import { v2Tools } from "./v2-tools";
+import type { OwnerContext } from "../payments/requests";
 import { insertRawTransaction } from "../db/v2-queries";
 
 function round2(n: number): number {
@@ -42,7 +43,7 @@ export interface ToolDefinition {
   name: string;
   description: string;
   parameters: Record<string, unknown>;
-  handler: (db: Database.Database, args: Record<string, unknown>) => unknown | Promise<unknown>;
+  handler: (db: Database.Database, args: Record<string, unknown>, context?: OwnerContext) => unknown | Promise<unknown>;
 }
 
 // -- get_envelope --
