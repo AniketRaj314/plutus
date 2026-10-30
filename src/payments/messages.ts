@@ -34,7 +34,7 @@ export function renderPaymentMessage(
     minimumFractionDigits: 2,
     maximumFractionDigits: 2,
   });
-  return `Hey ${plain(facts.name)}! ${greeting}\nViolet here, helping Aniket with ${plain(facts.context)}.\n\n${facts.basis === "split" ? "Your share" : "Your current shared-tab balance payable to Aniket"}: ₹${amount}\nAniket's UPI: \`${facts.upi}\`\n\n${closing}\nReply here if you have a question or have sent the payment.`;
+  return `Hey ${plain(facts.name)}! ${greeting}\nViolet here, helping Aniket with ${plain(facts.context)}.\n\n${facts.basis === "split" ? "Your share" : "Your current shared-tab balance payable to Aniket"}: ₹${amount}\nAniket's UPI: \`${facts.upi}\` (click on the UPI ID to copy)\n\n${closing}\nReply here if you have a question or have sent the payment.`;
 }
 
 export async function composePaymentMessage(
