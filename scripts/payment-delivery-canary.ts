@@ -12,7 +12,7 @@ async function main(): Promise<void> {
     throw new Error("Configure the owner's numeric Telegram user ID");
   const messageId = await sendPaymentMessage(
     ownerId,
-    `Plutus delivery test, sent only to Aniket. No payment is requested and no ledger record was created.\n\nCopy-format check: \`${paymentDestination()}\``,
+    `Plutus delivery test, sent only to Aniket. No payment is requested and no ledger record was created.\n\nCopy-format check: \`${paymentDestination()}\` (click on the UPI ID to copy)`,
   );
   console.log(
     `Owner-only canary sent, message ID ${messageId}. Verify the inline-code UPI in Telegram.`,

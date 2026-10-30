@@ -21,7 +21,8 @@ receivables. See [v2 ledger](v2-ledger.md) for the financial model.
   standalone bilateral events, not arbitrary invoice allocations.
 - Canonical snapshots are rechecked before dispatch. Repayment ambiguity requires
   owner resolution or explicit selection of the net-balance basis. AI writes
-  warmth only; code supplies amounts and copyable UPI `9969596700@ptyes`.
+  warmth only; code supplies amounts and copyable UPI `9969596700@ptyes`, followed
+  by "(click on the UPI ID to copy)" outside the inline-code formatting.
 - Successful sends deduplicate; ambiguous outcomes require explicit review and
   retry approval. Opt-out and permission changes invalidate existing drafts.
 - Delivery is disabled by default. See [payment requests](payment-requests.md)
