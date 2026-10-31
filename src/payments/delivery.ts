@@ -54,6 +54,12 @@ export const sendPaymentMessage: SendPaymentMessage = async (
   } catch {
     throw new DeliveryError("transport_outcome_unknown", "uncertain");
   }
+  return telegramMessageResult(response);
+};
+
+export async function telegramMessageResult(
+  response: Response,
+): Promise<number> {
   let body: {
     ok?: boolean;
     error_code?: number;
@@ -78,7 +84,7 @@ export const sendPaymentMessage: SendPaymentMessage = async (
   if (body.error_code === 400 || body.error_code === 401)
     throw new DeliveryError("telegram_rejected", "failed");
   throw new DeliveryError("telegram_outcome_unknown", "uncertain");
-};
+}
 
 export async function deliverPaymentRequests(
   db: Database.Database,
@@ -212,6 +218,11 @@ export async function deliverPaymentRequests(
 export function paymentDeliveryHealth(db: Database.Database) {
   return {
     enabled: process.env.PAYMENT_REQUEST_DELIVERY_ENABLED === "true",
+    qr_delivery: db
+      .prepare(
+        "SELECT status,COUNT(*) AS count FROM payment_request_qr GROUP BY status",
+      )
+      .all(),
     counts: db
       .prepare(
         "SELECT status,COUNT(*) AS count FROM payment_requests GROUP BY status",

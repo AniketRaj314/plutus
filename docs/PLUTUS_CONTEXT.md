@@ -51,3 +51,16 @@ or send a live canary without the separately authorized rollout action.
   Only explicit owner approval permits retry of uncertain Telegram outcomes.
   The existing delivery gate covers these messages. No historic replies are
   replayed as notifications during migration.
+
+## Optional amount-prefilled QR (approved October 31, 2026)
+
+- Every newly prepared payment request retains the original amount, copyable UPI
+  ID and copy hint. An additional QR image uses the same authorized snapshot.
+  Generate the PNG locally, without sending financial details to a QR service.
+- Send the text first. Track the QR image separately so its failure never repeats
+  the text request. Replies to either message retain the same bill context.
+- Recheck amount, destination and contact permissions before dispatch. QR delivery
+  does not settle a debt. A saved image cannot be revoked; if the amount changes,
+  explicitly tell the recipient not to use the old QR and review the request.
+- Keep the UPI ID fallback for app restrictions, including gallery QR limits.
+  No automatic QR backfill for previously prepared or sent requests.

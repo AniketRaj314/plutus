@@ -248,3 +248,55 @@ changes during model work, concurrent processing, migration and recovery.
 No real recipient messages are sent by the tests or by schema migration.
 Deployment remains a separate action. Once deployed, validate a consenting test
 recipient's question, dispute and owner relay; inspect health and delivery IDs.
+
+## Optional amount-prefilled QR (1.16.0)
+
+Newly prepared requests include an additional PNG QR. The original text message
+still contains the amount and inline-code UPI ID with its copy hint. The QR is
+sent as a quiet reply to that text message, with a short caption that repeats
+the same amount and copyable UPI ID and explains scanning/saving. The text remains
+usable when an image cannot be delivered. Replies to the QR route to the same
+bill conversation, including for contributors.
+
+The PNG is generated locally using `qrcode`. It encodes a standard `upi://pay`
+URI with `pa` (the authorized UPI ID), `pn=Aniket`, the exact two-decimal `am`
+calculated from integer paise, `cu=INR`, and a generic shared-expense note. No
+recipient name, receipt items, private context, merchant registration claim,
+bank credentials or provider-generated transaction ID is embedded. Model output
+does not supply the amount or destination. A QR image is not evidence of payment.
+
+`payment_request_qr` is an additive communication table. A row is created only
+when preparing a new draft, inside the same database transaction as the request.
+It waits until the text is recorded as sent. The worker checks the original
+fingerprint, live financial facts, recipient permissions and authorization expiry
+both before and after asynchronous image generation. The existing delivery flag
+also stops QR dispatch. A change invalidates the pending QR instead of silently
+generating a different amount under old send authorization.
+
+`list_payment_requests` exposes `qr` status separately from text status, and
+`/health.payment_requests.qr_delivery` contains aggregate counts. Rate limits
+retry at the provider delay, at most five attempts. Interrupted or ambiguous
+photo sends become uncertain and never retry automatically. The owner-only
+`manage_payment_request_qr` tool can cancel an unsent image or retry a failed or
+uncertain image without resending text. Uncertain retries require explicit
+duplicate-risk approval; changed details and expired authorization block retry.
+
+Migration does not create QR rows for old drafts, queued requests or sent
+requests, and will not message existing recipients. Fresh preparation is required
+for QR support. Previously sent/downloaded QRs are static: they cannot be remotely
+revoked, made single-use, or treated as a live balance. If details change, the
+owner agent must explicitly warn against the old QR and reconcile the existing
+request before any newly authorized payment request. No automatic edit or resend
+of old messages is introduced by this feature.
+
+Compatibility: Google Pay documents a ₹2,000 maximum when selecting a QR from the
+photo gallery. Other app and bank restrictions can vary, so the copyable UPI
+fallback is always present. The local tests independently decode the generated
+PNG and mock Telegram's multipart photo transport. They do not verify a real
+UPI app accepting this personal VPA or complete a payment. After a separately
+approved deployment/test, check scan-to-prefill on the intended Android/iOS apps;
+the payer can inspect the payee and amount without authorizing a transfer.
+
+References: [UPI payment fields](https://developers.google.com/pay/india/api/android/in-app-payments),
+[Google Pay gallery payments](https://support.google.com/pay/india/answer/7296045?co=GENIE.Platform%3DiOS&hl=en),
+[Telegram sendPhoto](https://core.telegram.org/bots/api#sendphoto).

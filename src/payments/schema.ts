@@ -18,6 +18,12 @@ export function migratePaymentRequests(db: Database.Database): void {
       created_at TEXT NOT NULL
     );
     CREATE INDEX IF NOT EXISTS idx_payment_queue ON payment_requests(status,next_attempt_at);
+    CREATE TABLE IF NOT EXISTS payment_request_qr (
+      request_id TEXT PRIMARY KEY REFERENCES payment_requests(id), fingerprint TEXT NOT NULL,
+      status TEXT NOT NULL CHECK(status IN ('waiting','queued','sending','sent','failed','uncertain','stale','cancelled')),
+      attempts INTEGER NOT NULL DEFAULT 0, next_attempt_at TEXT NOT NULL, lease_until TEXT,
+      telegram_message_id INTEGER, sent_at TEXT, last_error_code TEXT
+    );
     CREATE TABLE IF NOT EXISTS payment_batch_items (
       batch_id TEXT NOT NULL REFERENCES payment_batches(id),
       request_id TEXT NOT NULL REFERENCES payment_requests(id), PRIMARY KEY(batch_id,request_id)
