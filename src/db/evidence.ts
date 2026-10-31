@@ -50,6 +50,20 @@ export function findTransactionByEvidence(
     .get(channel, externalId) as Transaction | undefined;
 }
 
+// Statement imports can have a raw ledger row without a legacy transaction.
+export function findRawTransactionIdByEvidence(
+  db: Database.Database,
+  channel: EvidenceChannel,
+  externalId: string
+): string | undefined {
+  const row = db.prepare(
+    `SELECT r.id FROM transaction_evidence e
+     JOIN raw_transactions r ON r.id = e.raw_transaction_id
+     WHERE e.channel = ? AND e.external_id = ?`
+  ).get(channel, externalId) as { id: string } | undefined;
+  return row?.id;
+}
+
 function extractUpiReference(notes: string | null | undefined): string | null {
   return notes?.match(/\bupi_ref:([A-Za-z0-9-]+)/i)?.[1] ?? null;
 }

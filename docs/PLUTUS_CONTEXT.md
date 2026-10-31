@@ -64,3 +64,20 @@ or send a live canary without the separately authorized rollout action.
   explicitly tell the recipient not to use the old QR and review the request.
 - Keep the UPI ID fallback for app restrictions, including gallery QR limits.
   No automatic QR backfill for previously prepared or sent requests.
+
+## AmEx foreign-currency alerts (approved October 31, 2026)
+
+- Accept currency codes recognised by Node 22's ICU currency catalogue and
+  explicit AmEx aliases, including RM/MYR, THB/baht and PHP/peso. The catalogue
+  comes from the runtime, so code coverage can change with Node/ICU updates.
+- Preserve original currency and amount. Foreign alerts remain pending FX
+  resolution until settled INR evidence is available. Do not infer exchange rates.
+- Preserve established Indian AmEx meanings for bare dollar and yen symbols;
+  Rs/Rs. denotes INR in this issuer format. Other ambiguous symbols need an ISO
+  code. Decimal-point amounts accept Western and Indian comma grouping;
+  unsupported or malformed amounts remain retryable, never guessed.
+- Explicit Gmail evidence links to an existing raw transaction suppress duplicate
+  ingestion even for statement-only records. Do not fuzzy-match statement charges
+  by merchant/date/amount or overwrite their settled values.
+- Before deploying this fix, reconcile the reviewed pending MYR alert to its
+  existing statement charge. See [currency rollout](amex-currency-rollout.md).

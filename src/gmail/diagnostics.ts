@@ -1,6 +1,7 @@
 import type Database from "better-sqlite3";
 import type { gmail_v1 } from "googleapis";
 import { getContext } from "../db/queries";
+import { findRawTransactionIdByEvidence } from "../db/evidence";
 import { getGmailClient } from "./auth";
 import { getGmailReceivedAt, parseGmailMessage } from "./parsers";
 import { isLikelyTransactionAlert } from "./poller";
@@ -259,8 +260,9 @@ export async function searchTransactionEmails(
     const raw = db
       .prepare("SELECT id FROM raw_transactions WHERE raw_email_id = ?")
       .get(listed.id) as { id: string } | undefined;
+    const rawId = raw?.id ?? findRawTransactionIdByEvidence(db, "gmail", listed.id);
     let storageStatus: StorageStatus;
-    if (raw) storageStatus = "ingested";
+    if (rawId) storageStatus = "ingested";
     else if (parserStatus === "ignored") storageStatus = "ignored";
     else if (unparseableIds.has(listed.id)) storageStatus = "retry_pending";
     else if (processedIds.has(listed.id)) storageStatus = "processed_without_raw";
@@ -275,7 +277,7 @@ export async function searchTransactionEmails(
       snippet: safeSnippet(message, parserStatus),
       parser_status: parserStatus,
       storage_status: storageStatus,
-      raw_transaction_id: raw?.id ?? null,
+      raw_transaction_id: rawId ?? null,
       parsed_transaction: parsed ? buildParsedSummary(parsed) : null,
     });
   }
