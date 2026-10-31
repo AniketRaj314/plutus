@@ -39,6 +39,7 @@ import {
 } from "../scheduler/status";
 import {
   findIdfcUpiCrossChannelMatch,
+  findRawTransactionIdByEvidence,
   recordTransactionEvidence,
 } from "../db/evidence";
 
@@ -528,6 +529,13 @@ export async function processMessage(
     if (!existing.merchant_clean) await enrich(db, existing);
     await finalizeTransaction(db, getTransaction(db, existing.id) ?? existing, options);
     return "recorded";
+  }
+
+  // An explicitly reconciled email is already evidence of a canonical charge.
+  // Do not infer a second expense or overwrite statement-settled FX values.
+  // Keep the direct-email recovery path above for incomplete normal ingestion.
+  if (findRawTransactionIdByEvidence(db, "gmail", parsed.raw_email_id)) {
+    return "duplicate";
   }
 
   const crossChannelMatch =
