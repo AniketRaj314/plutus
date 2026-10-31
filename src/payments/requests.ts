@@ -451,6 +451,11 @@ export async function preparePaymentBatch(
           );
         }
         db.prepare(
+          `INSERT INTO payment_request_qr(request_id,fingerprint,status,next_attempt_at) VALUES (?,?,'waiting',?)
+           ON CONFLICT(request_id) DO UPDATE SET fingerprint=excluded.fingerprint,status='waiting',attempts=0,
+             next_attempt_at=excluded.next_attempt_at,lease_until=NULL,telegram_message_id=NULL,sent_at=NULL,last_error_code=NULL`,
+        ).run(id, fingerprint, now.toISOString());
+        db.prepare(
           "INSERT INTO payment_batch_items(batch_id,request_id) VALUES (?,?)",
         ).run(batchId, id);
         auditRequest(db, id, "prepared", owner.actor, now);
@@ -494,6 +499,12 @@ export function listPaymentRequests(db: Database.Database, batchId?: string) {
     message: row.message,
     fingerprint: row.fingerprint,
     status: row.status,
+    qr:
+      db
+        .prepare(
+          "SELECT status,telegram_message_id,last_error_code FROM payment_request_qr WHERE request_id=?",
+        )
+        .get(row.id) ?? null,
     error_code: row.last_error_code,
     expires_at: row.expires_at,
     connected: Boolean(
@@ -616,6 +627,9 @@ export function changeRequestState(
         );
       db.prepare(
         "UPDATE payment_requests SET status='cancelled' WHERE id=?",
+      ).run(id);
+      db.prepare(
+        "UPDATE payment_request_qr SET status='cancelled' WHERE request_id=? AND status IN ('waiting','queued')",
       ).run(id);
     } else if (action === "retry_uncertain") {
       if (row.status !== "uncertain")

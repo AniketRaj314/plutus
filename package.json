@@ -1,6 +1,6 @@
 {
   "name": "plutus",
-  "version": "1.15.0",
+  "version": "1.16.0",
   "description": "Personal finance tracker that reads Gmail transaction alerts and communicates via Telegram",
   "main": "dist/index.js",
   "private": true,
@@ -33,6 +33,7 @@
     "node-html-parser": "^9.0.0",
     "node-telegram-bot-api": "^0.66.0",
     "openai": "^7.34.0",
+    "qrcode": "1.5.4",
     "zod": "^3.25.76"
   },
   "devDependencies": {
@@ -40,6 +41,9 @@
     "@types/node": "^20.16.10",
     "@types/node-cron": "^3.0.11",
     "@types/node-telegram-bot-api": "^0.64.7",
+    "@types/qrcode": "1.5.6",
+    "jsqr": "1.4.0",
+    "pngjs": "7.0.0",
     "ts-node-dev": "^2.0.0",
     "typescript": "^5.6.2"
   }

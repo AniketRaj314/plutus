@@ -12,6 +12,7 @@ import { composePaymentMessage } from "../payments/messages";
 import type { V2ToolDefinition } from "./v2-tools";
 import { getBillContext, saveBillExplanation } from "../payments/bill-context";
 import { relayOwnerReply } from "../payments/chat-delivery";
+import { managePaymentQr } from "../payments/qr";
 
 const text = { type: "string" };
 const object = (
@@ -29,6 +30,27 @@ const recipient = z
   .strict();
 
 export const contactTools: V2ToolDefinition[] = [
+  {
+    name: "manage_payment_request_qr",
+    requiresOwner: true,
+    description:
+      "Cancel an unsent optional QR, or retry only its failed/uncertain image delivery without resending the payment text. Retrying an uncertain QR may duplicate the image and requires Aniket's explicit duplicate-risk approval. Changed details or expired authorization block retries. Use list_payment_requests to inspect qr status. No financial changes.",
+    parameters: object(
+      {
+        request_id: text,
+        action: { type: "string", enum: ["cancel", "retry"] },
+      },
+      ["request_id", "action"],
+    ),
+    handler: (db, args, context) => {
+      const owner = requireOwner(context);
+      const input = z
+        .object({ request_id: id, action: z.enum(["cancel", "retry"]) })
+        .strict()
+        .parse(args);
+      return managePaymentQr(db, input.request_id, input.action, owner);
+    },
+  },
   {
     name: "get_bill_conversation_context",
     requiresOwner: true,

@@ -102,6 +102,17 @@ export function handleRecipientMessage(
         | undefined;
       row = requests.find((r) => r.id === linked?.request_id);
     }
+    if (!row) {
+      const linkedQr = db
+        .prepare(
+          `SELECT q.request_id FROM payment_request_qr q JOIN payment_requests p ON p.id=q.request_id
+        WHERE p.contact_id=? AND q.status='sent' AND q.telegram_message_id=?`,
+        )
+        .get(person.contact_id, input.reply_to_message_id) as
+        | { request_id: string }
+        | undefined;
+      row = requests.find((r) => r.id === linkedQr?.request_id);
+    }
   }
   const session = db
     .prepare("SELECT * FROM payment_chat_sessions WHERE contact_id=?")
@@ -200,6 +211,15 @@ export function isPaymentReply(
   messageId?: number,
 ): boolean {
   if (messageId === undefined) return false;
+  if (
+    db
+      .prepare(
+        `SELECT 1 FROM payment_request_qr q JOIN payment_requests p ON p.id=q.request_id
+    WHERE p.contact_id=? AND q.status='sent' AND q.telegram_message_id=?`,
+      )
+      .get(contactId, messageId)
+  )
+    return true;
   return Boolean(
     db
       .prepare(
