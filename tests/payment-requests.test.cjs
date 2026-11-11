@@ -368,7 +368,7 @@ test("rendered request has exact server amount, context and inline-code UPI", as
   const row = await draft(db, split(db));
   assert.match(row.message, /₹883\.71/);
   assert.match(row.message, /`9969596700@ptyes`/);
-  assert.match(row.message, /our dinner at District Dining/);
+  assert.match(row.message, /District Dining · 20 Oct 2026/);
   const malicious = renderPaymentMessage(
     {
       name: "Vee",
@@ -840,14 +840,16 @@ test("recipient gateway never runs contributor or owner agent, even for attachme
     {
       runOwnerAgent: async () => assert.fail("owner agent"),
       runContributorAgent: async () => assert.fail("contributor agent"),
-      loadImages: async () => assert.fail("image processing"),
+      loadImages: async () => [],
+      answerSplit: async () => ({route:"chat",request_id:null,reply:"I can help only with your shared expenses with Aniket.",draft_action:"status",draft:null}),
+      sendConversationMessage: async (_chat,text) => { reply=text; return 5; },
       sendToIncomingChat: async (_chat, text) => {
         reply = text;
         return 1;
       },
     },
   );
-  assert.match(reply, /no requests/);
+  assert.match(reply, /only with your shared expenses/);
   assert.equal(
     resolveTelegramActor(db, { ...message, chat: { id: -1, type: "group" } }),
     null,

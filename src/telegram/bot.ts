@@ -24,6 +24,9 @@ import {
   type TelegramPhotoSize,
 } from "./media";
 import type { AgentImageInput } from "../agent/image-input";
+import { acceptSplitMessage, processSplitInbox, SplitInputError, type AnswerSplit } from "../payments/split-conversation";
+import { activeSplit, reviewSplit } from "../payments/split-drafts";
+import { deliverSplitMessages, ownerSplitReference } from "../payments/split-outbox";
 
 const MESSAGE_MAP_KEY = "telegram_message_map";
 const PENDING_REBALANCE_KEY = "pending_rebalance_message";
@@ -269,6 +272,7 @@ export function getMessageIdForTransaction(db: Database.Database, transactionId:
 // -- incoming webhook updates --
 
 export interface TelegramIncomingMessage {
+  date?: number;
   message_id: number;
   chat: { id: number | string; type?: "private" | "group" | "supergroup" | "channel" };
   from?: {
@@ -324,6 +328,7 @@ export function resolveTelegramActor(
 }
 
 interface TelegramHandlerDependencies {
+  answerSplit?: AnswerSplit;
   runOwnerAgent?: typeof runAgent;
   runContributorAgent?: typeof runContributorAgent;
   sendToIncomingChat?: typeof sendMessageToChat;
@@ -424,10 +429,7 @@ export async function handleTelegramUpdate(
     db.prepare("DELETE FROM payment_chat_sessions WHERE contact_id=?").run(actor.contact_id);
   }
 
-  if (actor.role !== "owner" && (actor.role === "recipient" ||
-      /^\/(?:stop|stop_requests|resume_requests|splits)$/i.test(userMessage) ||
-      activePaymentConversation(db, actor.contact_id) ||
-      isPaymentReply(db, actor.contact_id, message.reply_to_message?.message_id))) {
+  if (actor.role !== "owner" && /^\/(?:stop|stop_requests|resume_requests)$/i.test(userMessage)) {
     const result = handleRecipientMessage(db, {
       user_id:actor.telegram_user_id, chat_id:String(message.chat.id), message_id:message.message_id,
       text:message.text ?? message.caption ?? "[Attachment received; please describe the payment or question in text.]",
@@ -446,6 +448,9 @@ export async function handleTelegramUpdate(
       );
     } catch (error) {
       if (!(error instanceof TelegramImageError)) throw error;
+      if (actor.role === "recipient" && message.caption && getTelegramRecipient(db,actor.telegram_user_id)?.delivery_status === "ready")
+        acceptSplitMessage(db,{userId:actor.telegram_user_id,chatId:String(message.chat.id),messageId:message.message_id,
+          text:`${message.caption}\n[Receipt download or validation failed; ask for a readable replacement.]`,sentAt:message.date});
       await (dependencies.sendToIncomingChat ?? sendMessageToChat)(
         message.chat.id,
         error.userMessage,
@@ -456,6 +461,45 @@ export async function handleTelegramUpdate(
       );
       return;
     }
+  }
+
+  if (actor.role !== "owner" && !(actor.role === "contributor" && /^\/tab$/i.test(userMessage)) && (actor.role === "recipient" ||
+      /^\/(?:splits|new_split|retry)$/i.test(userMessage) || activeSplit(db,actor.contact_id) ||
+      activePaymentConversation(db,actor.contact_id) || isPaymentReply(db,actor.contact_id,message.reply_to_message?.message_id))) {
+    const person = getTelegramRecipient(db,actor.telegram_user_id);
+    if (person?.delivery_status !== "ready") {
+      await (dependencies.sendToIncomingChat ?? sendMessageToChat)(message.chat.id,
+        "Your split chat is paused. Use /resume_requests to continue.",{reply_to_message_id:message.message_id});
+      return;
+    }
+    try {
+      acceptSplitMessage(db,{userId:actor.telegram_user_id,chatId:String(message.chat.id),messageId:message.message_id,
+        text:message.text ?? message.caption ?? "Please read this receipt with my earlier instructions.",
+        replyTo:message.reply_to_message?.message_id,media:images,sentAt:message.date});
+    } catch (error) {
+      if (!(error instanceof SplitInputError)) throw error;
+      await (dependencies.sendToIncomingChat ?? sendMessageToChat)(message.chat.id,error.message,{reply_to_message_id:message.message_id});
+      return;
+    }
+    await processSplitInbox(db,{answer:dependencies.answerSplit,answerRecipient:dependencies.answerRecipient,send:dependencies.sendConversationMessage});
+    await deliverSplitMessages(db,{send:dependencies.sendConversationMessage});
+    return;
+  }
+
+  const splitReference = actor.role === "owner" ? ownerSplitReference(db,String(message.chat.id),message.message_thread_id,message.reply_to_message?.message_id) : undefined;
+  if (actor.role === "owner" && splitReference && /^(approve|reject)[.!]?$/i.test(userMessage)) {
+    let response: string;
+    try {
+      const result = reviewSplit(db,{id:splitReference.draft_id,revision:splitReference.revision,
+        action:/^approve/i.test(userMessage)?"approve":"reject"},
+        {role:"owner",actor:`telegram:${actor.telegram_user_id}`,source:"telegram",request_id:String(update.update_id),
+          split_review:{id:splitReference.draft_id,revision:splitReference.revision}});
+      response = result.status === "approved" ? "Approved and recorded once. The sender's confirmation is queued." : "Rejected. The balance is unchanged; the sender's update is queued.";
+      await deliverSplitMessages(db,{send:dependencies.sendConversationMessage});
+    } catch (error) { response = error instanceof Error ? error.message : "Could not review this draft."; }
+    await (dependencies.sendToIncomingChat ?? sendMessageToChat)(message.chat.id,response,
+      {thread_id:message.message_thread_id,reply_to_message_id:message.message_id});
+    return;
   }
 
   const replyToId = message.reply_to_message?.message_id;
@@ -490,6 +534,7 @@ export async function handleTelegramUpdate(
         owner_context: { role:"owner", actor:`telegram:${actor.telegram_user_id}`, source:"telegram", request_id:String(update.update_id) },
         replied_to_transaction_id: linkedTransactionId,
         replied_to_payment_request_id: ownerReplyRequest(db, String(message.chat.id), message.message_thread_id, message.reply_to_message?.message_id),
+        replied_to_split_draft: splitReference,
         images,
       });
     } else {

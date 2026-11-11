@@ -2,6 +2,43 @@ import type Database from "better-sqlite3";
 
 export function migratePaymentRequests(db: Database.Database): void {
   db.exec(`
+    CREATE TABLE IF NOT EXISTS split_drafts (
+      id TEXT PRIMARY KEY, contact_id TEXT NOT NULL REFERENCES contacts(id),
+      user_id TEXT NOT NULL, revision INTEGER NOT NULL DEFAULT 1,
+      status TEXT NOT NULL DEFAULT 'draft', data TEXT NOT NULL,
+      raw_transaction_id TEXT, reviewed_by TEXT, review_note TEXT,
+      created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+    );
+    CREATE UNIQUE INDEX IF NOT EXISTS split_draft_active ON split_drafts(contact_id)
+      WHERE status IN ('draft','submitted','rejected');
+    CREATE TABLE IF NOT EXISTS split_draft_versions (
+      draft_id TEXT NOT NULL REFERENCES split_drafts(id), revision INTEGER NOT NULL,
+      data TEXT NOT NULL, created_at TEXT NOT NULL, PRIMARY KEY(draft_id,revision)
+    );
+    CREATE TABLE IF NOT EXISTS split_inbox (
+      id INTEGER PRIMARY KEY, contact_id TEXT NOT NULL REFERENCES contacts(id),
+      user_id TEXT NOT NULL, chat_id TEXT NOT NULL, message_id INTEGER NOT NULL,
+      reply_to_message_id INTEGER, text TEXT NOT NULL, media TEXT NOT NULL DEFAULT '[]',
+      draft_id TEXT REFERENCES split_drafts(id), response TEXT, route TEXT,
+      status TEXT NOT NULL DEFAULT 'pending', attempts INTEGER NOT NULL DEFAULT 0,
+      lease TEXT, lease_until TEXT, created_at TEXT NOT NULL,
+      UNIQUE(user_id,message_id)
+    );
+    CREATE TABLE IF NOT EXISTS split_outbox (
+      id TEXT PRIMARY KEY, contact_id TEXT NOT NULL REFERENCES contacts(id),
+      user_id TEXT NOT NULL, contact_version INTEGER NOT NULL,
+      draft_id TEXT REFERENCES split_drafts(id), revision INTEGER,
+      dedupe_key TEXT NOT NULL UNIQUE, audience TEXT NOT NULL,
+      chat_id TEXT NOT NULL, thread_id INTEGER, reply_to_message_id INTEGER,
+      text TEXT NOT NULL, media TEXT, status TEXT NOT NULL DEFAULT 'queued',
+      attempts INTEGER NOT NULL DEFAULT 0, next_attempt_at TEXT NOT NULL,
+      lease_until TEXT, telegram_message_id INTEGER, error_code TEXT,
+      created_at TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS split_inbox_pending ON split_inbox(status,id);
+    CREATE TABLE IF NOT EXISTS payment_chat_media (
+      event_id INTEGER PRIMARY KEY REFERENCES payment_chat_events(id), media TEXT NOT NULL
+    );
     CREATE TABLE IF NOT EXISTS payment_batches (
       id TEXT PRIMARY KEY, created_by TEXT NOT NULL, created_at TEXT NOT NULL
     );

@@ -36,7 +36,7 @@ export class TelegramImageError extends Error {
   }
 }
 
-const SUPPORTED_DOCUMENT_TYPES = new Set(["image/jpeg", "image/png", "image/webp"]);
+const SUPPORTED_DOCUMENT_TYPES = new Set(["image/jpeg", "image/png", "image/webp", "application/pdf"]);
 
 export function selectTelegramImage(
   message: TelegramImageMessage
@@ -56,7 +56,7 @@ export function selectTelegramImage(
   if (message.document) {
     if (!SUPPORTED_DOCUMENT_TYPES.has(message.document.mime_type ?? "")) {
       throw new TelegramImageError(
-        "Please send the image as a photo, PNG, JPEG, or WebP file."
+        "Please send the receipt as a photo, PNG, JPEG, WebP, or PDF file."
       );
     }
     if ((message.document.file_size ?? 0) > MAX_TELEGRAM_IMAGE_BYTES) {
@@ -118,6 +118,12 @@ export async function loadTelegramImage(
   }
 
   const bytes = Buffer.concat(chunks);
+  if (message.document?.mime_type === "application/pdf") {
+    if (bytes.subarray(0, 5).toString("ascii") !== "%PDF-")
+      throw new TelegramImageError("I couldn't verify that PDF. Please resend the receipt.");
+    return [{ data_url: `data:application/pdf;base64,${bytes.toString("base64")}`,
+      mime_type: "application/pdf", filename: "receipt.pdf" }];
+  }
   const mimeType = detectImageMimeType(bytes);
   if (!mimeType) {
     throw new TelegramImageError("I couldn't verify that image. Please resend it as PNG or JPEG.");

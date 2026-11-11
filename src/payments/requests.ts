@@ -7,6 +7,7 @@ import {
   listReceivables,
 } from "../db/v2-queries";
 import type { TelegramContributor } from "../telegram/access";
+import { billLabel } from "./bill-label";
 
 export interface OwnerContext {
   role: "owner";
@@ -16,6 +17,7 @@ export interface OwnerContext {
   // Trusted turn-local scope, populated by the owner agent and Telegram routing.
   bill_ids?: string[];
   owner_message_id?: number;
+  split_review?: { id: string; revision: number };
 }
 
 export function requireOwner(context?: OwnerContext): OwnerContext {
@@ -382,15 +384,8 @@ export async function preparePaymentBatch(
       assertNotAlreadyRequested(db, snapshot, existing?.id);
       const message = await compose({
         name: snapshot.contact.name,
-        context: input.context,
-        summary:
-          input.context.length <= 140
-            ? input.context
-            : snapshot.basis === "split"
-              ? [...new Set(snapshot.selected.map((row) => row.label))]
-                  .join(", ")
-                  .slice(0, 140)
-              : "your shared tab with Aniket",
+        context: snapshot.basis === "split" ? billLabel(db,{source_ids:JSON.stringify(sourceIds)}) : "your shared tab with Aniket",
+        summary: snapshot.basis === "split" ? billLabel(db,{source_ids:JSON.stringify(sourceIds)}) : "your shared tab with Aniket",
         amount_paise: snapshot.amount_paise,
         basis: snapshot.basis,
         upi: snapshot.upi,

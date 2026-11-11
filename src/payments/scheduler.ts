@@ -5,6 +5,8 @@ import { deliverPaymentRequests } from "./delivery";
 import { deliverChatMessages } from "./chat-delivery";
 import { processRecipientConversations } from "./replies";
 import { deliverPaymentQrs } from "./qr";
+import { processSplitInbox } from "./split-conversation";
+import { deliverSplitMessages } from "./split-outbox";
 
 export function startPaymentRequestDelivery(db: Database.Database): void {
   // Recovery still runs with delivery disabled, but never makes a network call.
@@ -20,6 +22,8 @@ export function startPaymentRequestDelivery(db: Database.Database): void {
         await deliverPaymentQrs(db);
         await processRecipientConversations(db);
         await deliverChatMessages(db);
+        await processSplitInbox(db);
+        await deliverSplitMessages(db);
       } catch {
         throw new Error(
           "Payment outbox processing failed; inspect persisted request status",

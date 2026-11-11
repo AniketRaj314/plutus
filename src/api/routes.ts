@@ -198,6 +198,11 @@ export function registerRoutes(app: FastifyInstance, db: Database.Database): voi
       },
       sms_ingestion: smsIngestion,
       payment_requests: paymentDeliveryHealth(db),
+      split_submissions: {
+        inbox: db.prepare("SELECT status,count(*) AS count FROM split_inbox GROUP BY status").all(),
+        drafts: db.prepare("SELECT status,count(*) AS count FROM split_drafts GROUP BY status").all(),
+        delivery: db.prepare("SELECT status,count(*) AS count FROM split_outbox GROUP BY status").all(),
+      },
       ...schedulerHealth,
     };
   });

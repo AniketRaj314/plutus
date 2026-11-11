@@ -243,6 +243,7 @@ export interface RecordCounterpartyTransferInput {
 }
 
 export interface RecordContributorPurchaseInput {
+  approved_by?: string;
   idempotency_key: string;
   reporter: string;
   reporter_telegram_user_id: string;
@@ -1831,7 +1832,8 @@ export function recordContributorPurchase(
   }
 
   const rawEmailId = `telegram-contributor:${input.idempotency_key.trim()}`;
-  const createdBy = `telegram_contributor:${reporterTelegramUserId}`;
+  const createdBy = input.approved_by ? `owner_approval:${input.approved_by}` : `telegram_contributor:${reporterTelegramUserId}`;
+  const evidenceKind = input.approved_by ? "owner_approved_recipient_report" : "telegram_contributor_report";
   return db.transaction(() => {
     const existingRaw = db
       .prepare("SELECT * FROM raw_transactions WHERE raw_email_id = ?")
@@ -1843,7 +1845,7 @@ export function recordContributorPurchase(
         existingRaw.merchant_raw === label &&
         existingRaw.occurred_at === occurredAt &&
         Math.abs(rawAmountInr(existingRaw) - input.gross_amount_inr) <= 0.01 &&
-        payload?.evidence_kind === "telegram_contributor_report" &&
+        payload?.evidence_kind === evidenceKind &&
         String(payload?.reporter_telegram_user_id ?? "") === reporterTelegramUserId &&
         Math.abs(Number(payload?.owner_share_inr) - input.owner_share_inr) <= 0.01;
       if (!sameReport) {
@@ -1862,7 +1864,8 @@ export function recordContributorPurchase(
         direction: "debit",
         raw_email_id: rawEmailId,
         raw_payload: JSON.stringify({
-          evidence_kind: "telegram_contributor_report",
+          evidence_kind: evidenceKind,
+          approved_by: input.approved_by ?? null,
           reporter,
           reporter_telegram_user_id: reporterTelegramUserId,
           owner_share_inr: input.owner_share_inr,

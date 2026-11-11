@@ -81,3 +81,29 @@ or send a live canary without the separately authorized rollout action.
   by merchant/date/amount or overwrite their settled values.
 - Before deploying this fix, reconcile the reviewed pending MYR alert to its
   existing statement charge. See [currency rollout](amex-currency-rollout.md).
+
+## Recipient-submitted splits (approved November 11, 2026)
+
+- Connected recipients can start a new sender-paid expense conversationally,
+  including during a conversation about an old request. Text, photo/image files
+  and PDFs belong to a durable draft with retained evidence and version history.
+- Keep one open draft per contact, including rejected drafts awaiting correction.
+  Preserve earlier payer/date/item instructions when a receipt arrives later.
+  Ask only missing questions. Split fees/discounts proportionally, using exact
+  integer/rational arithmetic and showing the final paise allocation.
+- Sender confirmation submits an already delivered calculation preview. Only
+  explicit Aniket approval of that exact revision can change the ledger or
+  bilateral balance. New evidence/edits invalidate the previous approval request.
+  Recipient roles never gain the contributor's direct recording privileges.
+- Approval records the economic expense once, with Aniket's personal share and
+  zero cash flow because the sender paid. Repayment remains a separate event.
+  Check possible duplicate purchases before approval. Foreign receipts require
+  settled INR evidence; never invent conversion rates.
+- Owner review includes itemisation and receipt copies. Approval/rejection and
+  shared rejection notes return through a durable outbox. Do not claim delivery
+  from queue persistence. Ambiguous sends need explicit duplicate-risk approval.
+- Bill labels use actual expense dates and a short merchant/title, never old
+  today/yesterday wording or sent_at masquerading as the purchase date. Missing
+  expense dates are explicit. Resolve relative dates against the sender's message
+  time in Asia/Kolkata.
+- See [recipient split drafts](recipient-split-drafts.md) for rollout and limits.

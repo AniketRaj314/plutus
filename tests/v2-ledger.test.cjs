@@ -3764,9 +3764,9 @@ test("Telegram image intake validates type, bytes, and actual file contents", as
 
   assert.throws(
     () => selectTelegramImage({
-      document: { file_id: "pdf", mime_type: "application/pdf", file_size: 100 },
+      document: { file_id: "exe", mime_type: "application/octet-stream", file_size: 100 },
     }),
-    (error) => error instanceof TelegramImageError && /PNG, JPEG, or WebP/.test(error.message)
+    (error) => error instanceof TelegramImageError && /PNG, JPEG, WebP, or PDF/.test(error.message)
   );
   assert.throws(
     () => selectTelegramImage({

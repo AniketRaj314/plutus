@@ -2,6 +2,8 @@ import type { ResponseInputItem } from "openai/resources/responses/responses";
 
 export interface AgentImageInput {
   data_url: string;
+  mime_type?: "application/pdf";
+  filename?: string;
 }
 
 export function buildUserInputItem(
@@ -14,7 +16,10 @@ export function buildUserInputItem(
     role: "user",
     content: [
       { type: "input_text", text },
-      ...images.map((image) => ({
+      ...images.map((image) => image.mime_type === "application/pdf" ? ({
+        type: "input_file" as const, file_data: image.data_url,
+        filename: image.filename ?? "receipt.pdf",
+      }) : ({
         type: "input_image" as const,
         image_url: image.data_url,
         detail: "high" as const,
