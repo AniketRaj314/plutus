@@ -2,6 +2,8 @@ import type Database from "better-sqlite3";
 import { getTelegramRecipient, setRecipientDelivery } from "../telegram/access";
 import type { PaymentRequest } from "./requests";
 import { plain } from "./messages";
+import { billLabel } from "./bill-label";
+import type { AgentImageInput } from "../agent/image-input";
 import {
   answerRecipient,
   recipientPacket,
@@ -17,6 +19,8 @@ interface RecipientInput {
   message_id: number;
   text: string;
   reply_to_message_id?: number;
+  request_id?: string;
+  media?: AgentImageInput[];
 }
 interface Event {
   id: number;
@@ -87,7 +91,8 @@ export function handleRecipientMessage(
       "SELECT * FROM payment_requests WHERE contact_id=? AND status='sent' ORDER BY sent_at DESC,id LIMIT 30",
     )
     .all(person.contact_id) as PaymentRequest[];
-  let row: PaymentRequest | undefined;
+  let row: PaymentRequest | undefined = input.request_id ? requests.find(r=>r.id===input.request_id) : undefined;
+  if (input.request_id && !row) throw new Error("Unknown recipient request");
   if (input.reply_to_message_id !== undefined) {
     row = requests.find(
       (r) => r.telegram_message_id === input.reply_to_message_id,
@@ -164,7 +169,7 @@ export function handleRecipientMessage(
           requests
             .map(
               (r, i) =>
-                `${i + 1}. ${plain(r.context).slice(0, 100)} (${r.sent_at?.slice(0, 10) ?? "sent earlier"})`,
+                `${i + 1}. ${billLabel(db, r)}`,
             )
             .join("\n")
         : "You're connected to Violet. There are no requests sent to you yet. Aniket can send one when a split is ready.",
@@ -202,6 +207,8 @@ export function handleRecipientMessage(
         ).lastInsertRowid,
     );
   })();
+  if (input.media?.length) db.prepare("INSERT OR IGNORE INTO payment_chat_media(event_id,media) VALUES (?,?)")
+    .run(eventId, JSON.stringify(input.media));
   return { text: "", duplicate: false, event_id: eventId };
 }
 
