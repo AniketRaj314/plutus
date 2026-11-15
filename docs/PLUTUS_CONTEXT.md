@@ -120,3 +120,15 @@ or send a live canary without the separately authorized rollout action.
   manual entries through explicit Gmail evidence links first, preserving their raw
   records, interpretations and splits. Do not fuzzy-match or clear poll state.
 - See [template rollout](amex-template-rollout.md) for the rollout checklist.
+
+## Railway build dependencies (approved November 16, 2026)
+
+- Keep runtime `NODE_ENV=production`. The Nixpacks install phase explicitly runs
+  `npm ci --include=dev` so TypeScript and its declarations exist before compiling.
+  Do not rely on builder defaults to install development dependencies.
+- The v1.17.1 GitHub deployment failed before startup with `tsc: not found`.
+  Version 1.17.2 includes the build configuration fix and the merged AmEx fix.
+  Check Railway and live health before claiming either is deployed.
+- Validate a clean Node 22 install and build with `NODE_ENV=production`, then run
+  the tests. After merge, confirm the build logs use the explicit install command,
+  the live version is correct, and enabled schedulers complete successful cycles.
