@@ -6,6 +6,7 @@ import { parseBobCard } from "./bobcard";
 import { parseAmex } from "./amex";
 import { parseIdfcUpi } from "./idfc-upi";
 import type { EmailContent, ParsedTransaction } from "./types";
+import { isAmexSender } from "../senders";
 
 export type { ParsedTransaction, EmailContent, TransactionSource } from "./types";
 export { parseIdfcCreditCard } from "./idfc-cc";
@@ -47,7 +48,7 @@ export function parseGmailMessage(message: gmail_v1.Schema$Message): ParsedTrans
       : parseIdfcUpi(email)
     : fromLower.includes("no-reply@getonecard.app")
     ? parseBobCard(email)
-    : fromLower.includes("americanexpress.com")
+    : isAmexSender(from)
     ? parseAmex(email)
     : fromLower.includes("credit_cards@icici.bank.in")
     ? parseIciciCreditCard(email)

@@ -107,3 +107,16 @@ or send a live canary without the separately authorized rollout action.
   expense dates are explicit. Resolve relative dates against the sender's message
   time in Asia/Kolkata.
 - See [recipient split drafts](recipient-split-drafts.md) for rollout and limits.
+
+## AmEx email templates
+
+- Polling, parsing and diagnostics share the exact legacy and new issuer sender
+  addresses. Accept both paragraph/named-month and nested-table/DD-MM-YYYY
+  transaction-update layouts. Invalid dates or conflicting fields remain retryable.
+- Preserve original currencies and issuer dates. Declined-payment notices and
+  security emails are not transaction events. Sender matching alone is not proof
+  of email authenticity.
+- A parser revision replays the existing bounded 48-hour window. Reconcile known
+  manual entries through explicit Gmail evidence links first, preserving their raw
+  records, interpretations and splits. Do not fuzzy-match or clear poll state.
+- See [template rollout](amex-template-rollout.md) for the rollout checklist.

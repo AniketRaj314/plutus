@@ -5,13 +5,7 @@ import { findRawTransactionIdByEvidence } from "../db/evidence";
 import { getGmailClient } from "./auth";
 import { getGmailReceivedAt, parseGmailMessage } from "./parsers";
 import { isLikelyTransactionAlert } from "./poller";
-
-const DIAGNOSTIC_SENDERS = {
-  amex: ["AmericanExpress@welcome.americanexpress.com"],
-  bobcard: ["no-reply@getonecard.app"],
-  idfc: ["noreply@idfcfirstbank.com"],
-  icici: ["credit_cards@icici.bank.in"],
-} as const;
+import { TRANSACTION_SENDERS as DIAGNOSTIC_SENDERS } from "./senders";
 
 const PROVIDERS = ["all", "amex", "bobcard", "idfc", "icici"] as const;
 const DEFAULT_LOOKBACK_DAYS = 3;
