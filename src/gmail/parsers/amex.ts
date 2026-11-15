@@ -1,6 +1,7 @@
 import { parse } from "node-html-parser";
 import type { EmailContent, ParsedFields } from "./types";
 import { parseAmexAmount } from "./amex-amount";
+import { isAmexTransactionSubject } from "../senders";
 
 const MONTHS: Record<string, number> = {
   january: 0,
@@ -20,18 +21,21 @@ const MONTHS: Record<string, number> = {
 const IST_OFFSET_MS = 5.5 * 60 * 60 * 1000;
 
 export function parseAmex(email: EmailContent): ParsedFields | null {
-  if (!email.subject.includes("Your transaction update")) return null;
+  if (!isAmexTransactionSubject(email.subject)) return null;
   if (!email.htmlBody) return null;
 
   const root = parse(email.htmlBody);
-  const paragraphs = root
-    .querySelectorAll("p")
-    .map((p) => p.text.replace(/ /g, " ").trim())
+  const blocks = root
+    .querySelectorAll("p, td")
+    // Nested layout tables repeat their descendants' text. Only read leaf
+    // blocks, in document order, for both the old paragraphs and new cells.
+    .filter((node) => !node.querySelector("p, td"))
+    .map((node) => node.text.replace(/\s+/g, " ").trim())
     .filter((t) => t.length > 0);
 
-  const dateStr = valueAfterLabel(paragraphs, "Date:");
-  const merchantRaw = valueAfterLabel(paragraphs, "Merchant:");
-  const amountStr = valueAfterLabel(paragraphs, "Amount:");
+  const dateStr = valueAfterLabel(blocks, "Date:");
+  const merchantRaw = valueAfterLabel(blocks, "Merchant:");
+  const amountStr = valueAfterLabel(blocks, "Amount:");
   if (!dateStr || !merchantRaw || !amountStr) return null;
 
   const datetime = buildIsoDatetime(dateStr, email.receivedAt);
@@ -41,7 +45,9 @@ export function parseAmex(email: EmailContent): ParsedFields | null {
   if (!parsedAmount) return null;
   const { currency, amount } = parsedAmount;
 
-  const endingMatch = email.htmlBody.match(/Account Ending:\s*(\d+)/i);
+  const endingMatch = blocks
+    .join("\n")
+    .match(/Account\s+Ending:\s*(\d{4,5})\b/i);
   const cardLast4 = endingMatch ? endingMatch[1] : "";
 
   if (currency !== "INR") {
@@ -79,19 +85,35 @@ export function parseAmex(email: EmailContent): ParsedFields | null {
   };
 }
 
-function valueAfterLabel(paragraphs: string[], label: string): string | null {
-  const index = paragraphs.findIndex((p) => p === label);
-  if (index === -1 || index + 1 >= paragraphs.length) return null;
-  return paragraphs[index + 1];
+function valueAfterLabel(blocks: string[], label: string): string | null {
+  const values = new Set<string>();
+  for (let i = 0; i < blocks.length; i++) {
+    if (blocks[i].toLowerCase() === label.toLowerCase() && blocks[i + 1])
+      values.add(blocks[i + 1]);
+  }
+  // Responsive duplicates are fine only if they agree. Never guess between
+  // multiple transactions or conflicting amount/date fields in one message.
+  return values.size === 1 ? [...values][0] : null;
 }
 
 function buildIsoDatetime(dateStr: string, receivedAt?: string): string | null {
-  const match = dateStr.match(/(\d{1,2})\s+([A-Za-z]+)\s+(\d{4})/);
-  if (!match) return null;
-
-  const [, dayStr, monthStr, yearStr] = match;
-  const month = MONTHS[monthStr.toLowerCase()];
-  if (month === undefined) return null;
+  const named = dateStr.match(/^(\d{1,2})\s+([A-Za-z]+)\s+(\d{4})$/);
+  const numeric = dateStr.match(/^(\d{2})-(\d{2})-(\d{4})$/);
+  if (!named && !numeric) return null;
+  const day = Number((named ?? numeric)![1]);
+  const year = Number((named ?? numeric)![3]);
+  const month = named
+    ? MONTHS[named[2].toLowerCase()]
+    : Number(numeric![2]) - 1;
+  if (month === undefined || month < 0 || month > 11 || year < 1000)
+    return null;
+  const calendar = new Date(Date.UTC(year, month, day));
+  if (
+    calendar.getUTCFullYear() !== year ||
+    calendar.getUTCMonth() !== month ||
+    calendar.getUTCDate() !== day
+  )
+    return null;
 
   let hour = 0;
   let minute = 0;
@@ -111,7 +133,8 @@ function buildIsoDatetime(dateStr: string, receivedAt?: string): string | null {
   // AmEx supplies the transaction's IST calendar date but no time. Combine
   // that authoritative date with Gmail's receipt time-of-day in IST.
   const parsed = new Date(
-    Date.UTC(Number(yearStr), month, Number(dayStr), hour, minute, second, millisecond) - IST_OFFSET_MS
+    Date.UTC(year, month, day, hour, minute, second, millisecond) -
+      IST_OFFSET_MS,
   );
   if (Number.isNaN(parsed.getTime())) return null;
 

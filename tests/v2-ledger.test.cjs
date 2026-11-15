@@ -709,7 +709,7 @@ test("Gmail MCP diagnostics expose parser and storage state without returning em
     { gmail, now: new Date("2026-07-20T12:00:00.000Z") }
   );
 
-  assert.match(listQuery, /^from:\(AmericanExpress@welcome\.americanexpress\.com\) after:\d+ before:\d+$/);
+  assert.match(listQuery, /^from:\(AmericanExpress@welcome\.americanexpress\.com OR donotreply@communication\.americanexpress\.co\.in\) after:\d+ before:\d+$/);
   assert.equal(result.count, 3);
   assert.equal(result.poller.last_successful_poll_at, "2026-07-20T06:45:00.000Z");
   assert.equal(result.poller.last_successful_connection_at, "2026-07-20T06:50:00.000Z");
@@ -816,7 +816,7 @@ test("Gmail parser revision replay recovers a recent alert already marked proces
   assert.equal(raw.amount, 50);
   assert.equal(raw.currency, "USD");
   assert.equal(raw.is_international, 1);
-  assert.equal(getContext(db, "gmail_parser_revision").value, "amex-sgd-v1");
+  assert.equal(getContext(db, "gmail_parser_revision").value, "amex-templates-v2");
   db.close();
 });
 

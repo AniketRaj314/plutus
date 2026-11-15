@@ -43,19 +43,16 @@ import {
   recordTransactionEvidence,
 } from "../db/evidence";
 
-const WATCHED_SENDERS = [
-  "noreply@idfcfirstbank.com",
-  "no-reply@getonecard.app",
-  "AmericanExpress@welcome.americanexpress.com",
-  "credit_cards@icici.bank.in",
-];
+import { TRANSACTION_SENDERS, isAmexSender, isAmexTransactionSubject } from "./senders";
+
+const WATCHED_SENDERS = Object.values(TRANSACTION_SENDERS).flat();
 
 const LAST_POLL_KEY = "last_gmail_poll";
 const LAST_CLEAN_POLL_KEY = "last_clean_gmail_poll";
 const PROCESSED_IDS_KEY = "processed_message_ids";
 const UNPARSEABLE_IDS_KEY = "unparseable_gmail_message_ids";
 const PARSER_REVISION_KEY = "gmail_parser_revision";
-const PARSER_REVISION = "amex-sgd-v1";
+const PARSER_REVISION = "amex-templates-v2";
 const GMAIL_SYNC_ALERT_STATE_KEY = "gmail_sync_alert_state";
 const PARSER_REPLAY_WINDOW_SECONDS = 48 * 60 * 60;
 const MAX_PROCESSED_IDS = 2000;
@@ -186,7 +183,7 @@ function header(message: gmail_v1.Schema$Message, name: string): string {
 
 function providerLabel(from: string): string {
   const normalized = from.toLowerCase();
-  if (normalized.includes("americanexpress.com")) return "AmEx";
+  if (isAmexSender(from)) return "AmEx";
   if (normalized.includes("getonecard.app")) return "BOBCARD";
   if (normalized.includes("idfcfirstbank.com")) return "IDFC FIRST Bank";
   if (normalized.includes("icici.bank.in")) return "ICICI Bank";
@@ -659,7 +656,7 @@ export function isLikelyTransactionAlert(message: gmail_v1.Schema$Message): bool
   const subject =
     headers.find((header) => header.name?.toLowerCase() === "subject")?.value?.toLowerCase() ?? "";
 
-  if (from.includes("americanexpress.com")) return subject.includes("your transaction update");
+  if (isAmexSender(from)) return isAmexTransactionSubject(subject);
   if (from.includes("credit_cards@icici.bank.in")) {
     const snippet = message.snippet?.toLowerCase() ?? "";
     return subject.includes("transaction alert for your icici bank credit card") && !snippet.includes("declined");
