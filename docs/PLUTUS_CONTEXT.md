@@ -6,6 +6,14 @@ inferred from this document or a pending pull request. Keep raw transaction
 evidence immutable and separate personal impact, cash flow, flex impact, and
 receivables. See [v2 ledger](v2-ledger.md) for the financial model.
 
+## Publication safety
+
+Follow the publication-safety rules in `AGENTS.md`. Treat repository artifacts,
+PR text and CI output as public. Use fully synthetic examples and fixtures;
+production evidence and reconciliation notes belong only in private,
+access-controlled storage. Review every outgoing commit, the full diff and PR
+text before publication. Report previously published leaks privately.
+
 ## Contact and payment-request rules (approved October 30, 2026)
 
 - One canonical contact joins retained ledger-name aliases and a verified numeric
