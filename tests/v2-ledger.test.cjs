@@ -3202,9 +3202,9 @@ test("authorized contributor purchases are atomic, idempotent, and attributed wi
 
 test("contributor prompt permits only identity-bound bilateral reads and contains no owner financial context", () => {
   const prompt = buildContributorSystemPrompt({ telegram_user_id: "222", name: "Rushil" });
-  assert.match(prompt, /only jobs/i);
-  assert.match(prompt, /no access to Aniket's financial history/i);
-  assert.match(prompt, /shared tab between you and Aniket/);
+  assert.match(prompt, /read-only/i);
+  assert.match(prompt, /cannot access unrelated finances/i);
+  assert.match(prompt, /require Aniket's approval/);
   assert.match(prompt, /get_my_tab_with_aniket/);
   assert.match(prompt, /Never ask for or accept another person's name/);
   assert.doesNotMatch(prompt, /get_raw_transactions|get_counterparty_balance|OPEN SPLITS/i);
@@ -3414,74 +3414,31 @@ test("Telegram sender authorization is identity-based, dynamic, and fails closed
   db.close();
 });
 
-test("Telegram handler keeps contributors on the bilateral path and audits the owner", async () => {
+test("Telegram handler routes contributors through owner-reviewed conversations", async () => {
   const db = makeDb();
-  authorizeTelegramContributor(db, "Rushil", "222");
-  const incoming = [];
-  const ownerAlerts = [];
-  let ownerCalls = 0;
-  let contributorPayload;
-  await handleTelegramUpdate(
-    db,
-    {
-      update_id: 900,
-      message: {
-        message_id: 42,
-        chat: { id: 222, type: "private" },
-        from: { id: 222, first_name: "Rushil" },
-        text: "I paid ₹800 for Aniket's dinner today",
+  authorizeTelegramContributor(db, "Avery", "222");
+  const gate = process.env.PAYMENT_REQUEST_DELIVERY_ENABLED;
+  process.env.PAYMENT_REQUEST_DELIVERY_ENABLED = "true";
+  let routed = false;
+  try {
+    await handleTelegramUpdate(db, {update_id: 900, message: {
+      message_id: 42, chat: {id: 222, type: "private"}, from: {id: 222}, text: "I owe Aniket for a purchase.",
+    }}, {
+      runOwnerAgent: async () => assert.fail("No owner access"),
+      runContributorAgent: async () => assert.fail("No direct contributor writes"),
+      answerSplit: async (packet) => {
+        routed = true;
+        assert.equal(packet.sender, "Avery");
+        assert.ok(packet.shared_tab);
+        return {route: "chat", request_id: null, reply: "What was the purchase?", draft_action: "status", draft: null};
       },
-    },
-    {
-      runOwnerAgent: async () => {
-        ownerCalls++;
-        return "owner";
-      },
-      runContributorAgent: async (_db, payload) => {
-        contributorPayload = payload;
-        return {
-          text: "Recorded ₹800 for dinner.",
-          recorded_purchases: [
-            {
-              raw_transaction_id: "raw-1",
-              label: "Dinner",
-              occurred_at: "2026-08-22T12:00:00+05:30",
-              gross_amount_inr: 800,
-              owner_share_inr: 800,
-              category: "Dining",
-              treatment: "normal",
-              flex_classification: "flex",
-              was_existing: false,
-              reporter: "Rushil",
-            },
-          ],
-        };
-      },
-      sendToIncomingChat: async (chatId, text, options) => {
-        incoming.push({ chatId, text, options });
-        return 1;
-      },
-      sendOwnerMessage: async (text) => {
-        ownerAlerts.push(text);
-        return 2;
-      },
-      sendTyping: async () => {},
-    }
-  );
-
-  assert.equal(ownerCalls, 0);
-  assert.equal(contributorPayload.identity.telegram_user_id, "222");
-  assert.equal(contributorPayload.identity.name, "Rushil");
-  assert.equal(contributorPayload.conversation_id, "222");
-  assert.deepEqual(incoming[0], {
-    chatId: 222,
-    text: "Recorded ₹800 for dinner.",
-    options: { thread_id: undefined, reply_to_message_id: 42 },
-  });
-  assert.equal(ownerAlerts.length, 1);
-  assert.match(ownerAlerts[0], /Rushil recorded a payment made for you/);
-  assert.match(ownerAlerts[0], /your share ₹800/);
-
+      sendConversationMessage: async () => 1,
+    });
+    assert.equal(routed, true);
+    assert.equal(db.prepare("SELECT count(*) n FROM raw_transactions").get().n, 0);
+  } finally {
+    gate === undefined ? delete process.env.PAYMENT_REQUEST_DELIVERY_ENABLED : process.env.PAYMENT_REQUEST_DELIVERY_ENABLED = gate;
+  }
   let calls = 0;
   await handleTelegramUpdate(
     db,
@@ -4883,69 +4840,22 @@ test("Violet discards a stale balance drafted after a balance-affecting write", 
   db.close();
 });
 
-test("contributor Violet refreshes the bilateral tab after recording a purchase", async () => {
+test("legacy contributor entry point cannot execute a hallucinated write tool", async () => {
   const db = makeDb();
-  authorizeTelegramContributor(db, "Rushil", "222");
-  const requests = [];
-  const responses = [
-    {
-      output_text: "",
-      output: [{
-        id: "fc_record_purchase",
-        call_id: "call_record_purchase",
-        type: "function_call",
-        name: "record_purchase_for_aniket",
-        arguments: JSON.stringify({
-                label: "Rapido delivery",
-                occurred_at: "2026-08-22",
-                gross_amount_inr: 98,
-                owner_share_inr: 98,
-                category: "Transport",
-                treatment: "split",
-                flex_classification: "flex",
-              }),
-      }],
-    },
-    {
-      output_text: "Recorded, but your tab is settled.",
-      output: [],
-    },
-    {
-      output_text: "Recorded ₹98. Aniket owes you ₹98.",
-      output: [],
-    },
-  ];
-
-  const result = await runContributorAgent(
-    db,
-    {
-      identity: { telegram_user_id: "222", name: "Rushil" },
-      conversation_id: "222",
-      message_id: 987,
-      user_message: "I paid ₹98 for Aniket's Rapido delivery today.",
-    },
-    {
-      createResponse: async (request) => {
-        requests.push(request);
-        return responses[requests.length - 1];
-      },
-    }
-  );
-
-  assert.equal(result.text, "Recorded ₹98. Aniket owes you ₹98.");
-  assert.equal(result.recorded_purchases.length, 1);
-  assert.equal(requests.length, 3);
-  assert.equal(requests[0].model, "gpt-5.6-sol");
-  assert.equal(requests[0].reasoning.effort, "high");
-  assert.equal(requests[0].parallel_tool_calls, false);
-  assert.equal("reasoning_effort" in requests[0], false);
-  const refreshMessage = requests[2].input.find(
-    (message) => message.role === "developer" &&
-      typeof message.content === "string" &&
-      message.content.includes("POST-WRITE CANONICAL REFRESH")
-  );
-  assert.ok(refreshMessage);
-  assert.match(refreshMessage.content, /"amount_inr":98/);
+  authorizeTelegramContributor(db, "Avery", "222");
+  let calls = 0;
+  const result = await runContributorAgent(db, {
+    identity: {telegram_user_id: "222", name: "Spoofed"}, conversation_id: "222",
+    message_id: 987, user_message: "Please record a purchase.",
+  }, {createResponse: async (request) => {
+    assert.deepEqual(request.tools.map(t => t.name), ["get_my_tab_with_aniket"]);
+    if (++calls === 1) return {output_text: "", output: [{type: "function_call", id: "fc_test", call_id: "call_test",
+      name: "record_purchase_for_aniket", arguments: "{}"}]};
+    assert.match(request.input.find(m => m.type === "function_call_output").output, /unsupported contributor tool/);
+    return {output_text: "This needs Aniket's approval.", output: []};
+  }});
+  assert.equal(result.recorded_purchases.length, 0);
+  assert.equal(db.prepare("SELECT count(*) n FROM raw_transactions").get().n, 0);
   db.close();
 });
 

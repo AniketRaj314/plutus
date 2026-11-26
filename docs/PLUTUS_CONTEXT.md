@@ -11,7 +11,8 @@ receivables. See [v2 ledger](v2-ledger.md) for the financial model.
 - One canonical contact joins retained ledger-name aliases and a verified numeric
   Telegram identity. A username is a claim-time hint, not enduring identity.
 - The same private invitation flow grants recipient access by default.
-  Contributor adds own bilateral history and reporting purchases paid for Aniket.
+  Contributor adds access to their own bilateral history. Both roles can submit
+  shared purchases in either direction for owner approval.
   Existing contributors retain their role. All non-owner financial chats are private.
 - Send only after Aniket explicitly asks to inform the selected people. New debt,
   preparation, or joining alone does not authorize a payment request. No recurring
@@ -35,7 +36,8 @@ or send a live canary without the separately authorized rollout action.
 
 - Recipient chats remember a selected sent request. Unthreaded follow-ups use that
   context for up to 24 hours; ambiguous bills require a short choice. `/splits`
-  selects another request. Contributors can return to their broader tab with `/tab`.
+  selects another request. Contributors can ask naturally about their broader tab
+  or use `/tab`, without discarding a pending draft.
 - Explain amounts only on request, from confirmed, recipient-specific bill
   explanations. Owner discussions are private source material, linked by exact
   bill identity, never loaded into the recipient assistant. Tentative/private
@@ -84,7 +86,7 @@ or send a live canary without the separately authorized rollout action.
 
 ## Recipient-submitted splits (approved November 11, 2026)
 
-- Connected recipients can start a new sender-paid expense conversationally,
+- Connected recipients and contributors can start a new expense in either direction,
   including during a conversation about an old request. Text, photo/image files
   and PDFs belong to a durable draft with retained evidence and version history.
 - Keep one open draft per contact, including rejected drafts awaiting correction.
@@ -94,9 +96,15 @@ or send a live canary without the separately authorized rollout action.
 - Sender confirmation submits an already delivered calculation preview. Only
   explicit Aniket approval of that exact revision can change the ledger or
   bilateral balance. New evidence/edits invalidate the previous approval request.
-  Recipient roles never gain the contributor's direct recording privileges.
+  Neither role has direct ledger-writing privileges. The legacy contributor
+  agent is read-only; all private friend messages use the same durable inbox.
 - Approval records the economic expense once, with Aniket's personal share and
-  zero cash flow because the sender paid. Repayment remains a separate event.
+  zero cash flow when the sender paid. When Aniket paid, approval records the
+  friend's receivable and Aniket's own share. Owner review can link an existing
+  unsplit debit by ID, preserving raw evidence and replacing only its interpretation.
+  A reported share with unknown full bill total creates dated economic evidence
+  without a raw bank transaction or invented cash flow. It must be reconciled if
+  fuller bank evidence arrives later. Repayment remains a separate event.
   Check possible duplicate purchases before approval. Foreign receipts require
   settled INR evidence; never invent conversion rates.
 - Owner review includes itemisation and receipt copies. Approval/rejection and
