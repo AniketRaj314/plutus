@@ -1,4 +1,4 @@
-# Recipient split drafts, version 1.17.0
+# Recipient split drafts, version 1.18.0
 
 A friend can describe a new expense, upload a receipt in a separate message,
 clarify who paid and who had which items, then confirm a calculation preview.
@@ -17,13 +17,13 @@ clarification. Unreadable evidence is never converted into invented facts.
 
 1. Violet retains the explanation and uploads in the private contact inbox.
 2. Once the details reconcile, she sends a preview with the date, payer, items,
-   adjustments, both shares, draft ID and revision.
+   adjustments, both shares. The server retains the exact revision for confirmation.
 3. The sender confirms that delivered preview to submit it. This queues Aniket's
    review, itemisation and receipt copies. Missing receipts are clearly labelled.
 4. Aniket can reply `Approve` or `Reject` to the review message. More detailed
    discussion uses the owner assistant's `inspect_split_draft` and
    `review_split_draft` tools. Rejection notes are explicitly shared with the sender.
-5. Only approval writes the economic expense and bilateral payable, atomically
+5. Only approval writes the economic expense and bilateral debt, atomically
    with the approved state and the sender's decision notification. It records the
    source as an owner-approved recipient report. A repeated approval is idempotent.
    The structured receipt and allocation are linked to the resulting transaction
@@ -38,11 +38,38 @@ Previously approved purchases must be corrected through the existing owner
 ledger workflow, not recorded again as new submissions.
 
 Recipients have no owner/contributor tools, broader ledger history or unrelated
-people's records. Contributor recording rights remain unchanged. Approving a
-submission records personal impact and an amount owed to its payer, with zero
-current cash flow; it does not assign category/flex classification automatically.
+people's records. Contributors retain their own bilateral history, queried live
+for each message, but cannot directly write ledger entries. Both roles use the
+same conversation for receipts, text and follow-ups. Aniket-paid purchases create
+a receivable; sender-paid purchases create a payable and zero owner cash flow.
+The assistant does not assign flex classification automatically.
 Aniket can apply those interpretations through existing owner tools. Any later
 repayment remains a separate bilateral event.
+
+## Amounts and existing evidence
+
+`amount_basis` distinguishes a full `bill_total` from an `owed_share` when only
+the portion owed is known. Historical drafts without this field remain full bills.
+A share-only report requires a description, exact purchase date, payer and positive
+INR amount, but no invented receipt or itemisation. Its preview explicitly labels
+the unknown full total. Approval creates a dated interpretation and receivable or
+payable with zero cash flow, without fabricating a raw bank transaction. If fuller
+bank evidence arrives later, the owner must reconcile the report before counting
+it again. A repayment or correction of an existing expense is not a new purchase.
+
+`inspect_split_draft` surfaces same-day candidate transactions, including larger
+bills for reported portions, and prior share-only reports. Owner approval can use
+`existing_raw_transaction_id` for an owner-paid debit with an ordinary, unsplit
+interpretation. Linking preserves raw evidence, existing cash flow and billing
+metadata, and versions the interpretation while creating the receivable atomically.
+Existing splits, settlements and special interpretations need explicit owner
+reconciliation instead of being silently overwritten. Other duplicate candidates
+still require acknowledgement even when a debit is linked.
+
+Approval only records the financial event and queues its decision notification.
+It never automatically sends a payment request or QR code. The owner must ask for
+those separately. Whole-bill allocations round the nonpayer's share once and leave
+the remainder with the payer, in either direction.
 
 ## Persistence and recovery
 
@@ -83,8 +110,10 @@ in its original audit record but is not reused as the current bill title.
   submission or message send is required to validate the code.
 - Deploy the approved PR. Startup adds the tables and uses the existing delivery
   gate; it does not notify past senders or replay historical screenshots.
-- Verify version 1.17.0, existing scheduler health and `split_submissions` queue
-  counts. Check ordinary owner/contributor conversations still work.
+- Verify version 1.18.0, existing scheduler health and `split_submissions` queue
+  counts. Check ordinary owner/contributor conversations still work, including
+  natural shared-tab questions while a draft is pending. No schema migration is
+  needed for the bilateral extension; it uses the existing draft/evidence tables.
 - With separate authorization, run a recipient canary: describe a bill, upload a
   receipt separately, clarify payer, confirm preview, reject with a note, correct
   and resubmit, then approve. Verify no balance change before approval and exactly
@@ -93,6 +122,7 @@ in its original audit record but is not reused as the current bill title.
   handler. Ask him to resend the receipt and original allocation after rollout;
   do not invent or import an expense from the chat screenshots.
 
-If rolling back, pause the payment delivery worker first and inspect pending
-drafts. Old code cannot process these new inbox/outbox rows. Keep their evidence
+If rolling back, pause non-owner conversations and the payment delivery worker
+first and inspect pending drafts. Older versions assume sender-paid full bills and restore contributor direct
+writes, so do not resume friend chats on those versions. Keep their evidence
 and approved financial records intact and explain the temporary pause to users.

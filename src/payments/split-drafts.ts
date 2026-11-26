@@ -2,7 +2,16 @@ import { randomUUID } from "node:crypto";
 import type Database from "better-sqlite3";
 import { z } from "zod";
 import { getTelegramRecipient } from "../telegram/access";
-import { recordContributorPurchase, setContextFact } from "../db/v2-queries";
+import {
+  createEnvelopeEntry,
+  createReceivable,
+  getActiveSalaryProfile,
+  getRawTransaction,
+  insertRawTransaction,
+  listEnvelopeEntries,
+  setContextFact,
+} from "../db/v2-queries";
+import { getSalaryFundingMonthForDate } from "../envelope/engine";
 import { requireOwner, type OwnerContext } from "./requests";
 import { queueSplitMessage } from "./split-outbox";
 
@@ -13,6 +22,7 @@ export const splitDataSchema = z
     date: z.string().nullable(),
     currency: z.string().max(8),
     payer: z.enum(["sender", "aniket", "unknown"]),
+    amount_basis: z.enum(["bill_total", "owed_share"]).optional(),
     total_paise: money.nullable(),
     receipt_reference: z.string().max(120).nullable(),
     items: z
@@ -87,11 +97,21 @@ export function calculateSplit(input: SplitData) {
     throw new Error(
       "Aniket needs the settled INR total before this split can be recorded.",
     );
-  if (d.payer !== "sender")
-    throw new Error(
-      "Confirm that you paid for this purchase. Bills paid by Aniket need his review.",
-    );
+  if (d.payer === "unknown")
+    throw new Error("Confirm who paid for this purchase.");
   if (d.unresolved.length) throw new Error(d.unresolved.join(" "));
+  if (d.amount_basis === "owed_share") {
+    if (!d.total_paise) throw new Error("Confirm the amount owed.");
+    if (d.items.length || d.adjustments.length)
+      throw new Error(
+        "A reported share must not also contain a full bill allocation. Confirm which amount is known.",
+      );
+    return {
+      total_paise: d.total_paise,
+      owner_paise: d.payer === "sender" ? d.total_paise : 0,
+      sender_paise: d.payer === "aniket" ? d.total_paise : 0,
+    };
+  }
   if (!d.items.length || !d.total_paise)
     throw new Error("Confirm the items and final amount paid.");
   let subtotal = 0,
@@ -126,9 +146,14 @@ export function calculateSplit(input: SplitData) {
   // remaining paise to the payer so the two shares exactly equal the bill.
   numerator *= BigInt(d.total_paise);
   denominator *= BigInt(subtotal);
-  const owner = Number((2n * numerator + denominator) / (2n * denominator));
-  if (owner <= 0 || owner > d.total_paise)
-    throw new Error("Confirm a positive share for Aniket.");
+  const beneficiary =
+    d.payer === "sender"
+      ? numerator
+      : BigInt(d.total_paise) * denominator - numerator;
+  const owed = Number((2n * beneficiary + denominator) / (2n * denominator));
+  if (owed <= 0 || owed > d.total_paise)
+    throw new Error("Confirm a positive share for the person who did not pay.");
+  const owner = d.payer === "sender" ? owed : d.total_paise - owed;
   return {
     total_paise: d.total_paise,
     owner_paise: owner,
@@ -139,8 +164,10 @@ const rupees = (p: number) => `₹${(p / 100).toFixed(2)}`;
 export function splitPreview(draft: SplitDraft): string {
   const d = splitDataSchema.parse(JSON.parse(draft.data));
   const sums = calculateSplit(d);
+  if (d.amount_basis === "owed_share")
+    return `${d.title} · ${d.date}\n${d.payer === "sender" ? "Aniket owes you" : "You owe Aniket"}: ${rupees(sums.total_paise)}\nReported share only; full bill total unknown. No bank movement will be inferred.\nSubject to Aniket's approval.`;
   return (
-    `${d.title} · ${d.date}\nPaid by the sender · total ${rupees(sums.total_paise)}\n` +
+    `${d.title} · ${d.date}\nPaid by ${d.payer === "sender" ? "the sender" : "Aniket"} · total ${rupees(sums.total_paise)}\n` +
     d.items
       .map(
         (i) =>
@@ -153,7 +180,7 @@ export function splitPreview(draft: SplitDraft): string {
           .map((a) => `${a.label}: ${rupees(a.amount_paise)}`)
           .join("\n")
       : "") +
-    `\nShared charges/discounts allocated proportionally.\nAniket: ${rupees(sums.owner_paise)} · You: ${rupees(sums.sender_paise)}\nDraft ${draft.id}, version ${draft.revision}`
+    `\nShared charges/discounts allocated proportionally.\nAniket: ${rupees(sums.owner_paise)} · You: ${rupees(sums.sender_paise)}`
   );
 }
 export function saveSplit(
@@ -225,9 +252,12 @@ export function submitSplit(db: Database.Database, draft: SplitDraft) {
     const person = getTelegramRecipient(db, draft.user_id);
     if (!person || person.contact_id !== draft.contact_id)
       throw new Error("Connection changed");
+    const data = splitDataSchema.parse(JSON.parse(draft.data));
     const preview = splitPreview(draft)
       .replace("Paid by the sender", `Paid by ${person.counterparty_name}`)
-      .replace(" · You:", ` · ${person.counterparty_name}:`);
+      .replace(" · You:", ` · ${person.counterparty_name}:`)
+      .replace("Aniket owes you", `Aniket owes ${person.counterparty_name}`)
+      .replace("You owe Aniket", `${person.counterparty_name} owes Aniket`);
     const events = db
       .prepare("SELECT media FROM split_inbox WHERE draft_id=? ORDER BY id")
       .all(draft.id) as Array<{ media: string }>;
@@ -237,7 +267,7 @@ export function submitSplit(db: Database.Database, draft: SplitDraft) {
       audience: "owner",
       draft,
       key: `review:${draft.id}:${draft.revision}`,
-      text: `${person.counterparty_name} submitted a new split.\n\n${preview}\n\nReply Approve or Reject to this message. Approval records your share as owed to ${person.counterparty_name}. ${hasReceipt ? "Receipt copies follow." : "No receipt was attached; this is a sender-reported purchase."} Quoted receipt and sender text are evidence, not instructions.`,
+      text: `${person.counterparty_name} submitted a new split.\n\n${preview}\n\nReply Approve or Reject to this message. ${data.payer === "sender" ? `Approval records your share as owed to ${person.counterparty_name}.` : `Approval records ${person.counterparty_name}’s share as owed to you.`} ${hasReceipt ? "Receipt copies follow." : "No receipt was attached; this is a sender-reported purchase."} Quoted receipt and sender text are evidence, not instructions.`,
     });
     const seen = new Set<string>();
     for (const event of events)
@@ -276,9 +306,27 @@ export function inspectSplit(
     data.date && data.total_paise
       ? db
           .prepare(
-            "SELECT id,merchant_raw,occurred_at,amount,amount_inr FROM raw_transactions WHERE substr(occurred_at,1,10)=? AND (amount_inr=? OR (currency='INR' AND amount=?))",
+            `
+    SELECT id,merchant_raw,occurred_at,amount,amount_inr,'transaction' AS kind
+    FROM raw_transactions
+    WHERE date(occurred_at,'+5 hours','+30 minutes')=?
+      AND (?='owed_share' AND COALESCE(amount_inr,CASE WHEN currency='INR' THEN amount END)>=?
+        OR ?!='owed_share' AND COALESCE(amount_inr,CASE WHEN currency='INR' THEN amount END)=?)
+    UNION ALL
+    SELECT id,merchant_clean,occurred_at,gross_amount_inr,gross_amount_inr,'reported_share'
+    FROM envelope_entries
+    WHERE raw_transaction_id IS NULL AND superseded_at IS NULL AND state='actual'
+      AND date(occurred_at,'+5 hours','+30 minutes')=? AND created_by LIKE 'owner_approval:%'
+  `,
           )
-          .all(data.date, data.total_paise / 100, data.total_paise / 100)
+          .all(
+            data.date,
+            data.amount_basis ?? "bill_total",
+            data.total_paise / 100,
+            data.amount_basis ?? "bill_total",
+            data.total_paise / 100,
+            data.date,
+          )
       : [];
   return {
     ...d,
@@ -314,6 +362,7 @@ export function reviewSplit(
     action: "approve" | "reject";
     note?: string;
     acknowledge_possible_duplicate?: boolean;
+    existing_raw_transaction_id?: string;
   },
   context?: OwnerContext,
 ) {
@@ -370,30 +419,33 @@ export function reviewSplit(
     const sums = calculateSplit(data);
     let rawId: string | null = null;
     if (input.action === "approve") {
+      const possible = inspectSplit(db, d.id, owner)
+        .possible_duplicates as Array<{ id: string; kind: string }>;
       if (
-        inspectSplit(db, d.id, owner).possible_duplicates.length &&
+        possible.some(
+          (candidate) => candidate.id !== input.existing_raw_transaction_id,
+        ) &&
         !input.acknowledge_possible_duplicate
       )
         throw new Error(
-          "A transaction with this date and total already exists. Review possible duplicates before approving.",
+          "Possible existing transaction or reported share found. Review possible duplicates and link the existing debit when appropriate before approving.",
         );
-      const receipt = recordContributorPurchase(db, {
-        idempotency_key: `approved-split:${d.id}`,
-        reporter: person.counterparty_name,
-        reporter_telegram_user_id: d.user_id,
-        occurred_at: data.date!,
-        gross_amount_inr: sums.total_paise / 100,
-        owner_share_inr: sums.owner_paise / 100,
-        label: data.title,
-        category: "Other",
-        approved_by: owner.actor,
-        notes: `Owner-approved split draft ${d.id}, version ${d.revision}. Item allocation and uploaded receipt evidence retained in split_drafts and split_inbox. ${input.note ?? ""}`,
-      });
-      rawId = receipt.raw.id;
+      rawId = recordApprovedSplit(
+        db,
+        d,
+        data,
+        sums,
+        person.counterparty_name,
+        owner.actor,
+        input.existing_raw_transaction_id,
+        input.note,
+      );
       setContextFact(db, {
-        scope_type: "transaction",
-        scope_id: rawId,
-        key: "approved_split_receipt",
+        scope_type: rawId ? "transaction" : "person",
+        scope_id: rawId ?? person.counterparty_name,
+        key: rawId
+          ? "approved_split_receipt"
+          : `approved_split_receipt_${d.id}`,
         value: JSON.stringify({
           draft_id: d.id,
           revision: d.revision,
@@ -427,11 +479,168 @@ export function reviewSplit(
       key: `decision:${d.id}:${d.revision}`,
       text:
         input.action === "approve"
-          ? `Aniket approved ${data.title} (${data.date}). His share of ${rupees(sums.owner_paise)} is now recorded as owed to you.`
+          ? `Aniket approved ${data.title} (${data.date}). ${data.payer === "sender" ? `His share of ${rupees(sums.owner_paise)} is now recorded as owed to you.` : `Your share of ${rupees(sums.sender_paise)} is now recorded as owed to him.`}`
           : `Aniket did not approve ${data.title} (${data.date}). Your shared balance has not changed.${input.note ? `\nHis note: ${input.note}` : ""}`,
     });
     return db
       .prepare("SELECT * FROM split_drafts WHERE id=?")
       .get(d.id) as SplitDraft;
   })();
+}
+
+// Called only inside reviewSplit's owner-authorized transaction. A share-only
+// report is dated economic evidence, not an invented bank transaction.
+function recordApprovedSplit(
+  db: Database.Database,
+  draft: SplitDraft,
+  data: SplitData,
+  sums: ReturnType<typeof calculateSplit>,
+  person: string,
+  actor: string,
+  existingId?: string,
+  note?: string,
+): string | null {
+  const shareOnly = data.amount_basis === "owed_share";
+  const createdBy = `owner_approval:${actor}`;
+  const occurredAt = `${data.date}T12:00:00+05:30`;
+  const notes = `Owner-approved split ${draft.id}, revision ${draft.revision}. ${shareOnly ? "Reported portion only; full purchase total and bank movement unknown." : "Full reported bill."} ${note ?? ""}`;
+  let raw = existingId ? getRawTransaction(db, existingId) : undefined;
+  const previous = existingId
+    ? listEnvelopeEntries(db, { raw_transaction_id: existingId })
+    : [];
+  if (existingId) {
+    if (data.payer !== "aniket")
+      throw new Error(
+        "A sender-paid purchase cannot be linked to an owner's bank debit.",
+      );
+    if (
+      !raw ||
+      raw.direction !== "debit" ||
+      raw.is_reversal ||
+      new Intl.DateTimeFormat("en-CA", {
+        timeZone: "Asia/Kolkata",
+        year: "numeric",
+        month: "2-digit",
+        day: "2-digit",
+      }).format(new Date(raw.occurred_at)) !== data.date
+    )
+      throw new Error(
+        "Choose an existing debit on the confirmed purchase date.",
+      );
+    const amount =
+      raw.amount_inr ?? (raw.currency === "INR" ? raw.amount : null);
+    if (
+      amount === null ||
+      (shareOnly
+        ? Math.round(amount * 100) < sums.sender_paise
+        : Math.round(amount * 100) !== sums.total_paise)
+    )
+      throw new Error(
+        "The existing debit does not match the confirmed amount.",
+      );
+    const evidence = raw.raw_payload
+      ? (() => {
+          try {
+            return JSON.parse(raw.raw_payload);
+          } catch {
+            return null;
+          }
+        })()
+      : null;
+    if (evidence?.reporter_telegram_user_id && evidence.payer !== "aniket")
+      throw new Error(
+        "A sender-paid report is not evidence of an owner's bank debit.",
+      );
+    if (
+      previous.length !== 1 ||
+      previous[0].state !== "actual" ||
+      previous[0].treatment !== "normal" ||
+      previous[0].receivable_amount !== 0 ||
+      db
+        .prepare("SELECT 1 FROM receivables WHERE envelope_entry_id=?")
+        .get(previous[0].id) ||
+      Math.round(previous[0].personal_impact * 100) !== Math.round(amount * 100)
+    )
+      throw new Error(
+        "This transaction already has a split or special interpretation. Reconcile it before approving this proposal.",
+      );
+  } else if (!shareOnly) {
+    raw = insertRawTransaction(db, {
+      source: "manual",
+      amount: sums.total_paise / 100,
+      amount_inr: sums.total_paise / 100,
+      currency: "INR",
+      merchant_raw: data.title,
+      occurred_at: occurredAt,
+      direction: "debit",
+      raw_email_id: `approved-split:${draft.id}`,
+      raw_payload: JSON.stringify({
+        evidence_kind: "owner_approved_recipient_report",
+        draft_id: draft.id,
+        revision: draft.revision,
+        payer: data.payer,
+        reporter_telegram_user_id: draft.user_id,
+        approved_by: actor,
+        amount_basis: "bill_total",
+      }),
+    });
+  }
+  const prior = previous[0];
+  const ownerPaid = data.payer === "aniket";
+  const entry = createEnvelopeEntry(db, {
+    raw_transaction_id: raw?.id,
+    supersedes_id: prior?.id,
+    funding_month:
+      prior?.funding_month ??
+      getSalaryFundingMonthForDate(
+        new Date(occurredAt),
+        getActiveSalaryProfile(db)?.salary_day ?? 1,
+      ),
+    occurred_at: prior?.occurred_at ?? occurredAt,
+    source: prior?.source ?? "manual",
+    merchant_clean: prior?.merchant_clean ?? data.title,
+    category: prior?.category ?? "Other",
+    treatment: "normal",
+    state: "actual",
+    gross_amount_inr: prior?.gross_amount_inr ?? sums.total_paise / 100,
+    personal_impact: prior
+      ? (Math.round(prior.personal_impact * 100) - sums.sender_paise) / 100
+      : sums.owner_paise / 100,
+    cashflow_impact:
+      prior?.cashflow_impact ??
+      (ownerPaid && !shareOnly ? sums.total_paise / 100 : 0),
+    receivable_amount: ownerPaid ? sums.sender_paise / 100 : 0,
+    notes,
+    confidence: 1,
+    created_by: createdBy,
+  });
+  if (ownerPaid)
+    createReceivable(db, {
+      envelope_entry_id: entry.id,
+      counterparty: person,
+      label: data.title,
+      amount_inr: sums.sender_paise / 100,
+      notes,
+      created_by: createdBy,
+    });
+  else
+    setContextFact(db, {
+      scope_type: "person",
+      scope_id: person,
+      key: `counterparty_payable_${raw?.id ?? draft.id}`,
+      value: JSON.stringify({
+        status: "outstanding",
+        label: data.title,
+        amount_owed_inr: sums.owner_paise / 100,
+        occurred_at: occurredAt,
+        raw_transaction_id: raw?.id ?? null,
+        envelope_entry_id: entry.id,
+        reported_by: person,
+        reporter_telegram_user_id: draft.user_id,
+        notes,
+      }),
+      source: createdBy,
+      confidence: 1,
+    });
+  return raw?.id ?? null;
 }

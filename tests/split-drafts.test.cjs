@@ -842,30 +842,20 @@ test("confirmation requires every preview part and rejects stale or cancelled dr
 test("a contributor can still use /tab while a receipt draft is open", async (t) => {
   const f = fixture(t, "contributor");
   const draft = saveSplit(f.db, "222", data());
-  let contributorCalls = 0;
-  await handleTelegramUpdate(
-    f.db,
-    {
-      update_id: 77,
-      message: {
-        message_id: 77,
-        text: "/tab",
-        from: { id: 222 },
-        chat: { id: 222, type: "private" },
-      },
+  let unifiedCalls = 0;
+  await handleTelegramUpdate(f.db, {update_id: 77, message: {
+    message_id: 77, text: "/tab", from: {id: 222}, chat: {id: 222, type: "private"},
+  }}, {
+    runContributorAgent: async () => assert.fail("No legacy routing"),
+    answerSplit: async (packet) => {
+      unifiedCalls++;
+      assert.ok(packet.shared_tab);
+      assert.equal(packet.draft.id, draft.id);
+      return {route: "chat", request_id: null, reply: "Your shared tab is settled.", draft_action: "status", draft: null};
     },
-    {
-      sendTyping: async () => {},
-      sendToIncomingChat: async () => 99,
-      runContributorAgent: async () => {
-        contributorCalls++;
-        return { text: "Here is your shared tab.", recorded_purchases: [] };
-      },
-      answerSplit: async () =>
-        assert.fail("Explicit /tab must preserve contributor access"),
-    },
-  );
-  assert.equal(contributorCalls, 1);
+    sendConversationMessage: f.transport.send,
+  });
+  assert.equal(unifiedCalls, 1);
   assert.equal(activeSplit(f.db, f.person.contact_id).id, draft.id);
   noLedger(f.db);
 });

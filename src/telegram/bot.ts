@@ -2,16 +2,12 @@ import TelegramBot from "node-telegram-bot-api";
 import type Database from "better-sqlite3";
 import { getContext, setContext, deleteContext } from "../db/queries";
 import { runAgent } from "../agent/runner";
-import {
-  runContributorAgent,
-  type ContributorAgentResult,
-  type ContributorIdentity,
-} from "../agent/contributor";
+import type { runContributorAgent } from "../agent/contributor";
 import {
   claimTelegramContributorInvite,
   getTelegramRecipient,
 } from "./access";
-import { handleRecipientMessage, isPaymentReply, activePaymentConversation, processRecipientConversations } from "../payments/replies";
+import { handleRecipientMessage, processRecipientConversations } from "../payments/replies";
 import { ownerReplyRequest } from "../payments/chat-delivery";
 import type { AnswerRecipient } from "../payments/recipient-agent";
 import type { SendPaymentMessage } from "../payments/delivery";
@@ -25,7 +21,7 @@ import {
 } from "./media";
 import type { AgentImageInput } from "../agent/image-input";
 import { acceptSplitMessage, processSplitInbox, SplitInputError, type AnswerSplit } from "../payments/split-conversation";
-import { activeSplit, reviewSplit } from "../payments/split-drafts";
+import { reviewSplit } from "../payments/split-drafts";
 import { deliverSplitMessages, ownerSplitReference } from "../payments/split-outbox";
 
 const MESSAGE_MAP_KEY = "telegram_message_map";
@@ -339,19 +335,6 @@ interface TelegramHandlerDependencies {
   sendConversationMessage?: SendPaymentMessage;
 }
 
-function contributorAuditMessage(receipt: ContributorAgentResult["recorded_purchases"][number]): string {
-  const classification = receipt.flex_classification
-    ? ` · ${receipt.flex_classification}`
-    : " · flex unclassified";
-  return [
-    `👤 ${receipt.reporter} recorded a payment made for you`,
-    `₹${receipt.gross_amount_inr.toLocaleString("en-IN")} · ${receipt.label}`,
-    `${receipt.occurred_at.slice(0, 10)} · your share ₹${receipt.owner_share_inr.toLocaleString("en-IN")}`,
-    `${receipt.treatment}${classification}`,
-    `Reply with corrections if anything is off.`,
-  ].join("\n");
-}
-
 export function parseTelegramContributorClaim(text: string): string | null {
   const match = text
     .trim()
@@ -385,8 +368,8 @@ export async function handleTelegramUpdate(
       await sendIncoming(
         message.chat.id,
         claim.contributor.role === "contributor"
-          ? `Access confirmed as ${claim.contributor.counterparty_name}. You can receive payment requests, record what you pay for Aniket, and see only your shared tab with him. Use /stop_requests to pause payment requests.`
-          : `Connected as ${claim.contributor.counterparty_name}. Violet can now send you payment requests from Aniket. You can reply to a request with questions or payment updates. Use /stop_requests to pause requests.`,
+          ? `Access confirmed as ${claim.contributor.counterparty_name}. You can discuss shared expenses in either direction, upload receipts for Aniket to approve, and see your shared tab with him. Use /stop_requests to pause payment requests.`
+          : `Connected as ${claim.contributor.counterparty_name}. Violet can now send you payment requests from Aniket. You can ask about a request or describe a new shared expense in either direction, with receipts if you have them. Aniket approves balance changes. Use /stop_requests to pause requests.`,
         { thread_id: message.message_thread_id, reply_to_message_id: message.message_id }
       );
       if (!claim.was_existing) {
@@ -425,10 +408,6 @@ export async function handleTelegramUpdate(
     message.caption?.trim() ||
     "Please examine this image and help me with anything financially relevant. If the context is ambiguous, ask one concise question.";
 
-  if (actor.role === "contributor" && /^\/tab$/i.test(userMessage)) {
-    db.prepare("DELETE FROM payment_chat_sessions WHERE contact_id=?").run(actor.contact_id);
-  }
-
   if (actor.role !== "owner" && /^\/(?:stop|stop_requests|resume_requests)$/i.test(userMessage)) {
     const result = handleRecipientMessage(db, {
       user_id:actor.telegram_user_id, chat_id:String(message.chat.id), message_id:message.message_id,
@@ -448,7 +427,7 @@ export async function handleTelegramUpdate(
       );
     } catch (error) {
       if (!(error instanceof TelegramImageError)) throw error;
-      if (actor.role === "recipient" && message.caption && getTelegramRecipient(db,actor.telegram_user_id)?.delivery_status === "ready")
+      if (actor.role !== "owner" && message.caption && getTelegramRecipient(db,actor.telegram_user_id)?.delivery_status === "ready")
         acceptSplitMessage(db,{userId:actor.telegram_user_id,chatId:String(message.chat.id),messageId:message.message_id,
           text:`${message.caption}\n[Receipt download or validation failed; ask for a readable replacement.]`,sentAt:message.date});
       await (dependencies.sendToIncomingChat ?? sendMessageToChat)(
@@ -463,9 +442,7 @@ export async function handleTelegramUpdate(
     }
   }
 
-  if (actor.role !== "owner" && !(actor.role === "contributor" && /^\/tab$/i.test(userMessage)) && (actor.role === "recipient" ||
-      /^\/(?:splits|new_split|retry)$/i.test(userMessage) || activeSplit(db,actor.contact_id) ||
-      activePaymentConversation(db,actor.contact_id) || isPaymentReply(db,actor.contact_id,message.reply_to_message?.message_id))) {
+  if (actor.role !== "owner") {
     const person = getTelegramRecipient(db,actor.telegram_user_id);
     if (person?.delivery_status !== "ready") {
       await (dependencies.sendToIncomingChat ?? sendMessageToChat)(message.chat.id,
@@ -526,34 +503,15 @@ export async function handleTelegramUpdate(
   );
 
   try {
-    let reply: string;
-    if (actor.role === "owner") {
-      reply = await (dependencies.runOwnerAgent ?? runAgent)(db, {
-        user_message: userMessage,
-        interface: "telegram",
-        owner_context: { role:"owner", actor:`telegram:${actor.telegram_user_id}`, source:"telegram", request_id:String(update.update_id) },
-        replied_to_transaction_id: linkedTransactionId,
-        replied_to_payment_request_id: ownerReplyRequest(db, String(message.chat.id), message.message_thread_id, message.reply_to_message?.message_id),
-        replied_to_split_draft: splitReference,
-        images,
-      });
-    } else {
-      const contributorIdentity: ContributorIdentity = {
-        telegram_user_id: actor.telegram_user_id,
-        name: actor.name,
-      };
-      const result = await (dependencies.runContributorAgent ?? runContributorAgent)(db, {
-        identity: contributorIdentity,
-        conversation_id: String(message.chat.id),
-        message_id: message.message_id,
-        user_message: userMessage,
-        images,
-      });
-      reply = result.text;
-      for (const receipt of result.recorded_purchases) {
-        await (dependencies.sendOwnerMessage ?? sendMessage)(contributorAuditMessage(receipt));
-      }
-    }
+    const reply = await (dependencies.runOwnerAgent ?? runAgent)(db, {
+      user_message: userMessage,
+      interface: "telegram",
+      owner_context: { role:"owner", actor:`telegram:${actor.telegram_user_id}`, source:"telegram", request_id:String(update.update_id) },
+      replied_to_transaction_id: linkedTransactionId,
+      replied_to_payment_request_id: ownerReplyRequest(db, String(message.chat.id), message.message_thread_id, message.reply_to_message?.message_id),
+      replied_to_split_draft: splitReference,
+      images,
+    });
     await (dependencies.sendToIncomingChat ?? sendMessageToChat)(message.chat.id, reply, {
       thread_id: message.message_thread_id,
       reply_to_message_id: message.message_id,
@@ -561,8 +519,8 @@ export async function handleTelegramUpdate(
   } catch (err) {
     const diagnostic = recordAgentError(db, {
       interface: "telegram",
-      actor_role: actor.role === "owner" ? "owner" : "contributor",
-      stage: actor.role === "owner" ? "owner_agent" : "contributor_agent",
+      actor_role: "owner",
+      stage: "owner_agent",
       error: err,
     });
     console.error(`[telegram] agent run failed: ${agentErrorLogLine(diagnostic)}`);

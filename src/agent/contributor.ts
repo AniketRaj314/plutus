@@ -9,9 +9,7 @@ import type {
 } from "openai/resources/responses/responses";
 import {
   getCounterpartyBalance,
-  recordContributorPurchase,
   type FlexBudgetClassification,
-  type RecordContributorPurchaseResult,
 } from "../db/v2-queries";
 import { getVioletModelConfig } from "./model-config";
 import { getActiveTelegramContributor } from "../telegram/access";
@@ -85,77 +83,13 @@ function currentIst(): string {
 }
 
 export function buildContributorSystemPrompt(identity: ContributorIdentity): string {
-  return `You are Violet's privacy-restricted bilateral finance assistant for ${identity.name}, an authorized contributor to Aniket's personal Plutus ledger.
-
+  return `You are Violet helping ${identity.name} understand their shared tab with Aniket.
 CURRENT TIME: ${currentIst()} IST
-
-YOUR ONLY JOBS:
-- Never use an em dash (—). Use a comma, colon, parentheses, or a regular hyphen instead.
-- Write simple Markdown-style text, never raw HTML. Use **bold**, short lists, and compact Markdown tables only when they make the answer easier to scan.
-- Help ${identity.name} record a purchase or payment they personally made on Aniket's behalf.
-- Help ${identity.name} review only the two-way tab between ${identity.name} and Aniket: what they covered for each other, direct transfers between them, and their net balance.
-- You have no access to Aniket's financial history, transactions, balances, cards, income, budgets, reimbursements, or other people's activity.
-- Never claim to know or reveal any unrelated information. If asked, say: "I can only help with payments and the shared tab between you and Aniket."
-- For every shared-tab, debt, balance, or history question, call get_my_tab_with_aniket immediately before answering. Never answer from conversation history.
-- Use view=current by default. Use view=full only when ${identity.name} explicitly asks for lifetime, old, or full history.
-- The shared-tab tool is identity-bound. Never ask for or accept another person's name as a lookup target.
-
-BEFORE RECORDING, establish:
-- what was paid for;
-- total amount paid;
-- Aniket's share (use the full amount only when ${identity.name} clearly says the whole payment was for Aniket);
-- purchase date (ask if it is not clear; do not invent it).
-
-RECORDING RULES:
-- Handle one purchase per message. Ask for separate messages when multiple purchases are bundled.
-- Call record_purchase_for_aniket only after the details above are clear.
-- Ordinary variable groceries, dining, travel, entertainment, and shopping are flex.
-- Fixed is only for genuinely recurring or non-negotiable obligations.
-- Excluded is only for pass-throughs, settlements, or an explicitly reimbursable purchase.
-- A payment of an existing card bill or debt may duplicate an already tracked expense. Do not record it as a new purchase; tell ${identity.name} that Aniket needs to review it.
-- Never say something was recorded unless the tool succeeded.
-- After recording, you may state the resulting bilateral balance only by calling get_my_tab_with_aniket.
-- Keep replies to 2-6 short lines. Show a compact net first and only the bilateral items needed to answer; expand only when asked.`;
+This compatibility entry point is read-only. New expenses in either direction, receipts, corrections and payment reports belong to the shared conversation and require Aniket's approval before any ledger change.
+Call get_my_tab_with_aniket immediately before answering any balance or history question. Use current by default, full only for explicitly requested lifetime history. Never infer a balance from history.
+The tool is identity-bound. Never ask for or accept another person's name as a lookup target. You cannot access unrelated finances.
+Never claim a purchase was recorded or a review sent. Keep replies natural and brief, ask only missing questions, and do not require menu commands. Never use an em dash. Write simple Markdown, never raw HTML.`;
 }
-
-const CONTRIBUTOR_TOOL: FunctionTool = {
-  type: "function",
-  name: "record_purchase_for_aniket",
-  description:
-    "Record one purchase the authenticated contributor personally paid for on Aniket's behalf. The authenticated reporter identity is injected by the server and cannot be selected by the model.",
-  parameters: {
-      type: "object",
-      properties: {
-        label: { type: "string" },
-        occurred_at: {
-          type: "string",
-          description: "Purchase date as YYYY-MM-DD, or an ISO 8601 timestamp when known.",
-        },
-        gross_amount_inr: { type: "number" },
-        owner_share_inr: {
-          type: "number",
-          description: "The portion of the purchase economically belonging to Aniket.",
-        },
-        category: { type: "string" },
-        treatment: { type: "string" },
-        flex_classification: {
-          type: "string",
-          enum: ["flex", "fixed", "excluded"],
-        },
-        notes: { type: "string" },
-      },
-      required: [
-        "label",
-        "occurred_at",
-        "gross_amount_inr",
-        "owner_share_inr",
-        "category",
-        "treatment",
-        "flex_classification",
-      ],
-  },
-  strict: false,
-};
 
 const CONTRIBUTOR_BALANCE_TOOL: FunctionTool = {
   type: "function",
@@ -236,24 +170,6 @@ function insertHistory(
   ).run(payload.identity.telegram_user_id, payload.conversation_id, role, content);
 }
 
-function toReceipt(
-  result: RecordContributorPurchaseResult,
-  reporter: string
-): ContributorPurchaseReceipt {
-  return {
-    raw_transaction_id: result.raw.id,
-    label: result.entry.merchant_clean ?? result.raw.merchant_raw ?? "Purchase",
-    occurred_at: result.entry.occurred_at ?? result.raw.occurred_at,
-    gross_amount_inr: result.entry.gross_amount_inr,
-    owner_share_inr: result.entry.personal_impact,
-    category: result.entry.category,
-    treatment: result.entry.treatment,
-    flex_classification: result.flex_classification?.classification ?? null,
-    was_existing: result.was_existing,
-    reporter,
-  };
-}
-
 export async function runContributorAgent(
   db: Database.Database,
   payload: ContributorAgentPayload,
@@ -280,7 +196,6 @@ export async function runContributorAgent(
   const createResponse =
     options.createResponse ??
     ((request: ResponseCreateParamsNonStreaming) => getClient().responses.create(request));
-  let needsBalanceRefresh = false;
   let finalText = "";
 
   for (let i = 0; i < MAX_TOOL_ITERATIONS; i++) {
@@ -289,7 +204,7 @@ export async function runContributorAgent(
       reasoning: { effort: modelConfig.reasoning_effort },
       instructions: systemPrompt,
       input,
-      tools: [CONTRIBUTOR_TOOL, CONTRIBUTOR_BALANCE_TOOL],
+      tools: [CONTRIBUTOR_BALANCE_TOOL],
       parallel_tool_calls: false,
       max_output_tokens: MAX_COMPLETION_TOKENS,
       store: false,
@@ -301,18 +216,6 @@ export async function runContributorAgent(
     verifyAccess();
     input.push(...(response.output as ResponseInputItem[]));
     if (toolCalls.length === 0) {
-      if (needsBalanceRefresh) {
-        const refreshed = getContributorBalanceView(db, payload.identity, "current");
-        needsBalanceRefresh = false;
-        input.push({
-          role: "developer",
-          content:
-            "POST-WRITE CANONICAL REFRESH: A purchase was recorded in this turn. " +
-            "Discard any balance number drafted before this message. Use only this freshly " +
-            `queried bilateral balance in the final answer: ${JSON.stringify(refreshed)}`,
-        });
-        continue;
-      }
       finalText = response.output_text ?? "";
       break;
     }
@@ -329,43 +232,6 @@ export async function runContributorAgent(
             payload.identity,
             args.view === "full" ? "full" : "current"
           );
-          needsBalanceRefresh = false;
-        } else if (toolCall.name === "record_purchase_for_aniket") {
-          const args = JSON.parse(toolCall.arguments || "{}") as {
-            label: string;
-            occurred_at: string;
-            gross_amount_inr: number;
-            owner_share_inr: number;
-            category: string;
-            treatment: string;
-            flex_classification: FlexBudgetClassification;
-            notes?: string;
-          };
-          const result = recordContributorPurchase(db, {
-            idempotency_key: `${payload.identity.telegram_user_id}:${payload.conversation_id}:${payload.message_id}`,
-            reporter: payload.identity.name,
-            reporter_telegram_user_id: payload.identity.telegram_user_id,
-            occurred_at: args.occurred_at,
-            gross_amount_inr: args.gross_amount_inr,
-            owner_share_inr: args.owner_share_inr,
-            label: args.label,
-            category: args.category,
-            treatment: args.treatment,
-            flex_classification: args.flex_classification,
-            notes: args.notes,
-          });
-          const receipt = toReceipt(result, payload.identity.name);
-          receipts.push(receipt);
-          needsBalanceRefresh = true;
-          toolResult = {
-            recorded: true,
-            raw_transaction_id: receipt.raw_transaction_id,
-            label: receipt.label,
-            date: receipt.occurred_at.slice(0, 10),
-            total_paid_inr: receipt.gross_amount_inr,
-            aniket_share_inr: receipt.owner_share_inr,
-            was_existing: receipt.was_existing,
-          };
         } else {
           throw new Error("unsupported contributor tool");
         }

@@ -3,6 +3,7 @@ import OpenAI from "openai";
 import { z } from "zod";
 import type Database from "better-sqlite3";
 import { buildUserInputItem, type AgentImageInput } from "../agent/image-input";
+import { getContributorBalanceView } from "../agent/contributor";
 import { getVioletModelConfig } from "../agent/model-config";
 import { getTelegramRecipient } from "../telegram/access";
 import {
@@ -40,6 +41,7 @@ const resultSchema = z
   .object({
     route: z.enum(["draft", "existing", "chat"]),
     request_id: z.string().nullable(),
+    tab_view: z.enum(["current", "full"]).optional(),
     reply: z.string().min(1).max(1600),
     draft_action: z.enum(["edit", "submit", "cancel", "status"]),
     draft: splitDataSchema.nullable(),
@@ -155,6 +157,22 @@ function conversationPacket(db: Database.Database, event: Inbox) {
       day: "2-digit",
     }).format(new Date()),
     sender: person.counterparty_name,
+    shared_tab:
+      person.role === "contributor"
+        ? getContributorBalanceView(db, {
+            telegram_user_id: event.user_id,
+            name: person.counterparty_name,
+          })
+        : null,
+    legacy_history:
+      person.role === "contributor"
+        ? db
+            .prepare(
+              "SELECT role,content FROM contributor_agent_messages WHERE telegram_user_id=? AND conversation_id=? ORDER BY id DESC LIMIT 20",
+            )
+            .all(event.user_id, event.chat_id)
+            .reverse()
+        : [],
     message: {
       text: event.text,
       sent_at: event.created_at,
@@ -202,16 +220,19 @@ export const answerSplit: AnswerSplit = async (packet, media) => {
     store: false,
     max_output_tokens: 6000,
     instructions: `You are Violet helping this authenticated friend with shared expenses with Aniket.
-Return ONLY JSON with keys route (draft|existing|chat), request_id (string|null), reply (short natural text), draft_action (edit|submit|cancel|status), draft (object|null).
-Choose draft for a new purchase the sender paid for, a receipt for that purchase, or a follow-up to their draft. Saying 'new split' overrides an old bill/menu. Never require /tab or a menu number to escape it.
+Return ONLY JSON with keys route (draft|existing|chat), request_id (string|null), reply (short natural text), draft_action (edit|submit|cancel|status), draft (object|null), and optional tab_view (current|full).
+Choose draft for a new shared purchase or amount owed in EITHER direction, a receipt, or a follow-up to their draft. Both contributors and recipients use this same approval flow. Never refuse because Aniket paid. Saying 'new split' overrides an old bill/menu. Never require /tab or a menu number to escape it.
 Choose existing only when the user means one of sent_requests; select its exact id. If ambiguous, ask one short conversational question with at most 3 dated choices. Avoid repeatedly listing all bills. /splits means show concise dated choices. /start is a warm greeting explaining they can ask about old splits or upload a new receipt for approval.
 Remember ALL supplied history and previous_bill_selection.pending_text when interpreting a newly received receipt. Resolve relative dates against that message's sent_at in Asia/Kolkata, not the processing date. Images/PDFs may arrive separately from the instructions. Use the current draft as accumulated facts; preserve everything not corrected. Do not treat a photo's arrival as consent to submit. Never attach a different bill's receipt to the draft silently; clarify first. When a draft is already open, ask the sender to finish or cancel it before starting another.
 For route=draft, draft may be null for status/submit/cancel. For edit, return the COMPLETE updated draft, with:
 title:string (short stable bill name, never today/yesterday), date:YYYY-MM-DD|null, currency:ISO code, payer:sender|aniket|unknown,
-total_paise:integer|null (actual final amount paid), receipt_reference:string|null,
+amount_basis:bill_total|owed_share (bill_total when the full bill is known, owed_share when only the portion owed is known),
+total_paise:integer|null (full bill total for bill_total, reported debt portion for owed_share), receipt_reference:string|null,
 items:[{name:string,amount_paise:integer (line total, quantity included),owner_parts:integer|null,total_parts:integer|null}],
 adjustments:[{label:string,amount_paise:signed integer}], unresolved:[string].
 owner_parts/total_parts is Aniket's fraction of a line: his alone 1/1, sender alone 0/1, equally shared 1/2. Names refer only to sender and Aniket. Never add unmentioned participants. Extract the receipt faithfully; unreadable items/totals stay unresolved. Do not invent prices, payments, dates or consent. Include final taxes, discounts, fees and rounding as separate adjustments, not both embedded and repeated. Shared adjustments are proportional to item subtotals; put exceptions needing other allocation in unresolved for clarification. Use paise only for INR; foreign amounts require settled INR evidence before recording. Preserve the real currency rather than pretending foreign amounts are INR.
+For owed_share, preserve the explicitly reported portion without inventing a full bill or a bank payment. No item list or receipt is required; use empty items and adjustments when unavailable. "I owe Aniket" means payer=aniket, "Aniket owes me" means payer=sender only for a purchase or value covered, not a repayment. Ask what it was for and the date only if missing. Existing debt, repayment, correction or settlement is not a new expense; clarify and refer to Aniket for review rather than create another purchase. Never assume a purchase date from a promised repayment date.
+Use shared_tab as the fresh, identity-bound current balance when supplied, including for /tab or natural balance questions. Reply via chat without discarding an open draft. If the contributor explicitly requests full or lifetime bilateral history, set tab_view=full; the server will supply that view before your final answer. Otherwise use current. If shared_tab is null, discuss only sent requests and the sender's proposals; do not expose a broader ledger or infer their total debt. legacy_history is context only, never a current balance.
 Ask only missing questions; use earlier statements of payer, date and item ownership. When the sender asks about the calculation, explain provided facts. The server calculates and displays actual shares; do not invent arithmetic or output your own final totals.
 Choose submit only after the sender explicitly confirms the most recently displayed preview or asks to send that unchanged version for Aniket's approval. A submitted draft remains pending until Aniket approves; editing it withdraws the old version. Rejected drafts retain their receipt and can be corrected using Aniket's review_note, then previewed and submitted again. cancel requires the sender's request. Never claim a balance changed or that a message was delivered; the server supplies status. Nobody here can approve on Aniket's behalf.
 Use recent_drafts for current approval/rejection status, rather than old conversation claims. A draft's individual share is not the current net balance; do not infer a net balance from history. Corrections to an approved purchase need Aniket's review, not a second new purchase.
@@ -301,9 +322,41 @@ export async function processSplitInbox(
         ...new Map(media.map((m) => [m.data_url, m])).values(),
       ];
       if (uniqueMedia.length > 4) throw new Error("receipt_limit");
-      const answer = resultSchema.parse(
+      let answer = resultSchema.parse(
         await (options.answer ?? answerSplit)(packet, uniqueMedia),
       );
+      if (
+        answer.route === "chat" &&
+        answer.tab_view === "full" &&
+        person.role === "contributor"
+      ) {
+        const current = getTelegramRecipient(db, event.user_id);
+        if (
+          !current ||
+          current.role !== "contributor" ||
+          current.contact_id !== event.contact_id ||
+          current.private_chat_id !== event.chat_id ||
+          current.delivery_status !== "ready"
+        )
+          throw new Error("connection_changed");
+        answer = resultSchema.parse(
+          await (options.answer ?? answerSplit)(
+            {
+              ...packet,
+              shared_tab: getContributorBalanceView(
+                db,
+                {
+                  telegram_user_id: event.user_id,
+                  name: current.counterparty_name,
+                },
+                "full",
+              ),
+            },
+            uniqueMedia,
+          ),
+        );
+        if (answer.route !== "chat") throw new Error("unexpected_tab_action");
+      }
       db.transaction(() => {
         if (
           !db
@@ -317,6 +370,8 @@ export async function processSplitInbox(
         if (
           !livePerson ||
           livePerson.contact_id !== event.contact_id ||
+          livePerson.role !== person.role ||
+          livePerson.private_chat_id !== event.chat_id ||
           livePerson.delivery_status !== "ready"
         )
           throw new Error("connection_changed");
